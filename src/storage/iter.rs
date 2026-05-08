@@ -4,7 +4,7 @@ use std::{
 
 use anyhow::{Context, bail};
 
-use crate::storage::{MemTable, record::Record};
+use crate::storage::{MemTable, engine::SSTableMeta, record::Record};
 
 pub struct SSTableIter {
     r: io::BufReader<fs::File>,
@@ -249,6 +249,117 @@ mod sstable_iter_tests {
     }
 }
 
+#[cfg(test)]
+mod sstable_scanner_tests {
+    use super::*;
+    use crate::storage::engine::SSTableMeta;
+    use crate::storage::BloomFilter;
+    use std::{io::Write, path::PathBuf};
+    use tempfile::tempdir;
+
+    fn write_sstable(path: &PathBuf, records: &[Record]) -> u64 {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(path)
+            .unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for rec in records {
+            let len_buf = (rec.len() as u64).to_le_bytes();
+            w.write_all(&len_buf).unwrap();
+            w.write_all(rec.as_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn make_meta(bloom_offset: u64, file_size: u64) -> SSTableMeta {
+        SSTableMeta {
+            bloom: BloomFilter::new(0, 0.01),
+            bloom_offset,
+            num_records: 0,
+            file_size,
+        }
+    }
+
+    #[test]
+    fn test_scanner_all_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+        let records = vec![
+            Record::from_raw_parts(1, 10, 0, "sys", "a"),
+            Record::from_raw_parts(1, 20, 0, "sys", "b"),
+            Record::from_raw_parts(2, 30, 0, "db", "c"),
+        ];
+        let len = write_sstable(&path, &records);
+        let meta = make_meta(len, len);
+        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let collected: Vec<Record> = scanner.collect();
+        assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn test_scanner_empty_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.sst");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        drop(f);
+        let meta = make_meta(0, 0);
+        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        assert!(scanner.collect::<Vec<_>>().is_empty());
+    }
+
+    #[test]
+    fn test_scanner_single_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+        let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
+        let len = write_sstable(&path, &records);
+        let meta = make_meta(len, len);
+        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let collected: Vec<Record> = scanner.collect();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].extract_value().unwrap(), b"loner");
+    }
+
+    #[test]
+    fn test_scanner_stops_at_bloom_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+        let records = vec![
+            Record::from_raw_parts(1, 10, 0, "sys", "a"),
+            Record::from_raw_parts(1, 20, 0, "sys", "b"),
+        ];
+        let len = write_sstable(&path, &records);
+        // bloom_offset < file_len — scanner should stop before extra garbage
+        let meta = make_meta(len, len);
+        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let collected: Vec<Record> = scanner.collect();
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn test_scanner_multiple_source_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+        let records = vec![
+            Record::from_raw_parts(1, 10, 0, "sys", "a"),
+            Record::from_raw_parts(2, 20, 0, "db", "b"),
+            Record::from_raw_parts(1, 30, 0, "web", "c"),
+            Record::from_raw_parts(3, 40, 0, "cache", "d"),
+        ];
+        let len = write_sstable(&path, &records);
+        let meta = make_meta(len, len);
+        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let collected: Vec<Record> = scanner.collect();
+        assert_eq!(collected.len(), 4);
+    }
+}
+
 
 /// Iterates over the MemTable's BTreeSet, yielding only records matching
 /// the given source_id, key, and time range.
@@ -332,27 +443,33 @@ impl Ord for HeapItem {
     }
 }
 
-pub(crate) struct MergeIter<'a> {
+pub(crate) struct MergeIter<'a, R> {
     heap: BinaryHeap<Reverse<HeapItem>>,
-    memtable_iter: MemTableIter<'a>,
-    sstable_iters: Vec<SSTableIter>,
+    memtable_iter: Option<MemTableIter<'a>>,
+    sstable_iters: Vec<R>,
     last_item: Option<HeapItem>,
 }
 
-impl<'a> MergeIter<'a> {
+impl<'a, R> MergeIter<'a, R>
+where
+    R: Iterator<Item = Record>
+{
     pub(crate) fn new(
-        mut memtable_iter: MemTableIter<'a>,
-        mut sstable_iters: Vec<SSTableIter>,
+        mut memtable_iter: Option<MemTableIter<'a>>,
+        mut sstable_iters: Vec<R>,
     ) -> Self {
         let mut heap = BinaryHeap::new();
 
         // insert first items of memtable + sstables
-        if let Some(r) = memtable_iter.next() {
-            heap.push(Reverse(HeapItem {
-                record: r,
-                source_idx: 0,
-            }));
+        if let Some(iter) = memtable_iter.as_mut() {
+            if let Some(r) = iter.next() {
+                heap.push(Reverse(HeapItem {
+                    record: r,
+                    source_idx: 0,
+                }));
+            }
         }
+
         for (i, iter) in sstable_iters.iter_mut().enumerate() {
             if let Some(r) = iter.next() {
                 heap.push(Reverse(HeapItem {
@@ -372,8 +489,8 @@ impl<'a> MergeIter<'a> {
 
     fn refil(&mut self, source_idx: usize) {
         match source_idx {
-            0 => {
-                if let Some(r) = self.memtable_iter.next() {
+            0 if self.memtable_iter.is_some() => {
+                if let Some(r) = self.memtable_iter.as_mut().unwrap().next() {
                     self.heap.push(Reverse(HeapItem {
                         record: r,
                         source_idx: 0,
@@ -394,8 +511,11 @@ impl<'a> MergeIter<'a> {
     }
 }
 
-impl<'a> Iterator for MergeIter<'a> {
-    type Item = Record;
+impl<'a, R> Iterator for MergeIter<'a, R>
+where
+    R: Iterator<Item = Record>
+{
+    type Item = R::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(item) = self.heap.pop() {
@@ -408,5 +528,63 @@ impl<'a> Iterator for MergeIter<'a> {
         }
 
         None
+    }
+}
+
+pub struct SSTableScanner<'a> {
+    r: io::BufReader<fs::File>,
+    buffer: Vec<u8>,
+    meta: &'a SSTableMeta,
+}
+
+impl<'a> SSTableScanner<'a> {
+    pub(crate) fn new(
+        path: &'a path::PathBuf,
+        meta: &'a SSTableMeta,
+    ) -> anyhow::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .context("SSTableIter::new: failed to open sstable file")?;
+        let r: io::BufReader<fs::File> = io::BufReader::new(f);
+
+        Ok(Self {
+            r,
+            buffer: Vec::with_capacity(1024),
+            meta,
+        })
+    }
+}
+
+impl<'a> Iterator for SSTableScanner<'a> {
+    type Item = Record;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.r.stream_position().ok()? >= self.meta.bloom_offset {
+                return None;
+            }
+            self.buffer.resize(8, 0);
+            match self.r.read_exact(&mut self.buffer[..8]) {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+                Err(e) => {
+                    tracing::error!(error = %e, "SSTableScanner.next: failed to read record length");
+                    return None;
+                }
+                Ok(_) => {}
+            }
+
+            let rec_len = u64::from_le_bytes([
+                self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
+                self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
+            ]) as usize;
+            self.buffer.resize(8 + rec_len, 0);
+            if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
+                tracing::error!(error = %e, "SSTableScanner.next: failed to read record");
+                return None;
+            }
+
+            let rec = Record::from_vec(self.buffer[8..].to_vec());
+            return Some(rec);
+        }
     }
 }

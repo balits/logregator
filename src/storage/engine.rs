@@ -23,15 +23,16 @@ pub(crate) struct SSTableMeta {
     pub(crate) bloom: BloomFilter,
     pub(crate) bloom_offset: u64,
     pub(crate) file_size: u64,
+    pub(crate) num_records: usize,
 }
 
 pub struct Engine {
-    dir: PathBuf,
-    wal: Wal,
-    memtable: MemTable,
-    sst_counter: AtomicUsize,
-    seq_counter: AtomicU64,
-    sstable_map: HashMap<PathBuf, SSTableMeta>,
+    pub(crate) dir: PathBuf,
+    pub(crate) wal: Wal,
+    pub(crate) memtable: MemTable,
+    pub(crate) sst_counter: AtomicUsize,
+    pub(crate) seq_counter: AtomicU64,
+    pub(crate) sstable_map: HashMap<PathBuf, SSTableMeta>,
 }
 
 impl Engine {
@@ -75,6 +76,7 @@ impl Engine {
                 .context("engine.open: failed to open sstable for seq scan")?;
 
             let mut r = io::BufReader::new(f);
+            let mut num_records = 0usize;
             
             loop {
                 let mut len_buf = [0u8; 8];
@@ -89,6 +91,7 @@ impl Engine {
                     .context("engine.open: failed to read sstable record")?;
                 if let Ok(seq) = Record::from_vec(rec_buf).extract_seq_num() {
                     max_seq_num = max_seq_num.max(seq);
+                    num_records += 1
                 }
             }
 
@@ -96,6 +99,7 @@ impl Engine {
             let meta = SSTableMeta {
                 bloom: entry.0,
                 bloom_offset: entry.1,
+                num_records,
                 file_size: fs::metadata(path)
                     .context("engine.open: failed to read sstable file metadata")?
                     .len(),
@@ -148,6 +152,7 @@ impl Engine {
         let mut w = io::BufWriter::new(f);
         let mut bloom = BloomFilter::new(self.memtable.len(), 0.01);
 
+        let mut num_records = 0usize;
         for rec in self.memtable.iter() {
             let len_buf = (rec.len() as u64).to_le_bytes();
             w.write_all(&len_buf)
@@ -155,6 +160,7 @@ impl Engine {
             w.write_all(rec.as_bytes())
                 .context("engine.flush: failed to write record")?;
             bloom.insert(rec.extract_source_id()?, rec.extract_key()?);
+            num_records += 1
         }
 
         let bloom_offset = w.stream_position()
@@ -164,18 +170,19 @@ impl Engine {
         w.write_all(&bloom_offset.to_le_bytes())
             .context("engine.flush: failed to write bloom filter offset")?;
 
-        self.sstable_map.insert(path.clone(), SSTableMeta {
-            bloom,
-            bloom_offset,
-            file_size: fs::metadata(&path)
-                .context("engine.flush: failed to read sstable file metadata")?
-                .len(),
-        });
-
         w.flush().context("engine.flush: failed to flush write buffer")?;
         w.get_ref()
             .sync_all()
             .context("engine.flush: failed to sync_all file")?;
+
+        self.sstable_map.insert(path.clone(), SSTableMeta {
+            bloom,
+            bloom_offset,
+            num_records,
+            file_size: fs::metadata(&path)
+                .context("engine.flush: failed to read sstable file metadata")?
+                .len(),
+        });
 
         self.memtable.clear();
         self.wal
@@ -186,7 +193,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn range<'a>(&'a self, source_id: i64, key: &'a str, start_ts: i64, end_ts: i64) -> anyhow::Result<MergeIter<'a>> {
+    pub fn range<'a>(&'a self, source_id: i64, key: &'a str, start_ts: i64, end_ts: i64) -> anyhow::Result<MergeIter<'a, SSTableIter>> {
         if start_ts > end_ts {
             bail!("engine.range: end_ts cannot be smaller than start_ts")
         }
@@ -216,7 +223,7 @@ impl Engine {
             })
             .collect();
 
-        Ok(MergeIter::new(memtable_iter, sstable_iters))
+        Ok(MergeIter::new(Some(memtable_iter), sstable_iters))
     }
 }
 
