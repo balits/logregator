@@ -3,6 +3,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use tracing::trace;
 
 use crate::storage::{BloomFilter, iter::{MemTableIter, MergeIter, SSTableIter}, record::Record};
 use crate::storage::{MemTable, Wal};
@@ -18,13 +19,19 @@ fn read_sorted_sstables(dir: &PathBuf) -> anyhow::Result<Vec<PathBuf>> {
     Ok(sstables)
 }
 
+pub(crate) struct SSTableMeta {
+    pub(crate) bloom: BloomFilter,
+    pub(crate) bloom_offset: u64,
+    pub(crate) file_size: u64,
+}
+
 pub struct Engine {
     dir: PathBuf,
     wal: Wal,
     memtable: MemTable,
     sst_counter: AtomicUsize,
     seq_counter: AtomicU64,
-    bloom_cache: HashMap<PathBuf, (BloomFilter, u64)>,
+    sstable_map: HashMap<PathBuf, SSTableMeta>,
 }
 
 impl Engine {
@@ -58,13 +65,17 @@ impl Engine {
             }
         }
 
+        let mut sstable_map = HashMap::new();
+
         // scan existing sstables for max seq_num
         for path in &sstables {
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .open(path)
                 .context("engine.open: failed to open sstable for seq scan")?;
+
             let mut r = io::BufReader::new(f);
+            
             loop {
                 let mut len_buf = [0u8; 8];
                 match r.read_exact(&mut len_buf) {
@@ -75,19 +86,23 @@ impl Engine {
                 let rec_len = u64::from_le_bytes(len_buf) as usize;
                 let mut rec_buf = vec![0u8; rec_len];
                 r.read_exact(&mut rec_buf)
-                    .context("engine: failed to read sstable record")?;
+                    .context("engine.open: failed to read sstable record")?;
                 if let Ok(seq) = Record::from_vec(rec_buf).extract_seq_num() {
                     max_seq_num = max_seq_num.max(seq);
                 }
             }
+
+            let entry = load_bloom(r)?;
+            let meta = SSTableMeta {
+                bloom: entry.0,
+                bloom_offset: entry.1,
+                file_size: fs::metadata(path)
+                    .context("engine.open: failed to read sstable file metadata")?
+                    .len(),
+            };
+            sstable_map.insert(path.to_owned(), meta);
         }
 
-        let mut bloom_cache = HashMap::new();
-        for path in &sstables {
-            if let Ok(entry) = load_bloom(path) {
-                bloom_cache.insert(path.clone(), entry);
-            }
-        }
 
         let mut e = Self {
             dir,
@@ -95,7 +110,7 @@ impl Engine {
             memtable,
             sst_counter: AtomicUsize::new(max_sst_id + 1),
             seq_counter: AtomicU64::new(max_seq_num + 1),
-            bloom_cache,
+            sstable_map,
         };
 
         if needs_flush {
@@ -148,7 +163,14 @@ impl Engine {
             .context("engine.flush: failed to write bloom filter footer")?;
         w.write_all(&bloom_offset.to_le_bytes())
             .context("engine.flush: failed to write bloom filter offset")?;
-        self.bloom_cache.insert(path, (bloom, bloom_offset));
+
+        self.sstable_map.insert(path.clone(), SSTableMeta {
+            bloom,
+            bloom_offset,
+            file_size: fs::metadata(&path)
+                .context("engine.flush: failed to read sstable file metadata")?
+                .len(),
+        });
 
         w.flush().context("engine.flush: failed to flush write buffer")?;
         w.get_ref()
@@ -176,13 +198,17 @@ impl Engine {
         let sstable_iters = read_sorted_sstables(&self.dir)
             .context("engine.range: failed to read sstable directory entries")?
             .iter().filter_map(|p| {
-                if let Some((bloom, _)) = self.bloom_cache.get(p) {
-                    if !bloom.contains(source_id, key.as_bytes()) {
-                        return None;
-                    }
+                let meta_opt = self.sstable_map.get(p);
+                if meta_opt.is_none()  {
+                    tracing::warn!(sstable_path = %p.display(), "metadata not found for sstabl");
+                    return None
                 }
-                let end_pos = self.bloom_cache.get(p).map(|(_, o)| *o);
-                SSTableIter::new(p, source_id, key, start_ts, end_ts, end_pos)
+                let meta = self.sstable_map.get(p).unwrap();
+                if !meta.bloom.contains(source_id, key.as_bytes()) {
+                    return None
+                }
+
+                SSTableIter::new(p, source_id, key, start_ts, end_ts, meta.bloom_offset)
                     .inspect_err(|e| {
                         tracing::error!(error = %e, "engine.range: failed to turn sstable path to iterator");
                     })
@@ -194,13 +220,7 @@ impl Engine {
     }
 }
 
-fn load_bloom(path: &Path) -> anyhow::Result<(BloomFilter, u64)> {
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .open(path)?;
-
-    let mut w = io::BufReader::new(f);
-
+fn load_bloom<R: io::Read + io::Seek>(mut w: R) -> anyhow::Result<(BloomFilter, u64)> {
     // footer is 8 bytes yet, in the future when we introduce block indecies it needs to be revisited
     w.seek(io::SeekFrom::End(-8)).context("failed to seek to sstable file end")?;
     let mut bloom_offset_buf = [0u8; 8];

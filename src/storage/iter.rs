@@ -12,7 +12,7 @@ pub struct SSTableIter {
     end: Record, // exclusive
     key: Vec<u8>,
     buffer: Vec<u8>,
-    end_pos: Option<u64>, // byte offset where records end (bloom footer start)
+    end_pos: u64, // byte offset where records end (tfooter start)
 }
 
 impl SSTableIter {
@@ -22,7 +22,7 @@ impl SSTableIter {
         key: &str,
         start_ts: i64,
         end_ts: i64,
-        end_pos: Option<u64>,
+        end_pos: u64,
     ) -> anyhow::Result<Self> {
         if start_ts > end_ts {
             bail!("SSTableIter::new: end_ts cannot be smaller than start_ts")
@@ -55,10 +55,8 @@ impl Iterator for SSTableIter {
     type Item = Record;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(end) = self.end_pos {
-                if self.r.stream_position().ok()? >= end {
-                    return None;
-                }
+            if self.r.stream_position().ok()? >= self.end_pos {
+                return None;
             }
             self.buffer.resize(8, 0);
             match self.r.read_exact(&mut self.buffer[..8]) {
@@ -101,7 +99,7 @@ mod sstable_iter_tests {
     use std::{io::Write, path::PathBuf};
     use tempfile::tempdir;
 
-    fn write_sstable(path: &PathBuf, records: &[Record]) {
+    fn write_sstable(path: &PathBuf, records: &[Record]) -> u64 {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -114,6 +112,7 @@ mod sstable_iter_tests {
             w.write_all(rec.as_bytes()).unwrap();
         }
         w.flush().unwrap();
+        std::fs::metadata(path).unwrap().len()
     }
 
     #[test]
@@ -125,9 +124,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
             Record::from_raw_parts(1, 30, 0, "sys", "c"),
         ];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 40, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 10, 40, len).unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -144,9 +142,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "a"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 30, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 10, 30, len).unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -162,9 +159,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
             Record::from_raw_parts(1, 30, 0, "sys", "past_end"),
         ];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 20, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 10, 20, len).unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -175,9 +171,8 @@ mod sstable_iter_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 10, 0, "sys", "a")];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 10, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 10, 10, len).unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -192,7 +187,8 @@ mod sstable_iter_tests {
             .unwrap();
         drop(f);
 
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, None).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len).unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -201,9 +197,8 @@ mod sstable_iter_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len).unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_value().unwrap(), b"loner");
@@ -214,9 +209,8 @@ mod sstable_iter_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 20, 0, "sys", "a")];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 10, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 0, 10, len).unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -230,8 +224,8 @@ mod sstable_iter_tests {
             .open(&path)
             .unwrap();
 
-        assert!(SSTableIter::new(&path, 1, "sys", 10, 5, None).is_err());
-        assert!(SSTableIter::new(&path, 1, "sys", -1, 10, None).is_err());
+        assert!(SSTableIter::new(&path, 1, "sys", 10, 5, 0).is_err());
+        assert!(SSTableIter::new(&path, 1, "sys", -1, 10, 0).is_err());
     }
 
     #[test]
@@ -243,9 +237,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
             Record::from_raw_parts(2, 10, 0, "sys", "other_source"),
         ];
-        write_sstable(&path, &records);
-
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, None).unwrap();
+        let len = write_sstable(&path, &records);
+        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len).unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert!(
