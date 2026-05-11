@@ -1,25 +1,33 @@
 use std::{
-    collections::HashMap, fs::{self}, io::{self, Read, Seek, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicU64, AtomicUsize, Ordering}
+    collections::BTreeMap, fs::{self}, io::{self, Read, Seek, SeekFrom, Write}, path::PathBuf
 };
 
 use anyhow::{Context, bail};
-use tracing::trace;
+use tokio::sync::mpsc;
 
-use crate::storage::{BloomFilter, iter::{MemTableIter, MergeIter, SSTableIter}, record::Record};
+use crate::storage::{BloomFilter, compaction::{self, CompactionCommand, CompactionResult}, iter::{MemTableIterOwned, MergeIter, SSTableIter}, record::Record};
 use crate::storage::{MemTable, Wal};
+use crate::storage::cmd;
 
-fn read_sorted_sstables(dir: &PathBuf) -> anyhow::Result<Vec<PathBuf>> {
-    let mut sstables: Vec<PathBuf> = std::fs::read_dir(dir)
-        .context("failed to read sstable directory contents")?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("sst"))
-        .collect();
-    sstables.sort();
-    Ok(sstables)
+#[derive(Debug)]
+pub struct Insert {
+    source_id: i64,
+    ts: i64,
+    key: String,
+    value: String,
+}
+#[derive(Debug)]
+pub struct Range {
+    source_id: i64,
+    key: String,
+    start_ts: i64,
+    end_ts: i64,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct SSTableMeta {
+    pub(crate) id: usize,
+    pub(crate) path: PathBuf,
     pub(crate) bloom: BloomFilter,
     pub(crate) bloom_offset: u64,
     pub(crate) file_size: u64,
@@ -29,20 +37,72 @@ pub(crate) struct SSTableMeta {
 pub struct Engine {
     pub(crate) dir: PathBuf,
     pub(crate) wal: Wal,
+    pub(crate) compaction_tx: mpsc::Sender<CompactionCommand>,
+    pub(crate) compaction_rx: mpsc::Receiver<CompactionResult>,
+
     pub(crate) memtable: MemTable,
-    pub(crate) sst_counter: AtomicUsize,
-    pub(crate) seq_counter: AtomicU64,
-    pub(crate) sstable_map: HashMap<PathBuf, SSTableMeta>,
+    pub(crate) sstable_map: BTreeMap<usize, SSTableMeta>,
+    pub(crate) sst_counter: usize,
+    pub(crate) seq_counter: u64,
 }
 
 impl Engine {
-    pub fn open(dir: PathBuf, limit: usize) -> anyhow::Result<Self> {
+    pub async fn run_main_loop(
+        &mut self,
+        mut network_rx: mpsc::Receiver<cmd::Command>,
+        network_tx: mpsc::Sender<cmd::Result>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                Some(cmd) = network_rx.recv() => {
+                    match cmd {
+                        cmd::Command::Insert(i) => {
+                            let res = self.insert(i.source_id, i.ts, &i.key, &i.value);
+                            network_tx
+                                .send(cmd::Result::Insert(res))
+                                .await
+                                .context("engine.loop: failed to reply to insert command")?;
+                        }
+                        cmd::Command::Range(r) => {
+                            let res = self.range(r.source_id, &r.key, r.start_ts, r.end_ts);
+                            network_tx
+                                .send(cmd::Result::Range(res))
+                                .await
+                                .context("engine.loop: failed to reply to range command")?;
+                        }
+                        rest => {
+                            tracing::warn!("engine.loop: dropping unexpected command {:?}", rest)
+                        }
+                    }
+                },
+
+                Some(CompactionResult { new_meta, ids_to_remove }) = self.compaction_rx.recv() => {
+                    for file_id in ids_to_remove {
+                        self.sstable_map.remove(&file_id);
+                        let file_path = make_sstable_path(&self.dir, file_id);
+                        if let Err(e) = fs::remove_file(&file_path) {
+                            tracing::error!(error = %e, "engine.loop: compaction finished, but failed to remove file {}", file_path.display())
+                        }
+                    }
+                    self.sstable_map.insert(new_meta.id, new_meta);
+                    tracing::info!("engine.loop: compaction finished, applying result")
+                }
+            }
+        }
+    }
+
+    pub fn open(
+        dir: PathBuf,
+        memtable_limit: usize,
+        compaction_tx: mpsc::Sender<CompactionCommand>,
+        compaction_rx: mpsc::Receiver<CompactionResult>
+    ) -> anyhow::Result<Self> {
         if !dir.exists() {
             fs::create_dir_all(&dir).context("engine.open: directory does not exist")?;
         }
 
         let wal_path = dir.join(Wal::WAL_PATH_FMT);
-        let mut memtable = MemTable::new(limit);
+        let mut memtable = MemTable::new(memtable_limit);
         let mut wal = Wal::new(&wal_path).context("engine.open: failed to create wal")?;
 
         let recovered = wal.recover().context("engine.open: failed recover WAL")?;
@@ -56,20 +116,27 @@ impl Engine {
             needs_flush = memtable.insert(rec);
         }
 
-        let sstables = read_sorted_sstables(&dir).context("engine.open: failed to read sstable directory entries")?;
+        let mut sstables: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .context("failed to read sstable directory contents")?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("sst"))
+            .collect();
+        sstables.sort();
         let mut max_sst_id = 0;
-        for path in &sstables {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(id) = stem.parse::<usize>() {
-                    max_sst_id = max_sst_id.max(id);
-                }
-            }
-        }
 
-        let mut sstable_map = HashMap::new();
+        let mut sstable_map = BTreeMap::new();
 
         // scan existing sstables for max seq_num
         for path in &sstables {
+            let file_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context("engine.open: failed to get valid UTF-8 file stem")?
+                .parse::<usize>()
+                .context("engine.open: failed to parse sstable id from file stem")?;
+            max_sst_id = max_sst_id.max(file_id);
+
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .open(path)
@@ -97,6 +164,8 @@ impl Engine {
 
             let entry = load_bloom(r)?;
             let meta = SSTableMeta {
+                id: file_id,
+                path: path.clone(),
                 bloom: entry.0,
                 bloom_offset: entry.1,
                 num_records,
@@ -104,7 +173,7 @@ impl Engine {
                     .context("engine.open: failed to read sstable file metadata")?
                     .len(),
             };
-            sstable_map.insert(path.to_owned(), meta);
+            sstable_map.insert(file_id, meta);
         }
 
 
@@ -112,9 +181,11 @@ impl Engine {
             dir,
             wal,
             memtable,
-            sst_counter: AtomicUsize::new(max_sst_id + 1),
-            seq_counter: AtomicU64::new(max_seq_num + 1),
             sstable_map,
+            sst_counter: max_sst_id + 1,
+            seq_counter: max_seq_num + 1,
+            compaction_rx,
+            compaction_tx,
         };
 
         if needs_flush {
@@ -125,24 +196,31 @@ impl Engine {
     }
 
     pub fn insert(&mut self, source_id: i64, ts: i64, key: &str, value: &str) -> anyhow::Result<()> {
-        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
-        let rec = Record::from_raw_parts(source_id, ts, seq, key, value);
-
+        let current_seq = self.seq_counter;
+        let rec = Record::from_raw_parts(source_id, ts, current_seq, key, value);
         self.wal
             .append(&rec)
             .context("engine.insert: failed to append to WAL")?;
-        if self.memtable.insert(rec) {
+
+        let needs_flush = self.memtable.insert(rec);
+        self.seq_counter += 1;
+
+        if needs_flush {
             self.flush().context("engine.insert: failed to flush to SSTable")?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
-        let mut path = self.dir.clone();
-        path.push(format!(
-            "{:010}.sst",
-            self.sst_counter.load(Ordering::Relaxed)
-        ));
+        let file_id = self.sst_counter;
+        let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
+        self.memtable.clear();
+
+        if memtable_records.is_empty() {
+            return Ok(());
+        }
+
+        let path = make_sstable_path(&self.dir, file_id);
 
         let f = std::fs::OpenOptions::new()
             .write(true)
@@ -150,10 +228,10 @@ impl Engine {
             .open(&path)
             .context("engine.flush: failed to open sstable file")?;
         let mut w = io::BufWriter::new(f);
-        let mut bloom = BloomFilter::new(self.memtable.len(), 0.01);
+        let mut bloom = BloomFilter::new(memtable_records.len(), 0.01);
 
         let mut num_records = 0usize;
-        for rec in self.memtable.iter() {
+        for rec in memtable_records.iter() {
             let len_buf = (rec.len() as u64).to_le_bytes();
             w.write_all(&len_buf)
                 .context("engine.flush: failed to write record length")?;
@@ -175,25 +253,50 @@ impl Engine {
             .sync_all()
             .context("engine.flush: failed to sync_all file")?;
 
-        self.sstable_map.insert(path.clone(), SSTableMeta {
+        let file_size = fs::metadata(&path)
+            .context("engine.flush: failed to read sstable file metadata")?
+            .len();
+
+        let new_meta = SSTableMeta {
+            id: file_id,
+            path,
             bloom,
             bloom_offset,
             num_records,
-            file_size: fs::metadata(&path)
-                .context("engine.flush: failed to read sstable file metadata")?
-                .len(),
-        });
+            file_size
+        };
+        self.sstable_map.insert(file_id, new_meta);
+        self.sst_counter += 1;
+        let need_compaction = self.sstable_map.len() >= 8;
 
-        self.memtable.clear();
         self.wal
             .clear()
             .context("engine.flush: failed to clear WAL")?;
-        self.sst_counter.fetch_add(1, Ordering::Relaxed);
+
+        if need_compaction {
+            let tables: Vec<SSTableMeta> = self.sstable_map
+                .iter()
+                .take(4)
+                .map(|(_, m)| m.clone())
+                .collect();
+
+            let new_file_id = self.sst_counter;
+            let new_file_path = self.dir.join(format!( "{:010}.sst", new_file_id ));
+            let cmd = compaction::CompactionCommand {
+                new_file_id,
+                new_file_path,
+                tables,
+            };
+
+            if let Err(e) = self.compaction_tx.try_send(cmd) {
+                tracing::warn!(error = %e, "failed to issue compaction, compactor queue is full")
+            }
+        }
 
         Ok(())
     }
 
-    pub fn range<'a>(&'a self, source_id: i64, key: &'a str, start_ts: i64, end_ts: i64) -> anyhow::Result<MergeIter<'a, SSTableIter>> {
+    pub fn range(&self, source_id: i64, key: &str, start_ts: i64, end_ts: i64) -> anyhow::Result<MergeIter<SSTableIter>> {
         if start_ts > end_ts {
             bail!("engine.range: end_ts cannot be smaller than start_ts")
         }
@@ -201,21 +304,17 @@ impl Engine {
             bail!("engine.range: start_ts cannot be negative")
         }
 
-        let memtable_iter = MemTableIter::filtered(&self.memtable, source_id, key.as_bytes(), start_ts, end_ts);
-        let sstable_iters = read_sorted_sstables(&self.dir)
-            .context("engine.range: failed to read sstable directory entries")?
-            .iter().filter_map(|p| {
-                let meta_opt = self.sstable_map.get(p);
-                if meta_opt.is_none()  {
-                    tracing::warn!(sstable_path = %p.display(), "metadata not found for sstabl");
-                    return None
-                }
-                let meta = self.sstable_map.get(p).unwrap();
+        let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
+
+        let memtable_iter = MemTableIterOwned::filtered(memtable_records, source_id, key.as_bytes(), start_ts, end_ts);
+        let sstable_iters = self.sstable_map
+            .values()
+            .filter_map(|meta| {
                 if !meta.bloom.contains(source_id, key.as_bytes()) {
                     return None
                 }
 
-                SSTableIter::new(p, source_id, key, start_ts, end_ts, meta.bloom_offset)
+                SSTableIter::new(&meta.path, source_id, key, start_ts, end_ts, meta.bloom_offset)
                     .inspect_err(|e| {
                         tracing::error!(error = %e, "engine.range: failed to turn sstable path to iterator");
                     })
@@ -227,17 +326,20 @@ impl Engine {
     }
 }
 
-fn load_bloom<R: io::Read + io::Seek>(mut w: R) -> anyhow::Result<(BloomFilter, u64)> {
+fn make_sstable_path(basedir: &PathBuf, file_id: usize) -> PathBuf {
+    basedir.join(format!("{:010}.sst", file_id ))
+}
+
+fn load_bloom<R: Read + Seek>(mut w: R) -> anyhow::Result<(BloomFilter, u64)> {
     // footer is 8 bytes yet, in the future when we introduce block indecies it needs to be revisited
-    w.seek(io::SeekFrom::End(-8)).context("failed to seek to sstable file end")?;
+    w.seek(SeekFrom::End(-8)).context("failed to seek to sstable file end")?;
     let mut bloom_offset_buf = [0u8; 8];
     w.read_exact(&mut bloom_offset_buf).context("failed to read bloom filter offset")?;
     let bloom_offset = u64::from_le_bytes(bloom_offset_buf);
 
-        w.seek(io::SeekFrom::Start(bloom_offset)).context("failed to seek to bloom filter start offset")?;
-        let bloom = BloomFilter::decode(&mut w).context("failed to decode bloom filter")?;
-
-        Ok((bloom, bloom_offset))
+    w.seek(io::SeekFrom::Start(bloom_offset)).context("failed to seek to bloom filter start offset")?;
+    let bloom = BloomFilter::decode(&mut w).context("failed to decode bloom filter")?;
+    Ok((bloom, bloom_offset))
 }
 
 #[cfg(test)]
@@ -245,12 +347,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn open_engine(dir: PathBuf, limit: usize) -> Engine {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<CompactionCommand>(1);
+        let (_res_tx, res_rx) = tokio::sync::mpsc::channel::<CompactionResult>(1);
+        Engine::open(dir, limit, cmd_tx, res_rx).unwrap()
+    }
+
     #[test]
     fn test_engine_initialization() {
         let dir = tempdir().unwrap();
         let engine_dir = dir.path().join("db_data");
 
-        let engine = Engine::open(engine_dir.clone(), 1024).unwrap();
+        let engine = open_engine(engine_dir.clone(), 1024);
 
         assert!(
             engine_dir.exists(),
@@ -261,13 +369,13 @@ mod tests {
             "engine should create the WAL file"
         );
 
-        assert_eq!(engine.sst_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.sst_counter, 1);
     }
 
     #[test]
     fn test_engine_range_validation() {
         let dir = tempdir().unwrap();
-        let engine = Engine::open(dir.path().to_path_buf(), 1024).unwrap();
+        let engine = open_engine(dir.path().to_path_buf(), 1024);
 
         assert!(engine.range(1, "sys", 10, 5).is_err());
         assert!(engine.range(1, "sys", -1, 10).is_err());
@@ -276,7 +384,7 @@ mod tests {
     #[test]
     fn test_engine_range_no_matches() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 1024).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
 
@@ -288,7 +396,7 @@ mod tests {
     #[test]
     fn test_engine_range_in_memtable_only() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 1024).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "sys", "mem high").unwrap();
@@ -307,7 +415,7 @@ mod tests {
     #[test]
     fn test_engine_range_start_inclusive_end_exclusive() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 1024).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "sys", "mem high").unwrap();
@@ -323,7 +431,7 @@ mod tests {
     #[test]
     fn test_engine_range_key_filtering() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 50).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "db", "query slow").unwrap();
@@ -343,7 +451,7 @@ mod tests {
     #[test]
     fn test_engine_range_across_sstables() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 50).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "sys", "mem high").unwrap();
@@ -362,7 +470,7 @@ mod tests {
     #[test]
     fn test_engine_range_overlapping_sstables() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 50).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
         engine.insert(1, 15, "sys", "first flush").unwrap();
         engine.insert(1, 25, "sys", "flush_trigger_01").unwrap();
@@ -380,7 +488,7 @@ mod tests {
     #[test]
     fn test_engine_range_memtable_and_sstables() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 50).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
         engine.insert(1, 10, "sys", "flushed").unwrap();
         engine.insert(1, 20, "sys", "flush_trigger_01").unwrap();
@@ -401,7 +509,7 @@ mod tests {
     #[test]
     fn test_engine_flush_trigger() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path().to_path_buf(), 50).unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
         let sst_file_path = dir.path().join("0000000001.sst");
 
@@ -422,7 +530,7 @@ mod tests {
         let wal_metadata = std::fs::metadata(dir.path().join(Wal::WAL_PATH_FMT)).unwrap();
         assert_eq!(wal_metadata.len(), 0);
 
-        assert_eq!(engine.sst_counter.load(Ordering::Relaxed), 2);
+        assert_eq!(engine.sst_counter, 2);
     }
 
 }

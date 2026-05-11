@@ -5,10 +5,10 @@ use std::{
 
 use anyhow::Context;
 
-const SALT1: &'static [u8] = b"bloom_salt_1";
-const SALT2: &'static [u8] = b"bloom_salt_2";
+const SALT1: &[u8] = b"bloom_salt_1";
+const SALT2: &[u8] = b"bloom_salt_2";
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct BloomFilter {
     bitmap: Vec<u8>,
     n_bits: usize,
@@ -21,7 +21,7 @@ impl BloomFilter {
         let m = (-(n as f64 * fpr.ln()) / 2f64.ln().powi(2)).ceil() as usize;
         let k = ((m as f64 / (n as f64)) * 2f64.ln()) as usize;
         Self {
-            bitmap: vec![0; (m + 7) / 8],
+            bitmap: vec![0; m.div_ceil(8)],
             n_bits: m,
             n_hashes: k.max(1),
             rs: RandomState::new(),
@@ -86,8 +86,8 @@ impl BloomFilter {
             .context("bloom_filter.decode: failed to read filter contents")?;
 
         Ok(Self {
-            n_bits: n_bits,
-            n_hashes: n_hashes,
+            n_bits,
+            n_hashes,
             bitmap: bitmap_buf,
             rs: RandomState::new(),
         })

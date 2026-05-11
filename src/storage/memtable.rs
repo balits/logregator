@@ -6,6 +6,7 @@ use crate::storage::record::Record;
 /// log records. Inserting a record fills up the capacity
 /// of the memtable, returning a true if the table has exceeded
 /// its capacity and is in need of flushing.
+#[derive(Clone)]
 pub(crate) struct MemTable {
     current_sz: usize,
     limit: usize,
@@ -54,6 +55,7 @@ impl MemTable {
 }
 
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]
