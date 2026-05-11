@@ -1,9 +1,8 @@
-use crate::storage::Wal;
-
 mod storage;
+mod proto;
+mod server;
 
 fn main() {
-    let _w: Wal;
     println!("Hello, world!");
 }
 

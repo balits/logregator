@@ -1,28 +1,23 @@
 use std::{
-    collections::BTreeMap, fs::{self}, io::{self, Read, Seek, SeekFrom, Write}, path::PathBuf
+    collections::BTreeMap,
+    fs::{self},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
 };
 
 use anyhow::{Context, bail};
 use tokio::sync::mpsc;
 
-use crate::storage::{BloomFilter, compaction::{self, CompactionCommand, CompactionResult}, iter::{MemTableIterOwned, MergeIter, SSTableIter}, record::Record};
 use crate::storage::{MemTable, Wal};
-use crate::storage::cmd;
-
-#[derive(Debug)]
-pub struct Insert {
-    source_id: i64,
-    ts: i64,
-    key: String,
-    value: String,
-}
-#[derive(Debug)]
-pub struct Range {
-    source_id: i64,
-    key: String,
-    start_ts: i64,
-    end_ts: i64,
-}
+use crate::{
+    proto,
+    storage::{
+        BloomFilter,
+        compaction::{self, CompactionCommand, CompactionResult},
+        iter::{MemTableIterOwned, MergeIter, SSTableIter},
+        record::Record,
+    },
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SSTableMeta {
@@ -49,29 +44,67 @@ pub struct Engine {
 impl Engine {
     pub async fn run_main_loop(
         &mut self,
-        mut network_rx: mpsc::Receiver<cmd::Command>,
-        network_tx: mpsc::Sender<cmd::Result>,
+        mut network_rx: mpsc::Receiver<proto::Command>,
     ) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 Some(cmd) = network_rx.recv() => {
                     match cmd {
-                        cmd::Command::Insert(i) => {
+                        proto::Command::Insert(i, sender) => {
                             let res = self.insert(i.source_id, i.ts, &i.key, &i.value);
-                            network_tx
-                                .send(cmd::Result::Insert(res))
-                                .await
-                                .context("engine.loop: failed to reply to insert command")?;
+                            if sender.send(res).is_err() {
+                                tracing::warn!("engine.loop(cmd=INSERT): failed to send result through the channel");
+                            }
+                            tracing::debug!("engine.loop(cmd=INSERT): replyed successfuly");
                         }
-                        cmd::Command::Range(r) => {
-                            let res = self.range(r.source_id, &r.key, r.start_ts, r.end_ts);
-                            network_tx
-                                .send(cmd::Result::Range(res))
-                                .await
-                                .context("engine.loop: failed to reply to range command")?;
+                        proto::Command::BatchInsert(b, sender) => {
+                            let res = self.batch_insert(b.records);
+                            if sender.send(res).is_err() {
+                                tracing::warn!("engine.loop(cmd=BATCH_INSERT): failed to send result through the channel");
+                            }
+                            tracing::debug!("engine.loop(cmd=BATCH_INSERT): replyed successfuly");
                         }
-                        rest => {
-                            tracing::warn!("engine.loop: dropping unexpected command {:?}", rest)
+                        proto::Command::Range(r, end_sender, record_sender) => {
+                            let merge_iter = self.range(r.source_id, &r.key, r.start_ts, r.end_ts);
+                            tokio::task::spawn_blocking(move || {
+                                match merge_iter {
+                                    Ok(iter) => {
+                                        let mut loop_err: anyhow::Result<()> = Ok(());
+                                        for raw_rec in iter {
+                                            match proto::Record::try_from(raw_rec) {
+                                                Ok(rec) => {
+                                                    if let Err(err) = record_sender.blocking_send(rec) {
+                                                        tracing::warn!(error = %err, "engine.loop(cmd=RANGE): failed to send record");
+                                                        loop_err = Err(anyhow::Error::new(err));
+                                                        break;
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    tracing::warn!(error = %err, "engine.loop(cmd=RANGE): failed parse record bytes");
+                                                    loop_err = Err(err);
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if let Err(err) = loop_err {
+                                            if end_sender.send(Err(err)).is_err() {
+                                                tracing::warn!("engine.loop(cmd=RANGE): failed to send end=Error");
+                                            }
+                                        } else {
+                                            if end_sender.send(Ok(())).is_err() {
+                                                tracing::warn!("engine.loop(cmd=RANGE): failed to send end=RangeEnd");
+                                            }
+                                        }
+                                        drop(record_sender);
+                                    },
+                                    Err(err) => {
+                                        if end_sender.send(Err(err)).is_err() {
+                                            tracing::warn!("engine.loop(cmd=RANGE): failed to send end=Error");
+                                        }
+                                    }
+                                }
+                            });
                         }
                     }
                 },
@@ -95,7 +128,7 @@ impl Engine {
         dir: PathBuf,
         memtable_limit: usize,
         compaction_tx: mpsc::Sender<CompactionCommand>,
-        compaction_rx: mpsc::Receiver<CompactionResult>
+        compaction_rx: mpsc::Receiver<CompactionResult>,
     ) -> anyhow::Result<Self> {
         if !dir.exists() {
             fs::create_dir_all(&dir).context("engine.open: directory does not exist")?;
@@ -144,12 +177,14 @@ impl Engine {
 
             let mut r = io::BufReader::new(f);
             let mut num_records = 0usize;
-            
+
             loop {
                 let mut len_buf = [0u8; 8];
                 match r.read_exact(&mut len_buf) {
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e).context("engine.open: failed to read sstable record length"),
+                    Err(e) => {
+                        return Err(e).context("engine.open: failed to read sstable record length");
+                    }
                     Ok(_) => {}
                 }
                 let rec_len = u64::from_le_bytes(len_buf) as usize;
@@ -176,7 +211,6 @@ impl Engine {
             sstable_map.insert(file_id, meta);
         }
 
-
         let mut e = Self {
             dir,
             wal,
@@ -189,13 +223,20 @@ impl Engine {
         };
 
         if needs_flush {
-            e.flush().context("engine.open: failed to flush to SSTable after recovering logs")?;
+            e.flush()
+                .context("engine.open: failed to flush to SSTable after recovering logs")?;
         }
 
         Ok(e)
     }
 
-    pub fn insert(&mut self, source_id: i64, ts: i64, key: &str, value: &str) -> anyhow::Result<()> {
+    pub fn insert(
+        &mut self,
+        source_id: i64,
+        ts: i64,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
         let current_seq = self.seq_counter;
         let rec = Record::from_raw_parts(source_id, ts, current_seq, key, value);
         self.wal
@@ -206,8 +247,44 @@ impl Engine {
         self.seq_counter += 1;
 
         if needs_flush {
-            self.flush().context("engine.insert: failed to flush to SSTable")?;
+            self.flush()
+                .context("engine.insert: failed to flush to SSTable")?;
         }
+        Ok(())
+    }
+
+    pub fn batch_insert(&mut self, inserts: Vec<proto::Insert>) -> anyhow::Result<()> {
+        let count = inserts.len();
+        let mut records: Vec<Record> = Vec::with_capacity(count);
+
+        for ins in &inserts {
+            records.push(Record::from_raw_parts(
+                ins.source_id,
+                ins.ts,
+                self.seq_counter,
+                &ins.key,
+                &ins.value,
+            ));
+            self.seq_counter += 1;
+        }
+
+        self.wal
+            .batch_append(&records)
+            .context("engine.batch_insert: failed to append to WAL")?;
+
+        let mut needs_flush = false;
+        for rec in records {
+            if self.memtable.insert(rec) {
+                needs_flush = true;
+            }
+        }
+
+        if needs_flush {
+            self.flush()
+                .context("engine.batch_insert: failed to flush to SSTable")?;
+        }
+
+        tracing::debug!(count, "engine.batch_insert: inserted batch");
         Ok(())
     }
 
@@ -241,14 +318,17 @@ impl Engine {
             num_records += 1
         }
 
-        let bloom_offset = w.stream_position()
+        let bloom_offset = w
+            .stream_position()
             .context("engine.flush: failed to seek to current position")?;
-        bloom.encode(&mut w)
+        bloom
+            .encode(&mut w)
             .context("engine.flush: failed to write bloom filter footer")?;
         w.write_all(&bloom_offset.to_le_bytes())
             .context("engine.flush: failed to write bloom filter offset")?;
 
-        w.flush().context("engine.flush: failed to flush write buffer")?;
+        w.flush()
+            .context("engine.flush: failed to flush write buffer")?;
         w.get_ref()
             .sync_all()
             .context("engine.flush: failed to sync_all file")?;
@@ -263,7 +343,7 @@ impl Engine {
             bloom,
             bloom_offset,
             num_records,
-            file_size
+            file_size,
         };
         self.sstable_map.insert(file_id, new_meta);
         self.sst_counter += 1;
@@ -274,14 +354,15 @@ impl Engine {
             .context("engine.flush: failed to clear WAL")?;
 
         if need_compaction {
-            let tables: Vec<SSTableMeta> = self.sstable_map
+            let tables: Vec<SSTableMeta> = self
+                .sstable_map
                 .iter()
                 .take(4)
                 .map(|(_, m)| m.clone())
                 .collect();
 
             let new_file_id = self.sst_counter;
-            let new_file_path = self.dir.join(format!( "{:010}.sst", new_file_id ));
+            let new_file_path = self.dir.join(format!("{:010}.sst", new_file_id));
             let cmd = compaction::CompactionCommand {
                 new_file_id,
                 new_file_path,
@@ -296,7 +377,13 @@ impl Engine {
         Ok(())
     }
 
-    pub fn range(&self, source_id: i64, key: &str, start_ts: i64, end_ts: i64) -> anyhow::Result<MergeIter<SSTableIter>> {
+    pub fn range(
+        &self,
+        source_id: i64,
+        key: &str,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> anyhow::Result<MergeIter<SSTableIter>> {
         if start_ts > end_ts {
             bail!("engine.range: end_ts cannot be smaller than start_ts")
         }
@@ -306,7 +393,13 @@ impl Engine {
 
         let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
 
-        let memtable_iter = MemTableIterOwned::filtered(memtable_records, source_id, key.as_bytes(), start_ts, end_ts);
+        let memtable_iter = MemTableIterOwned::filtered(
+            memtable_records,
+            source_id,
+            key.as_bytes(),
+            start_ts,
+            end_ts,
+        );
         let sstable_iters = self.sstable_map
             .values()
             .filter_map(|meta| {
@@ -327,17 +420,20 @@ impl Engine {
 }
 
 fn make_sstable_path(basedir: &PathBuf, file_id: usize) -> PathBuf {
-    basedir.join(format!("{:010}.sst", file_id ))
+    basedir.join(format!("{:010}.sst", file_id))
 }
 
 fn load_bloom<R: Read + Seek>(mut w: R) -> anyhow::Result<(BloomFilter, u64)> {
     // footer is 8 bytes yet, in the future when we introduce block indecies it needs to be revisited
-    w.seek(SeekFrom::End(-8)).context("failed to seek to sstable file end")?;
+    w.seek(SeekFrom::End(-8))
+        .context("failed to seek to sstable file end")?;
     let mut bloom_offset_buf = [0u8; 8];
-    w.read_exact(&mut bloom_offset_buf).context("failed to read bloom filter offset")?;
+    w.read_exact(&mut bloom_offset_buf)
+        .context("failed to read bloom filter offset")?;
     let bloom_offset = u64::from_le_bytes(bloom_offset_buf);
 
-    w.seek(io::SeekFrom::Start(bloom_offset)).context("failed to seek to bloom filter start offset")?;
+    w.seek(io::SeekFrom::Start(bloom_offset))
+        .context("failed to seek to bloom filter start offset")?;
     let bloom = BloomFilter::decode(&mut w).context("failed to decode bloom filter")?;
     Ok((bloom, bloom_offset))
 }
@@ -388,9 +484,27 @@ mod tests {
 
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
 
-        assert!(engine.range(1, "other", 5, 15).unwrap().collect::<Vec<_>>().is_empty());
-        assert!(engine.range(1, "sys", 20, 30).unwrap().collect::<Vec<_>>().is_empty());
-        assert!(engine.range(1, "sys", 10, 10).unwrap().collect::<Vec<_>>().is_empty());
+        assert!(
+            engine
+                .range(1, "other", 5, 15)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .range(1, "sys", 20, 30)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .range(1, "sys", 10, 10)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -480,7 +594,10 @@ mod tests {
 
         let result: Vec<_> = engine.range(1, "sys", 20, 30).unwrap().collect();
         assert_eq!(result.len(), 2);
-        let mut ts: Vec<i64> = result.iter().map(|r| r.extract_timestamp().unwrap()).collect();
+        let mut ts: Vec<i64> = result
+            .iter()
+            .map(|r| r.extract_timestamp().unwrap())
+            .collect();
         ts.sort();
         assert_eq!(ts, vec![20, 25]);
     }
@@ -533,4 +650,123 @@ mod tests {
         assert_eq!(engine.sst_counter, 2);
     }
 
+    fn make_insert(source_id: i64, ts: i64, key: &str, value: &str) -> proto::Insert {
+        proto::Insert {
+            source_id,
+            ts,
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_engine_batch_insert_basic() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        let batch = vec![
+            make_insert(1, 10, "sys", "cpu normal"),
+            make_insert(1, 20, "sys", "mem high"),
+            make_insert(1, 30, "sys", "disk full"),
+        ];
+
+        engine.batch_insert(batch).unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].extract_timestamp().unwrap(), 10);
+        assert_eq!(result[1].extract_timestamp().unwrap(), 20);
+        assert_eq!(result[2].extract_timestamp().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_engine_batch_insert_seq_nums() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        // seq_counter starts at 1 after open
+        let start_seq = engine.seq_counter;
+
+        let batch = vec![
+            make_insert(1, 10, "sys", "a"),
+            make_insert(1, 20, "sys", "b"),
+            make_insert(1, 30, "sys", "c"),
+        ];
+
+        engine.batch_insert(batch).unwrap();
+
+        assert_eq!(engine.seq_counter, start_seq + 3);
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        assert_eq!(result.len(), 3);
+        for (i, rec) in result.iter().enumerate() {
+            assert_eq!(rec.extract_seq_num().unwrap(), start_seq + i as u64);
+        }
+    }
+
+    #[test]
+    fn test_engine_batch_insert_flush_trigger() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 100);
+
+        let batch = vec![
+            make_insert(1, 1, "sys", "x"),
+            make_insert(1, 2, "sys", "this_is_a_massive_payload_to_force_a_flush"),
+        ];
+
+        engine.batch_insert(batch).unwrap();
+
+        // should have flushed to SSTable
+        let sst_file_path = dir.path().join("0000000001.sst");
+        assert!(sst_file_path.exists(), "batch insert should trigger flush");
+
+        assert_eq!(engine.memtable.size_hint(), 0);
+
+        let wal_metadata = std::fs::metadata(dir.path().join(Wal::WAL_PATH_FMT)).unwrap();
+        assert_eq!(wal_metadata.len(), 0);
+    }
+
+    #[test]
+    fn test_engine_batch_insert_with_range() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
+
+        let batch = vec![
+            make_insert(1, 5, "sys", "first"),
+            make_insert(1, 10, "sys", "second"),
+        ];
+        engine.batch_insert(batch).unwrap();
+
+        // standalone insert after batch
+        engine.insert(1, 15, "sys", "third").unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 20).unwrap().collect();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].extract_timestamp().unwrap(), 5);
+        assert_eq!(result[1].extract_timestamp().unwrap(), 10);
+        assert_eq!(result[2].extract_timestamp().unwrap(), 15);
+    }
+
+    #[test]
+    fn test_engine_batch_insert_multiple_batches() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        let batch1 = vec![
+            make_insert(1, 10, "sys", "batch1_a"),
+            make_insert(1, 20, "sys", "batch1_b"),
+        ];
+        engine.batch_insert(batch1).unwrap();
+
+        let batch2 = vec![
+            make_insert(1, 30, "sys", "batch2_a"),
+            make_insert(1, 40, "sys", "batch2_b"),
+        ];
+        engine.batch_insert(batch2).unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        assert_eq!(result.len(), 4);
+        assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch1_a"));
+        assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch2_b"));
+    }
 }

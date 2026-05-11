@@ -66,6 +66,26 @@ impl Wal {
         Ok(records)
     }
 
+    pub(crate) fn batch_append(&mut self, recs: &[Record]) -> anyhow::Result<()> {
+        for rec in recs {
+            let len = rec.len() as u64;
+            self.w
+                .write_all(&len.to_le_bytes())
+                .context("wal.batch_append: failed to write prefix len")?;
+            self.w
+                .write_all(rec.as_bytes())
+                .context("wal.batch_append: failed to write record")?;
+        }
+        self.w
+            .flush()
+            .context("wal.batch_append: failed to flush")?;
+        self.w
+            .get_ref()
+            .sync_all()
+            .context("wal.batch_append: failed to sync_all")?;
+        Ok(())
+    }
+
     pub(crate) fn clear(&mut self) -> anyhow::Result<()> {
         let f = self.w.get_mut();
         f.set_len(0).context("wal.clear: failed to truncate")?;

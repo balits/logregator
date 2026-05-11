@@ -10,6 +10,9 @@ use anyhow::{Context, bail};
 
 use crate::storage::{engine::SSTableMeta, record::Record};
 
+/// SSTableIter allows buffered reading of key-values in
+/// an SSTable file within a [start, end) range
+#[derive(Debug)]
 pub struct SSTableIter {
     r: io::BufReader<fs::File>,
     start: Record,
@@ -100,6 +103,239 @@ impl Iterator for SSTableIter {
             }
             return Some(rec);
         }
+    }
+}
+
+
+/// Iterates over the MemTable's BTreeSet, yielding only records matching
+/// the given source_id, key, and time range.
+#[derive(Debug)]
+pub(crate) struct MemTableIterOwned {
+    inner: vec::IntoIter<Record>,
+    source_id: i64,
+    key: Vec<u8>,
+    start_ts: i64,
+    end_ts: i64,
+}
+
+impl MemTableIterOwned {
+    pub(crate) fn filtered(
+        memtable_records: Vec<Record>,
+        source_id: i64,
+        key: &[u8],
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Self {
+        MemTableIterOwned {
+            inner: memtable_records.into_iter(),
+            source_id,
+            key: key.to_vec(),
+            start_ts,
+            end_ts,
+        }
+    }
+}
+
+impl Iterator for MemTableIterOwned {
+    type Item = Record;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for r in self.inner.by_ref() {
+            let Ok(sid) = r.extract_source_id() else {
+                continue;
+            };
+            let Ok(ts) = r.extract_timestamp() else {
+                continue;
+            };
+            let Ok(key) = r.extract_key() else { continue };
+            if sid == self.source_id
+                && ts >= self.start_ts
+                && ts < self.end_ts
+                && key == self.key.as_slice()
+            {
+                let rec = r.clone();
+                return Some(rec);
+            }
+        }
+        None
+    }
+}
+
+/// HeapItem is a wrapper around a Record with a source
+/// index indicating which iterator it came from.
+/// If the source is the memtable, the source_idx is 0.
+/// If the source is an sstable, the actaul index of the sstable is source_idx - 1.
+///
+/// HeapItems implement <code>Ord</code> by delegating it to the underlying record.
+#[derive(Clone, Debug)]
+struct HeapItem {
+    record: Record,
+    /// 0 if memtable, > 0 if sstable iter
+    source_idx: usize,
+}
+
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.record.eq(&other.record)
+    }
+}
+
+impl Eq for HeapItem {}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.record.partial_cmp(&other.record)
+    }
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.record.cmp(&other.record)
+    }
+}
+
+#[derive(Debug)]
+pub struct MergeIter<I> {
+    heap: BinaryHeap<Reverse<HeapItem>>,
+    memtable_iter: Option<MemTableIterOwned>,
+    sstable_iters: Vec<I>,
+    last_item: Option<HeapItem>,
+}
+
+impl<I> MergeIter<I>
+where
+    I: Iterator<Item = Record>,
+{
+    pub(crate) fn new(
+        mut memtable_iter: Option<MemTableIterOwned>,
+        mut sstable_iters: Vec<I>,
+    ) -> Self {
+        let mut heap = BinaryHeap::new();
+
+        // insert first items of memtable + sstables
+        if let Some(iter) = memtable_iter.as_mut()
+            && let Some(r) = iter.next()
+        {
+            heap.push(Reverse(HeapItem {
+                record: r,
+                source_idx: 0,
+            }));
+        }
+
+        for (i, iter) in sstable_iters.iter_mut().enumerate() {
+            if let Some(r) = iter.next() {
+                heap.push(Reverse(HeapItem {
+                    record: r,
+                    source_idx: i + 1,
+                }));
+            }
+        }
+
+        Self {
+            heap,
+            memtable_iter,
+            sstable_iters,
+            last_item: None,
+        }
+    }
+
+    fn refil(&mut self, source_idx: usize) {
+        match source_idx {
+            0 if self.memtable_iter.is_some() => {
+                if let Some(r) = self.memtable_iter.as_mut().unwrap().next() {
+                    self.heap.push(Reverse(HeapItem {
+                        record: r,
+                        source_idx: 0,
+                    }));
+                }
+            }
+            n => {
+                if let Some(iter) = self.sstable_iters.get_mut(n - 1)
+                    && let Some(r) = iter.next()
+                {
+                    self.heap.push(Reverse(HeapItem {
+                        record: r,
+                        source_idx: n,
+                    }));
+                }
+            }
+        }
+    }
+}
+
+impl<I> Iterator for MergeIter<I>
+where
+    I: Iterator<Item = Record>,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(item) = self.heap.pop() {
+            self.refil(item.0.source_idx);
+            if let Some(ref prev) = self.last_item
+                && prev.eq(&item.0)
+            {
+                continue;
+            }
+            self.last_item = Some(item.0.clone());
+            return Some(item.0.record);
+        }
+
+        None
+    }
+}
+
+/// SSTableScanner allows unfiltered scanning of an SSTable file with the help of its metadata.
+pub struct SSTableScanner<'a> {
+    r: io::BufReader<fs::File>,
+    buffer: Vec<u8>,
+    meta: &'a SSTableMeta,
+}
+
+impl<'a> SSTableScanner<'a> {
+    pub(crate) fn new(path: &'a path::PathBuf, meta: &'a SSTableMeta) -> anyhow::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .context("SSTableIter::new: failed to open sstable file")?;
+        let r: io::BufReader<fs::File> = io::BufReader::new(f);
+
+        Ok(Self {
+            r,
+            buffer: Vec::with_capacity(1024),
+            meta,
+        })
+    }
+}
+
+impl<'a> Iterator for SSTableScanner<'a> {
+    type Item = Record;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.r.stream_position().ok()? >= self.meta.bloom_offset {
+            return None;
+        }
+        self.buffer.resize(8, 0);
+        match self.r.read_exact(&mut self.buffer[..8]) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => {
+                tracing::error!(error = %e, "SSTableScanner.next: failed to read record length");
+                return None;
+            }
+            Ok(_) => {}
+        }
+
+        let rec_len = u64::from_le_bytes([
+            self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
+            self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
+        ]) as usize;
+        self.buffer.resize(8 + rec_len, 0);
+        if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
+            tracing::error!(error = %e, "SSTableScanner.next: failed to read record");
+            return None;
+        }
+
+        let rec = Record::from_vec(self.buffer[8..].to_vec());
+        return Some(rec);
     }
 }
 
@@ -477,240 +713,5 @@ mod merge_iter_tests {
         let empty: Vec<vec::IntoIter<Record>> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         assert!(merge.collect::<Vec<_>>().is_empty());
-    }
-}
-
-/// Iterates over the MemTable's BTreeSet, yielding only records matching
-/// the given source_id, key, and time range.
-pub(crate) struct MemTableIterOwned {
-    inner: vec::IntoIter<Record>,
-    source_id: i64,
-    key: Vec<u8>,
-    start_ts: i64,
-    end_ts: i64,
-}
-
-impl MemTableIterOwned {
-    pub(crate) fn filtered(
-        memtable_records: Vec<Record>,
-        source_id: i64,
-        key: &[u8],
-        start_ts: i64,
-        end_ts: i64,
-    ) -> Self {
-        MemTableIterOwned {
-            inner: memtable_records.into_iter(),
-            source_id,
-            key: key.to_vec(),
-            start_ts,
-            end_ts,
-        }
-    }
-}
-
-impl Iterator for MemTableIterOwned {
-    type Item = Record;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for r in self.inner.by_ref() {
-            let Ok(sid) = r.extract_source_id() else {
-                continue;
-            };
-            let Ok(ts) = r.extract_timestamp() else {
-                continue;
-            };
-            let Ok(key) = r.extract_key() else { continue };
-            if sid == self.source_id
-                && ts >= self.start_ts
-                && ts < self.end_ts
-                && key == self.key.as_slice()
-            {
-                let rec = r.clone();
-                return Some(rec);
-            }
-        }
-        None
-    }
-}
-
-/// HeapItem is a wrapper around a Record with a source
-/// index indicating which iterator it came from.
-/// If the source is the memtable, the source_idx is 0.
-/// If the source is an sstable, the actaul index of the sstable is source_idx - 1.
-///
-/// HeapItems implement <code>Ord</code> by delegating it to the underlying record.
-#[derive(Clone)]
-struct HeapItem {
-    record: Record,
-    /// 0 if memtable, > 0 if sstable iter
-    source_idx: usize,
-}
-
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.record.eq(&other.record)
-    }
-}
-
-impl Eq for HeapItem {}
-
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.record.partial_cmp(&other.record)
-    }
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.record.cmp(&other.record)
-    }
-}
-
-pub(crate) struct MergeIter<I> {
-    heap: BinaryHeap<Reverse<HeapItem>>,
-    memtable_iter: Option<MemTableIterOwned>,
-    sstable_iters: Vec<I>,
-    last_item: Option<HeapItem>,
-}
-
-impl<I> MergeIter<I>
-where
-    I: Iterator<Item = Record>,
-{
-    pub(crate) fn new(
-        mut memtable_iter: Option<MemTableIterOwned>,
-        mut sstable_iters: Vec<I>,
-    ) -> Self {
-        let mut heap = BinaryHeap::new();
-
-        // insert first items of memtable + sstables
-        if let Some(iter) = memtable_iter.as_mut()
-            && let Some(r) = iter.next()
-        {
-            heap.push(Reverse(HeapItem {
-                record: r,
-                source_idx: 0,
-            }));
-        }
-
-        for (i, iter) in sstable_iters.iter_mut().enumerate() {
-            if let Some(r) = iter.next() {
-                heap.push(Reverse(HeapItem {
-                    record: r,
-                    source_idx: i + 1,
-                }));
-            }
-        }
-
-        Self {
-            heap,
-            memtable_iter,
-            sstable_iters,
-            last_item: None,
-        }
-    }
-
-    fn refil(&mut self, source_idx: usize) {
-        match source_idx {
-            0 if self.memtable_iter.is_some() => {
-                if let Some(r) = self.memtable_iter.as_mut().unwrap().next() {
-                    self.heap.push(Reverse(HeapItem {
-                        record: r,
-                        source_idx: 0,
-                    }));
-                }
-            }
-            n => {
-                if let Some(iter) = self.sstable_iters.get_mut(n - 1)
-                    && let Some(r) = iter.next()
-                {
-                    self.heap.push(Reverse(HeapItem {
-                        record: r,
-                        source_idx: n,
-                    }));
-                }
-            }
-        }
-    }
-}
-
-impl<I> Iterator for MergeIter<I>
-where
-    I: Iterator<Item = Record>,
-{
-    type Item = I::Item;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(item) = self.heap.pop() {
-            self.refil(item.0.source_idx);
-            if let Some(ref prev) = self.last_item
-                && prev.eq(&item.0)
-            {
-                continue;
-            }
-            self.last_item = Some(item.0.clone());
-            return Some(item.0.record);
-        }
-
-        None
-    }
-}
-
-pub struct SSTableScanner<'a> {
-    r: io::BufReader<fs::File>,
-    buffer: Vec<u8>,
-    meta: &'a SSTableMeta,
-}
-
-impl<'a> SSTableScanner<'a> {
-    pub(crate) fn new(path: &'a path::PathBuf, meta: &'a SSTableMeta) -> anyhow::Result<Self> {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .context("SSTableIter::new: failed to open sstable file")?;
-        let r: io::BufReader<fs::File> = io::BufReader::new(f);
-
-        Ok(Self {
-            r,
-            buffer: Vec::with_capacity(1024),
-            meta,
-        })
-    }
-}
-
-impl<'a> Iterator for SSTableScanner<'a> {
-    type Item = Record;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.r.stream_position().ok()? >= self.meta.bloom_offset {
-            return None;
-        }
-        self.buffer.resize(8, 0);
-        match self.r.read_exact(&mut self.buffer[..8]) {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => {
-                tracing::error!(error = %e, "SSTableScanner.next: failed to read record length");
-                return None;
-            }
-            Ok(_) => {}
-        }
-
-        let rec_len = u64::from_le_bytes([
-            self.buffer[0],
-            self.buffer[1],
-            self.buffer[2],
-            self.buffer[3],
-            self.buffer[4],
-            self.buffer[5],
-            self.buffer[6],
-            self.buffer[7],
-        ]) as usize;
-        self.buffer.resize(8 + rec_len, 0);
-        if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
-            tracing::error!(error = %e, "SSTableScanner.next: failed to read record");
-            return None;
-        }
-
-        let rec = Record::from_vec(self.buffer[8..].to_vec());
-        return Some(rec);
     }
 }

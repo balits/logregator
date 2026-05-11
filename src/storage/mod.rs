@@ -21,12 +21,12 @@
 mod wal;
 mod memtable;
 mod iter;
-mod compaction;
+pub mod compaction;
 mod record;
 mod bloom_filter;
-pub mod cmd;
 pub mod engine;
 
 pub(crate) use wal::Wal;
 pub(crate) use memtable::MemTable;
 pub(crate) use bloom_filter::BloomFilter;
+pub use record::Record;
