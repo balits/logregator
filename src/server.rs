@@ -160,15 +160,13 @@ impl Drop for Server {
 
 #[cfg(test)]
 mod integration_tests {
-    use std::net::SocketAddr;
-
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
     use crate::client::Client;
     use crate::proto;
     use crate::storage::compaction::{CompactionCommand, CompactionResult};
-    use crate::storage::engine::Engine;
+    use crate::storage::Engine;
 
     use super::Server;
 
@@ -189,7 +187,7 @@ mod integration_tests {
             result_rx,
         )
         .unwrap();
-        tokio::spawn(async move { engine.run_main_loop(network_rx).await });
+        tokio::spawn(async move { engine.engine_loop(network_rx).await });
         tokio::spawn(async move {
             crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
         });
@@ -291,7 +289,7 @@ mod integration_tests {
             result_rx,
         )
         .unwrap();
-        tokio::spawn(async move { engine.run_main_loop(network_rx).await });
+        tokio::spawn(async move { engine.engine_loop(network_rx).await });
         tokio::spawn(async move {
             crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
         });

@@ -3,15 +3,16 @@ use std::{
     collections::BinaryHeap,
     fs,
     io::{self, Read, Seek},
-    path, vec,
+    vec,
 };
 
 use anyhow::{Context, bail};
 
-use crate::storage::{engine::SSTableMeta, record::Record};
+use crate::storage::{SSTableMeta, record::Record};
 
-/// SSTableIter allows buffered reading of key-values in
-/// an SSTable file within a [start, end) range
+/// SSTableIter reads key-values from an SSTable file
+/// within a [start, end) range, using the index block to
+/// binary-seek to the nearest offset and then scanning linearly.
 #[derive(Debug)]
 pub struct SSTableIter {
     r: io::BufReader<fs::File>,
@@ -19,18 +20,17 @@ pub struct SSTableIter {
     end: Record, // exclusive
     key: Vec<u8>,
     buffer: Vec<u8>,
-    end_pos: u64, // byte offset where records end (tfooter start)
+    end_pos: u64, // byte offset where records end (index block start)
     filter: String,
 }
 
 impl SSTableIter {
     pub(crate) fn new(
-        path: &path::PathBuf,
+        meta: &SSTableMeta,
         source_id: i64,
         key: &str,
         start_ts: i64,
         end_ts: i64,
-        end_pos: u64,
         filter: &str,
     ) -> anyhow::Result<Self> {
         if start_ts > end_ts {
@@ -45,9 +45,13 @@ impl SSTableIter {
 
         let f = std::fs::OpenOptions::new()
             .read(true)
-            .open(path)
+            .open(&meta.path)
             .context("SSTableIter::new: failed to open sstable file")?;
-        let r: io::BufReader<fs::File> = io::BufReader::new(f);
+        let mut r: io::BufReader<fs::File> = io::BufReader::new(f);
+
+        let seek_offset = meta.index.binary_seek(&start);
+        r.seek(io::SeekFrom::Start(seek_offset))
+            .context("SSTableIter::new: failed to seek to index offset")?;
 
         Ok(Self {
             r,
@@ -55,7 +59,7 @@ impl SSTableIter {
             end,
             key: key.as_bytes().to_vec(),
             buffer: vec![],
-            end_pos,
+            end_pos: meta.index_offset,
             filter: filter.to_string(),
         })
     }
@@ -78,16 +82,12 @@ impl Iterator for SSTableIter {
                 Ok(_) => {}
             }
 
+            #[rustfmt::skip]
             let rec_len = u64::from_le_bytes([
-                self.buffer[0],
-                self.buffer[1],
-                self.buffer[2],
-                self.buffer[3],
-                self.buffer[4],
-                self.buffer[5],
-                self.buffer[6],
-                self.buffer[7],
+                self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
+                self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
             ]) as usize;
+
             self.buffer.resize(8 + rec_len, 0);
             if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
                 tracing::error!(error = %e, "SSTableIter::next: failed to read record");
@@ -116,7 +116,6 @@ impl Iterator for SSTableIter {
         }
     }
 }
-
 
 /// Iterates over the MemTable's BTreeSet, yielding only records matching
 /// the given source_id, key, and time range.
@@ -170,6 +169,64 @@ impl Iterator for MemTableIterOwned {
             }
         }
         None
+    }
+}
+
+//
+/// SSTableScan allows unfiltered scanning of an SSTable file with the help of its metadata.
+pub struct SSTableScaner {
+    r: io::BufReader<fs::File>,
+    buffer: Vec<u8>,
+    meta: SSTableMeta,
+}
+
+impl SSTableScaner {
+    pub(crate) fn new(meta: SSTableMeta) -> anyhow::Result<Self> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&meta.path)
+            .context("SSTableIter::new: failed to open sstable file")?;
+        let r: io::BufReader<fs::File> = io::BufReader::new(f);
+
+        Ok(Self {
+            r,
+            buffer: Vec::with_capacity(1024),
+            meta,
+        })
+    }
+}
+
+impl Iterator for SSTableScaner {
+    type Item = Record;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.r.stream_position().ok()? >= self.meta.index_offset {
+            return None;
+        }
+
+        self.buffer.resize(8, 0);
+        match self.r.read_exact(&mut self.buffer[..8]) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(e) => {
+                tracing::error!(error = %e, "SSTableScan.next: failed to read record length");
+                return None;
+            }
+            Ok(_) => {}
+        }
+
+        #[rustfmt::skip]
+        let rec_len = u64::from_le_bytes([
+            self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
+            self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
+        ]) as usize;
+
+        self.buffer.resize(8 + rec_len, 0);
+        if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
+            tracing::error!(error = %e, "SSTableScan.next: failed to read record");
+            return None;
+        }
+
+        let rec = Record::from_vec(self.buffer[8..].to_vec());
+        return Some(rec);
     }
 }
 
@@ -297,65 +354,25 @@ where
     }
 }
 
-/// SSTableScanner allows unfiltered scanning of an SSTable file with the help of its metadata.
-pub struct SSTableScanner<'a> {
-    r: io::BufReader<fs::File>,
-    buffer: Vec<u8>,
-    meta: &'a SSTableMeta,
-}
-
-impl<'a> SSTableScanner<'a> {
-    pub(crate) fn new(path: &'a path::PathBuf, meta: &'a SSTableMeta) -> anyhow::Result<Self> {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .context("SSTableIter::new: failed to open sstable file")?;
-        let r: io::BufReader<fs::File> = io::BufReader::new(f);
-
-        Ok(Self {
-            r,
-            buffer: Vec::with_capacity(1024),
-            meta,
-        })
-    }
-}
-
-impl<'a> Iterator for SSTableScanner<'a> {
-    type Item = Record;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.r.stream_position().ok()? >= self.meta.bloom_offset {
-            return None;
-        }
-        self.buffer.resize(8, 0);
-        match self.r.read_exact(&mut self.buffer[..8]) {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => {
-                tracing::error!(error = %e, "SSTableScanner.next: failed to read record length");
-                return None;
-            }
-            Ok(_) => {}
-        }
-
-        let rec_len = u64::from_le_bytes([
-            self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
-            self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
-        ]) as usize;
-        self.buffer.resize(8 + rec_len, 0);
-        if let Err(e) = self.r.read_exact(&mut self.buffer[8..8 + rec_len]) {
-            tracing::error!(error = %e, "SSTableScanner.next: failed to read record");
-            return None;
-        }
-
-        let rec = Record::from_vec(self.buffer[8..].to_vec());
-        return Some(rec);
-    }
-}
-
 #[cfg(test)]
 mod sstable_iter_tests {
     use super::*;
+    use crate::storage::{IndexBlock, SSTableMeta};
     use std::{io::Write, path::PathBuf};
     use tempfile::tempdir;
+
+    fn make_meta(path: PathBuf, end_pos: u64) -> SSTableMeta {
+        SSTableMeta {
+            id: 0,
+            path,
+            bloom: crate::storage::BloomFilter::new(0, 0.01),
+            bloom_offset: end_pos,
+            index: crate::storage::IndexBlock::default(),
+            index_offset: end_pos,
+            file_size: end_pos,
+            num_records: 0,
+        }
+    }
 
     fn write_sstable(path: &PathBuf, records: &[Record]) -> u64 {
         let f = std::fs::OpenOptions::new()
@@ -383,7 +400,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 30, 0, "sys", "c"),
         ];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 40, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 10, 40, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -401,7 +419,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 30, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 10, 30, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -418,7 +437,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(1, 30, 0, "sys", "past_end"),
         ];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 20, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 10, 20, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -430,7 +450,8 @@ mod sstable_iter_tests {
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 10, 0, "sys", "a")];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 10, 10, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 10, 10, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -446,7 +467,8 @@ mod sstable_iter_tests {
         drop(f);
 
         let len = std::fs::metadata(&path).unwrap().len();
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -456,7 +478,8 @@ mod sstable_iter_tests {
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_value().unwrap(), b"loner");
@@ -468,7 +491,8 @@ mod sstable_iter_tests {
         let path = dir.path().join("test.sst");
         let records = vec![Record::from_raw_parts(1, 20, 0, "sys", "a")];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 10, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 10, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -482,8 +506,9 @@ mod sstable_iter_tests {
             .open(&path)
             .unwrap();
 
-        assert!(SSTableIter::new(&path, 1, "sys", 10, 5, 0, "").is_err());
-        assert!(SSTableIter::new(&path, 1, "sys", -1, 10, 0, "").is_err());
+        let meta = make_meta(path, 0);
+        assert!(SSTableIter::new(&meta, 1, "sys", 10, 5, "").is_err());
+        assert!(SSTableIter::new(&meta, 1, "sys", -1, 10, "").is_err());
     }
 
     #[test]
@@ -496,7 +521,8 @@ mod sstable_iter_tests {
             Record::from_raw_parts(2, 10, 0, "sys", "other_source"),
         ];
         let len = write_sstable(&path, &records);
-        let iter = SSTableIter::new(&path, 1, "sys", 0, 100, len, "").unwrap();
+        let meta = make_meta(path, len);
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert!(
@@ -505,13 +531,168 @@ mod sstable_iter_tests {
                 .all(|r| r.extract_source_id().unwrap() == 1)
         );
     }
+
+    #[test]
+    fn test_index_binary_seek_empty() {
+        let index = IndexBlock::default();
+        let target = Record::from_raw_parts(1, 100, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 0);
+    }
+
+    #[test]
+    fn test_index_binary_seek_exact_match() {
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+        index.try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128).unwrap();
+
+        let target = Record::from_raw_parts(1, 100, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 42);
+    }
+
+    #[test]
+    fn test_index_binary_seek_between_entries() {
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+        index.try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128).unwrap();
+
+        let target = Record::from_raw_parts(1, 150, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 42);
+    }
+
+    #[test]
+    fn test_index_binary_seek_before_all() {
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+
+        let target = Record::from_raw_parts(1, 50, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 0);
+    }
+
+    #[test]
+    fn test_index_binary_seek_after_all() {
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+
+        let target = Record::from_raw_parts(1, 200, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 42);
+    }
+
+    #[test]
+    fn test_index_binary_seek_ignores_seq_num() {
+        // Index entry has seq=25, target has seq=0 — binary_seek should still match on ts
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(16, &Record::from_raw_parts(1, 116, 25, "sys", "v"), 200).unwrap();
+
+        let target = Record::from_raw_parts(1, 116, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 200);
+    }
+
+    #[test]
+    fn test_index_binary_seek_different_source_id() {
+        let mut index = IndexBlock::with_capacity(4);
+        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+
+        let target = Record::from_raw_parts(2, 100, 0, "sys", "");
+        assert_eq!(index.binary_seek(&target), 42); // falls back to previous (or 0 since no entry for sid=2)
+    }
+
+
+    fn write_indexed_sstable(path: &PathBuf, records: &[Record]) -> SSTableMeta {
+        let len = records.len();
+        SSTableMeta::write_to_file(path.clone(), 1, records.iter().cloned(), len).unwrap()
+    }
+
+    #[test]
+    fn test_iter_real_index_returns_all_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.sst");
+        let records: Vec<Record> = (0..33)
+            .map(|i| Record::from_raw_parts(1, i, i as u64, "sys", &format!("val{}", i)))
+            .collect();
+        let meta = write_indexed_sstable(&path, &records);
+
+        assert!(!meta.index.inner.is_empty(), "index should have entries for 33 records");
+
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
+        let collected: Vec<Record> = iter.collect();
+        assert_eq!(collected.len(), 33);
+    }
+
+    #[test]
+    fn test_iter_real_index_skips_early_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.sst");
+        let records: Vec<Record> = (0..33)
+            .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
+            .collect();
+        let meta = write_indexed_sstable(&path, &records);
+
+        assert!(meta.index.inner.len() >= 2, "33 records should produce >=2 index entries");
+
+        // Range [116, 120) — binary_seek should land on entry at ts=116
+        let iter = SSTableIter::new(&meta, 1, "sys", 116, 120, "").unwrap();
+        let collected: Vec<Record> = iter.collect();
+        assert_eq!(collected.len(), 4);
+        for rec in &collected {
+            let ts = rec.extract_timestamp().unwrap();
+            assert!(ts >= 116 && ts < 120, "timestamp {} should be in [116, 120)", ts);
+        }
+    }
+
+    #[test]
+    fn test_iter_real_index_skips_early_records_different_source() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.sst");
+        let mut records = Vec::with_capacity(48);
+        for i in 0..48 {
+            let sid = if i < 16 { 1 } else { 2 };
+            records.push(Record::from_raw_parts(sid, 100 + i, i as u64, "sys", &format!("val{}", i)));
+        }
+        let meta = write_indexed_sstable(&path, &records);
+
+        // Source_id=2 records start at index 16 (ts=116)
+        let iter = SSTableIter::new(&meta, 2, "sys", 116, 120, "").unwrap();
+        let collected: Vec<Record> = iter.collect();
+        assert_eq!(collected.len(), 4);
+        for rec in &collected {
+            assert_eq!(rec.extract_source_id().unwrap(), 2);
+            let ts = rec.extract_timestamp().unwrap();
+            assert!(ts >= 116 && ts < 120);
+        }
+    }
+
+    #[test]
+    fn test_iter_real_index_range_before_start() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.sst");
+        let records: Vec<Record> = (0..33)
+            .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
+            .collect();
+        let meta = write_indexed_sstable(&path, &records);
+
+        // Range before all records
+        let iter = SSTableIter::new(&meta, 1, "sys", 0, 50, "").unwrap();
+        assert!(iter.collect::<Vec<_>>().is_empty());
+    }
+
+    #[test]
+    fn test_iter_real_index_range_after_end() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.sst");
+        let records: Vec<Record> = (0..33)
+            .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
+            .collect();
+        let meta = write_indexed_sstable(&path, &records);
+
+        let iter = SSTableIter::new(&meta, 1, "sys", 200, 300, "").unwrap();
+        assert!(iter.collect::<Vec<_>>().is_empty());
+    }
 }
 
 #[cfg(test)]
 mod sstable_scanner_tests {
     use super::*;
-    use crate::storage::BloomFilter;
-    use crate::storage::engine::SSTableMeta;
+    use crate::storage::{BloomFilter, IndexBlock, SSTableMeta};
     use std::{io::Write, path::PathBuf};
     use tempfile::tempdir;
 
@@ -531,12 +712,14 @@ mod sstable_scanner_tests {
         std::fs::metadata(path).unwrap().len()
     }
 
-    fn make_meta(path: PathBuf, bloom_offset: u64, file_size: u64) -> SSTableMeta {
+    fn make_meta(path: PathBuf, end_pos: u64, file_size: u64) -> SSTableMeta {
         SSTableMeta {
             id: 0,
             path,
             bloom: BloomFilter::new(0, 0.01),
-            bloom_offset,
+            bloom_offset: end_pos,
+            index: IndexBlock::default(),
+            index_offset: end_pos,
             num_records: 0,
             file_size,
         }
@@ -553,7 +736,7 @@ mod sstable_scanner_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let scanner = SSTableScaner::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 3);
     }
@@ -569,7 +752,7 @@ mod sstable_scanner_tests {
             .unwrap();
         drop(f);
         let meta = make_meta(path.clone(), 0, 0);
-        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let scanner = SSTableScaner::new(meta.clone()).unwrap();
         assert!(scanner.collect::<Vec<_>>().is_empty());
     }
 
@@ -580,7 +763,7 @@ mod sstable_scanner_tests {
         let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let scanner = SSTableScaner::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_value().unwrap(), b"loner");
@@ -597,7 +780,7 @@ mod sstable_scanner_tests {
         let len = write_sstable(&path, &records);
         // bloom_offset < file_len — scanner should stop before extra garbage
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let scanner = SSTableScaner::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 2);
     }
@@ -614,7 +797,7 @@ mod sstable_scanner_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScanner::new(&path, &meta).unwrap();
+        let scanner = SSTableScaner::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 4);
     }

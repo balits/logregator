@@ -1,4 +1,4 @@
-#![allow(unused)]
+// #![allow(unused_)]
 
 mod storage;
 mod proto;

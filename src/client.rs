@@ -1,7 +1,7 @@
-use anyhow::{Context, anyhow, bail, format_err};
+use anyhow::{Context, format_err};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_util::codec::{Framed, FramedWrite};
+use tokio_util::codec::Framed;
 
 use crate::proto::{self, ClientMessage, ServerMessage};
 

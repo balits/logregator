@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
 };
 
@@ -13,21 +13,14 @@ use crate::{
     proto,
     storage::{
         BloomFilter,
+        IndexBlock,
+        SSTableMeta,
         compaction::{self, CompactionCommand, CompactionResult},
         iter::{MemTableIterOwned, MergeIter, SSTableIter},
         record::Record,
     },
 };
 
-#[derive(Debug, Clone)]
-pub(crate) struct SSTableMeta {
-    pub(crate) id: usize,
-    pub(crate) path: PathBuf,
-    pub(crate) bloom: BloomFilter,
-    pub(crate) bloom_offset: u64,
-    pub(crate) file_size: u64,
-    pub(crate) num_records: usize,
-}
 
 pub struct Engine {
     pub(crate) dir: PathBuf,
@@ -36,13 +29,13 @@ pub struct Engine {
     pub(crate) compaction_rx: mpsc::Receiver<CompactionResult>,
 
     pub(crate) memtable: MemTable,
-    pub(crate) sstable_map: BTreeMap<usize, SSTableMeta>,
-    pub(crate) sst_counter: usize,
+    pub(crate) sstable_map: BTreeMap<u64, SSTableMeta>,
+    pub(crate) sst_counter: u64,
     pub(crate) seq_counter: u64,
 }
 
 impl Engine {
-    pub async fn run_main_loop(
+    pub async fn engine_loop(
         &mut self,
         mut network_rx: mpsc::Receiver<proto::Command>,
     ) -> anyhow::Result<()> {
@@ -112,7 +105,7 @@ impl Engine {
                 Some(CompactionResult { new_meta, ids_to_remove }) = self.compaction_rx.recv() => {
                     for file_id in ids_to_remove {
                         self.sstable_map.remove(&file_id);
-                        let file_path = make_sstable_path(&self.dir, file_id);
+                        let file_path = SSTableMeta::format_file_path(&self.dir, file_id);
                         if let Err(e) = fs::remove_file(&file_path) {
                             tracing::error!(error = %e, "engine.loop: compaction finished, but failed to remove file {}", file_path.display())
                         }
@@ -150,7 +143,7 @@ impl Engine {
         }
 
         let mut sstables: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .context("failed to read sstable directory contents")?
+            .context("engine.open: failed to read sstable directory contents")?
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("sst"))
@@ -166,7 +159,7 @@ impl Engine {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .context("engine.open: failed to get valid UTF-8 file stem")?
-                .parse::<usize>()
+                .parse::<u64>()
                 .context("engine.open: failed to parse sstable id from file stem")?;
             max_sst_id = max_sst_id.max(file_id);
 
@@ -197,12 +190,18 @@ impl Engine {
                 }
             }
 
-            let entry = load_bloom(r)?;
+            r.seek(SeekFrom::End(-16))?;
+            let (index, index_offset) = IndexBlock::read_from_unchecked(&mut r)?;
+            let bloom_offset = r.stream_position()?;
+            let bloom = BloomFilter::decode(&mut r)?;
+
             let meta = SSTableMeta {
                 id: file_id,
                 path: path.clone(),
-                bloom: entry.0,
-                bloom_offset: entry.1,
+                bloom,
+                bloom_offset,
+                index,
+                index_offset,
                 num_records,
                 file_size: fs::metadata(path)
                     .context("engine.open: failed to read sstable file metadata")?
@@ -297,54 +296,11 @@ impl Engine {
             return Ok(());
         }
 
-        let path = make_sstable_path(&self.dir, file_id);
+        let path = SSTableMeta::format_file_path(&self.dir, file_id);
+        let records_len = memtable_records.len();
+        let new_meta = SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
+            .context("engine.flush: failed to write sstable file")?;
 
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .context("engine.flush: failed to open sstable file")?;
-        let mut w = io::BufWriter::new(f);
-        let mut bloom = BloomFilter::new(memtable_records.len(), 0.01);
-
-        let mut num_records = 0usize;
-        for rec in memtable_records.iter() {
-            let len_buf = (rec.len() as u64).to_le_bytes();
-            w.write_all(&len_buf)
-                .context("engine.flush: failed to write record length")?;
-            w.write_all(rec.as_bytes())
-                .context("engine.flush: failed to write record")?;
-            bloom.insert(rec.extract_source_id()?, rec.extract_key()?);
-            num_records += 1
-        }
-
-        let bloom_offset = w
-            .stream_position()
-            .context("engine.flush: failed to seek to current position")?;
-        bloom
-            .encode(&mut w)
-            .context("engine.flush: failed to write bloom filter footer")?;
-        w.write_all(&bloom_offset.to_le_bytes())
-            .context("engine.flush: failed to write bloom filter offset")?;
-
-        w.flush()
-            .context("engine.flush: failed to flush write buffer")?;
-        w.get_ref()
-            .sync_all()
-            .context("engine.flush: failed to sync_all file")?;
-
-        let file_size = fs::metadata(&path)
-            .context("engine.flush: failed to read sstable file metadata")?
-            .len();
-
-        let new_meta = SSTableMeta {
-            id: file_id,
-            path,
-            bloom,
-            bloom_offset,
-            num_records,
-            file_size,
-        };
         self.sstable_map.insert(file_id, new_meta);
         self.sst_counter += 1;
         let need_compaction = self.sstable_map.len() >= 8;
@@ -409,7 +365,7 @@ impl Engine {
                     return None
                 }
 
-                SSTableIter::new(&meta.path, source_id, key, start_ts, end_ts, meta.bloom_offset, filter)
+                SSTableIter::new(meta, source_id, key, start_ts, end_ts, filter)
                     .inspect_err(|e| {
                         tracing::error!(error = %e, "engine.range: failed to turn sstable path to iterator");
                     })
@@ -419,25 +375,6 @@ impl Engine {
 
         Ok(MergeIter::new(Some(memtable_iter), sstable_iters))
     }
-}
-
-fn make_sstable_path(basedir: &PathBuf, file_id: usize) -> PathBuf {
-    basedir.join(format!("{:010}.sst", file_id))
-}
-
-fn load_bloom<R: Read + Seek>(mut w: R) -> anyhow::Result<(BloomFilter, u64)> {
-    // footer is 8 bytes yet, in the future when we introduce block indecies it needs to be revisited
-    w.seek(SeekFrom::End(-8))
-        .context("failed to seek to sstable file end")?;
-    let mut bloom_offset_buf = [0u8; 8];
-    w.read_exact(&mut bloom_offset_buf)
-        .context("failed to read bloom filter offset")?;
-    let bloom_offset = u64::from_le_bytes(bloom_offset_buf);
-
-    w.seek(io::SeekFrom::Start(bloom_offset))
-        .context("failed to seek to bloom filter start offset")?;
-    let bloom = BloomFilter::decode(&mut w).context("failed to decode bloom filter")?;
-    Ok((bloom, bloom_offset))
 }
 
 #[cfg(test)]

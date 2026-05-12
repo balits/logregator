@@ -20,13 +20,15 @@
 
 mod wal;
 mod memtable;
+mod engine;
 mod iter;
-pub mod compaction;
 mod record;
-mod bloom_filter;
-pub mod engine;
+mod sstable;
+pub mod compaction;
 
 pub(crate) use wal::Wal;
 pub(crate) use memtable::MemTable;
-pub(crate) use bloom_filter::BloomFilter;
+pub(crate) use sstable::*;
 pub use record::Record;
+#[allow(unused)]
+pub use engine::Engine;
