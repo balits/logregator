@@ -65,7 +65,7 @@ impl Engine {
                             tracing::debug!("engine.loop(cmd=BATCH_INSERT): replyed successfuly");
                         }
                         proto::Command::Range(r, end_sender, record_sender) => {
-                            let merge_iter = self.range(r.source_id, &r.key, r.start_ts, r.end_ts);
+                            let merge_iter = self.range(r.source_id, &r.key, r.start_ts, r.end_ts, &r.filter);
                             tokio::task::spawn_blocking(move || {
                                 match merge_iter {
                                     Ok(iter) => {
@@ -383,6 +383,7 @@ impl Engine {
         key: &str,
         start_ts: i64,
         end_ts: i64,
+        filter: &str,
     ) -> anyhow::Result<MergeIter<SSTableIter>> {
         if start_ts > end_ts {
             bail!("engine.range: end_ts cannot be smaller than start_ts")
@@ -399,6 +400,7 @@ impl Engine {
             key.as_bytes(),
             start_ts,
             end_ts,
+            filter,
         );
         let sstable_iters = self.sstable_map
             .values()
@@ -407,7 +409,7 @@ impl Engine {
                     return None
                 }
 
-                SSTableIter::new(&meta.path, source_id, key, start_ts, end_ts, meta.bloom_offset)
+                SSTableIter::new(&meta.path, source_id, key, start_ts, end_ts, meta.bloom_offset, filter)
                     .inspect_err(|e| {
                         tracing::error!(error = %e, "engine.range: failed to turn sstable path to iterator");
                     })
@@ -473,8 +475,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        assert!(engine.range(1, "sys", 10, 5).is_err());
-        assert!(engine.range(1, "sys", -1, 10).is_err());
+        assert!(engine.range(1, "sys", 10, 5, "").is_err());
+        assert!(engine.range(1, "sys", -1, 10, "").is_err());
     }
 
     #[test]
@@ -486,21 +488,21 @@ mod tests {
 
         assert!(
             engine
-                .range(1, "other", 5, 15)
+                .range(1, "other", 5, 15, "")
                 .unwrap()
                 .collect::<Vec<_>>()
                 .is_empty()
         );
         assert!(
             engine
-                .range(1, "sys", 20, 30)
+                .range(1, "sys", 20, 30, "")
                 .unwrap()
                 .collect::<Vec<_>>()
                 .is_empty()
         );
         assert!(
             engine
-                .range(1, "sys", 10, 10)
+                .range(1, "sys", 10, 10, "")
                 .unwrap()
                 .collect::<Vec<_>>()
                 .is_empty()
@@ -516,7 +518,7 @@ mod tests {
         engine.insert(1, 20, "sys", "mem high").unwrap();
         engine.insert(1, 30, "sys", "disk full").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 15, 35).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 15, 35, "").unwrap().collect();
         assert_eq!(result.len(), 2);
         assert!(result.iter().any(|r| {
             r.extract_timestamp().unwrap() == 20 && r.extract_value().unwrap() == b"mem high"
@@ -534,11 +536,11 @@ mod tests {
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "sys", "mem high").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 10, 20).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 10, 20, "").unwrap().collect();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].extract_timestamp().unwrap(), 10);
 
-        let result: Vec<_> = engine.range(1, "sys", 10, 30).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 10, 30, "").unwrap().collect();
         assert_eq!(result.len(), 2);
     }
 
@@ -553,11 +555,11 @@ mod tests {
 
         engine.insert(1, 40, "db", "connection lost").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|r| r.extract_key().unwrap() == b"sys"));
 
-        let result: Vec<_> = engine.range(1, "db", 0, 100).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "db", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|r| r.extract_key().unwrap() == b"db"));
     }
@@ -574,7 +576,7 @@ mod tests {
         engine.insert(1, 40, "sys", "disk full").unwrap();
         engine.insert(1, 50, "sys", "all good").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 20, 45).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 20, 45, "").unwrap().collect();
         assert_eq!(result.len(), 3);
         assert!(result.iter().any(|r| r.extract_timestamp().unwrap() == 20));
         assert!(result.iter().any(|r| r.extract_timestamp().unwrap() == 30));
@@ -592,7 +594,7 @@ mod tests {
         engine.insert(1, 20, "sys", "second flush entry").unwrap();
         engine.insert(1, 45, "sys", "flush_trigger_02").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 20, 30).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 20, 30, "").unwrap().collect();
         assert_eq!(result.len(), 2);
         let mut ts: Vec<i64> = result
             .iter()
@@ -612,7 +614,7 @@ mod tests {
 
         engine.insert(1, 30, "sys", "in memtable").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 5, 35).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 5, 35, "").unwrap().collect();
         assert_eq!(result.len(), 3);
         assert!(result.iter().any(|r| {
             r.extract_timestamp().unwrap() == 10 && r.extract_value().unwrap() == b"flushed"
@@ -672,7 +674,7 @@ mod tests {
 
         engine.batch_insert(batch).unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].extract_timestamp().unwrap(), 10);
         assert_eq!(result[1].extract_timestamp().unwrap(), 20);
@@ -697,7 +699,7 @@ mod tests {
 
         assert_eq!(engine.seq_counter, start_seq + 3);
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 3);
         for (i, rec) in result.iter().enumerate() {
             assert_eq!(rec.extract_seq_num().unwrap(), start_seq + i as u64);
@@ -740,7 +742,7 @@ mod tests {
         // standalone insert after batch
         engine.insert(1, 15, "sys", "third").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 20).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 0, 20, "").unwrap().collect();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].extract_timestamp().unwrap(), 5);
         assert_eq!(result[1].extract_timestamp().unwrap(), 10);
@@ -764,9 +766,74 @@ mod tests {
         ];
         engine.batch_insert(batch2).unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 100).unwrap().collect();
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 4);
         assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch1_a"));
         assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch2_b"));
+    }
+
+    #[test]
+    fn test_engine_range_filter_empty_returns_all() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        engine.insert(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert(1, 20, "sys", "mem high").unwrap();
+        engine.insert(1, 30, "sys", "disk full").unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_engine_range_filter_partial_match() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        engine.insert(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert(1, 20, "sys", "mem high pressure").unwrap();
+        engine.insert(1, 30, "sys", "disk full").unwrap();
+        engine.insert(1, 40, "sys", "memory leak detected").unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "mem").unwrap().collect();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|r| {
+            let val = r.extract_value().unwrap();
+            val == b"mem high pressure" || val == b"memory leak detected"
+        }));
+    }
+
+    #[test]
+    fn test_engine_range_filter_no_match() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 1024);
+
+        engine.insert(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert(1, 20, "sys", "mem high").unwrap();
+
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "nonexistent").unwrap().collect();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_engine_range_filter_works_across_tiers() {
+        let dir = tempdir().unwrap();
+        let mut engine = open_engine(dir.path().to_path_buf(), 50);
+
+        engine.insert(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert(1, 20, "sys", "first flush trigger").unwrap();
+        engine.insert(1, 30, "sys", "disk full").unwrap();
+
+        // all records flushed to SSTables, empty filter yields all
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
+        assert_eq!(result.len(), 3);
+
+        // filter matches only one SSTable record
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "cpu").unwrap().collect();
+        assert_eq!(result.len(), 1);
+
+        // filter matches no records
+        let result: Vec<_> = engine.range(1, "sys", 0, 100, "nonexistent").unwrap().collect();
+        assert!(result.is_empty());
     }
 }

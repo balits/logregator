@@ -23,6 +23,10 @@ impl Server {
         })
     }
 
+    pub fn addr(&self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
     pub async fn run_main_loop(&self, cmd_tx: Sender<proto::Command>) -> anyhow::Result<()> {
         tracing::info!("listening on {}", Self::ADDR);
         loop {
@@ -51,7 +55,7 @@ impl Server {
         // let (rhalf, w) = tokio::io::split(conn);
         // let mut reader = FramedRead::new(rhalf, proto::Codec);
         // let mut writer = FramedWrite::new(w, proto::Codec);
-        let mut framed = Framed::new(conn, proto::Codec);
+        let mut framed = Framed::new(conn, proto::ServerCodec);
 
         while let Some(msg) = framed.next().await {
             let msg = msg?;
@@ -117,7 +121,13 @@ impl Server {
                     loop {
                         tokio::select! {
                             biased;
-
+                            Some(rec) = record_recv.recv() => {
+                                let reply = ServerMessage::RangeRecord(rec);
+                                framed
+                                    .send(reply)
+                                    .await
+                                    .context("server.handle_conn(cmd=RANGE): failed to reply to connection with record")?;
+                            },
                             end = &mut end_recv => {
                                 let reply = match end {
                                     Ok(Ok(_)) => ServerMessage::RangeEnd,
@@ -131,13 +141,6 @@ impl Server {
                                 break;
                             },
 
-                            Some(rec) = record_recv.recv() => {
-                                let reply = ServerMessage::RangeRecord(rec);
-                                framed
-                                    .send(reply)
-                                    .await
-                                    .context("server.handle_conn(cmd=RANGE): failed to reply to connection with record")?;
-                            }
                         };
                     }
                 }
@@ -152,5 +155,186 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         tracing::info!("server.main_loop: closing server");
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use std::net::SocketAddr;
+
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+
+    use crate::client::Client;
+    use crate::proto;
+    use crate::storage::compaction::{CompactionCommand, CompactionResult};
+    use crate::storage::engine::Engine;
+
+    use super::Server;
+
+    fn make_insert(source_id: i64, ts: i64, key: &str, value: &str) -> proto::Insert {
+        proto::Insert { source_id, ts, key: key.into(), value: value.into() }
+    }
+
+    async fn setup() -> (crate::client::Client, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let (network_tx, network_rx) = mpsc::channel(64);
+        let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
+        let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
+
+        let mut engine = Engine::open(
+            dir.path().join("data"),
+            1024,
+            compaction_tx,
+            result_rx,
+        )
+        .unwrap();
+        tokio::spawn(async move { engine.run_main_loop(network_rx).await });
+        tokio::spawn(async move {
+            crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
+        });
+
+        let server = Server::new(Some("127.0.0.1:0".parse().unwrap())).await.unwrap();
+        let addr = server.addr();
+        tokio::spawn(async move { server.run_main_loop(network_tx).await });
+
+        let client = Client::connect(&addr.to_string()).await.unwrap();
+        (client, dir)
+    }
+
+    #[tokio::test]
+    async fn test_insert_then_range() {
+        let (mut client, _dir) = setup().await;
+
+        client.insert(make_insert(1, 100, "sys", "cpu normal")).await.unwrap();
+
+        let results = client.range(proto::Range {
+            source_id: 1,
+            key: "sys".into(),
+            start_ts: 0,
+            end_ts: 200,
+            filter: "".into(),
+        }).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ts, 100);
+        assert_eq!(results[0].key, "sys");
+        assert_eq!(results[0].value, "cpu normal");
+    }
+
+    #[tokio::test]
+    async fn test_range_empty() {
+        let (mut client, _dir) = setup().await;
+
+        let results = client.range(proto::Range {
+            source_id: 1,
+            key: "nonexistent".into(),
+            start_ts: 0,
+            end_ts: 100,
+            filter: "".into(),
+        }).await.unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_range_invalid_ts() {
+        let (mut client, _dir) = setup().await;
+
+        let err = client.range(proto::Range {
+            source_id: 1,
+            key: "sys".into(),
+            start_ts: 100,
+            end_ts: 0,
+            filter: "".into(),
+        }).await.unwrap_err();
+
+        assert!(err.to_string().contains("end_ts cannot be smaller than start_ts"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_insert_then_range() {
+        let (mut client, _dir) = setup().await;
+
+        client.batch_insert(vec![
+            make_insert(1, 10, "sys", "first"),
+            make_insert(1, 20, "sys", "second"),
+            make_insert(1, 30, "sys", "third"),
+        ]).await.unwrap();
+
+        let results = client.range(proto::Range {
+            source_id: 1,
+            key: "sys".into(),
+            start_ts: 15,
+            end_ts: 35,
+            filter: "".into(),
+        }).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].ts, 20);
+        assert_eq!(results[0].value, "second");
+        assert_eq!(results[1].ts, 30);
+        assert_eq!(results[1].value, "third");
+    }
+
+    #[tokio::test]
+    async fn test_insert_flush_then_range() {
+        let dir = tempdir().unwrap();
+        let (network_tx, network_rx) = mpsc::channel(64);
+        let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
+        let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
+
+        let mut engine = Engine::open(
+            dir.path().join("data"),
+            80,
+            compaction_tx,
+            result_rx,
+        )
+        .unwrap();
+        tokio::spawn(async move { engine.run_main_loop(network_rx).await });
+        tokio::spawn(async move {
+            crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
+        });
+
+        let server = Server::new(Some("127.0.0.1:0".parse().unwrap())).await.unwrap();
+        let addr = server.addr();
+        tokio::spawn(async move { server.run_main_loop(network_tx).await });
+
+        let mut client = Client::connect(&addr.to_string()).await.unwrap();
+
+        client.insert(make_insert(1, 10, "sys", "small")).await.unwrap();
+        client.insert(make_insert(1, 20, "sys", "massive_payload_to_force_flush")).await.unwrap();
+
+        let results = client.range(proto::Range {
+            source_id: 1,
+            key: "sys".into(),
+            start_ts: 0,
+            end_ts: 100,
+            filter: "".into(),
+        }).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        let mut timestamps: Vec<i64> = results.iter().map(|r| r.ts).collect();
+        timestamps.sort();
+        assert_eq!(timestamps, vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_inserts_range_subset() {
+        let (mut client, _dir) = setup().await;
+
+        for i in 0..10 {
+            client.insert(make_insert(1, i * 10, "sys", &format!("val_{}", i))).await.unwrap();
+        }
+
+        let results = client.range(proto::Range {
+            source_id: 1,
+            key: "sys".into(),
+            start_ts: 20,
+            end_ts: 60,
+            filter: "".into(),
+        }).await.unwrap();
+
+        assert_eq!(results.len(), 4);
     }
 }

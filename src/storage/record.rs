@@ -113,7 +113,14 @@ impl Record {
         Ok(&self.0[40 + key_len..(40 + key_len + value_len)])
     }
 
-    pub fn extract_all_fields(&self) -> anyhow::Result<(i64, i64, u64, String, String)> {
+    pub fn extract_all_fields_owned(&self) -> anyhow::Result<(i64, i64, u64, String, String)> {
+        let (sid, ts, seq, _key, _val) = self.extract_all_fields_ref()?;
+        let key = String::from_utf8(_key.to_vec())?;
+        let value = String::from_utf8(_val.to_vec())?;
+        Ok((sid, ts, seq, key, value))
+    }
+
+    pub fn extract_all_fields_ref<'a>(&'a self) -> anyhow::Result<(i64, i64, u64, &'a [u8], &'a [u8])> {
         if self.0.len() < 24 {
             bail!("record.extract_all: not enough bytes for integer fields")
         }
@@ -140,7 +147,7 @@ impl Record {
         if self.0.len() < 32 + key_len {
             bail!("record.extract_all: not enough bytes for key contents")
         }
-        let key = String::from_utf8(self.0[32..32 + key_len].to_vec())?;
+        let key = &self.0[32..32 + key_len];
 
         if self.0.len() < 40 + key_len {
             bail!("record.extract_all: not enough bytes for value length")
@@ -153,7 +160,7 @@ impl Record {
             bail!("record.extract_all: not enough bytes for value contents")
         }
 
-        let value = String::from_utf8(self.0[40 + key_len..(40 + key_len + value_len)].to_vec())?;
+        let value = &self.0[40 + key_len..(40 + key_len + value_len)];
         Ok((source_id, timestamp, seq, key, value))
     }
 }
