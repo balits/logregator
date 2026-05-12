@@ -11,13 +11,13 @@ TCP client → length-prefixed binary protocol
                  ↓
           Bounded mpsc channel
                  ↓
-       Engine run loop (actor model)
-            ↙              ↘
-      MemTable            SSTable pool
-         ↓                    ↓
-      flush()            compaction
-         ↓                    ↓
-      SSTable            merged SSTable
+         Engine run loop
+         ↙              ↘
+   MemTable            SSTable pool
+      ↓                    ↓
+   flush()            compaction
+      ↓                    ↓
+   SSTable            merged SSTable
 ```
 
 ## Roadmap

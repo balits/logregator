@@ -21,7 +21,10 @@ impl Wal {
             .with_context(|| format!("wal: failed to open file {:?}", path))?;
 
         Ok(Wal {
-            w: io::BufWriter::new(file.try_clone()?),
+            w: io::BufWriter::new(
+                file.try_clone()
+                    .context("wal::new: failed to clone file descriptor")?,
+            ),
         })
     }
 

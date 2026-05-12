@@ -7,6 +7,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed};
+use tracing::Instrument;
 
 use crate::proto::{self, ServerMessage};
 
@@ -17,9 +18,11 @@ pub struct Server {
 impl Server {
     pub const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4321);
 
-    pub async fn new(addr: Option<SocketAddr>) -> std::io::Result<Self> {
+    pub async fn new(addr: Option<SocketAddr>) -> anyhow::Result<Self> {
         Ok(Self {
-            listener: TcpListener::bind(addr.unwrap_or(Self::ADDR)).await?,
+            listener: TcpListener::bind(addr.unwrap_or(Self::ADDR))
+                .await
+                .context("server.new: failed to bind")?,
         })
     }
 
@@ -28,7 +31,8 @@ impl Server {
     }
 
     pub async fn run_main_loop(&self, cmd_tx: Sender<proto::Command>) -> anyhow::Result<()> {
-        tracing::info!("listening on {}", Self::ADDR);
+        let server_addr = self.listener.local_addr().context("server.main_loop: failed to get local addr")?;
+        tracing::info!("listening on {server_addr}");
         loop {
             let (conn, addr) = self
                 .listener
@@ -37,12 +41,16 @@ impl Server {
                 .context("server.main_loop: failed to accept connection")?;
 
             let cmd_tx = cmd_tx.clone();
+            let span = tracing::info_span!("conn", %addr);
 
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_conn(conn, addr, cmd_tx).await {
-                    tracing::error!(error = %e, "server.main_loop: client connection failed: {addr}");
+            tokio::spawn(
+                async move {
+                    if let Err(e) = Self::handle_conn(conn, addr, cmd_tx).await {
+                        tracing::error!(error = %e, "connection handler failed");
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
     }
 
@@ -58,7 +66,8 @@ impl Server {
         let mut framed = Framed::new(conn, proto::ServerCodec);
 
         while let Some(msg) = framed.next().await {
-            let msg = msg?;
+            let msg = msg
+                .context("server.handle_conn: failed to read client message")?;
 
             // TODO: create response channel, await result,
             // encode as ServerMessage, write via _w
@@ -189,7 +198,7 @@ mod integration_tests {
         .unwrap();
         tokio::spawn(async move { engine.engine_loop(network_rx).await });
         tokio::spawn(async move {
-            crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
+            crate::storage::compaction::compaction_loop(compaction_rx, result_tx).await
         });
 
         let server = Server::new(Some("127.0.0.1:0".parse().unwrap())).await.unwrap();
@@ -291,7 +300,7 @@ mod integration_tests {
         .unwrap();
         tokio::spawn(async move { engine.engine_loop(network_rx).await });
         tokio::spawn(async move {
-            crate::storage::compaction::compactor_loop(compaction_rx, result_tx).await
+            crate::storage::compaction::compaction_loop(compaction_rx, result_tx).await
         });
 
         let server = Server::new(Some("127.0.0.1:0".parse().unwrap())).await.unwrap();

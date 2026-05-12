@@ -5,10 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["attributes"] }
 tempfile = "3.27.0"
-tokio = {version = "1.52.3", features = ["sync", "macros", "net", "io-util", "rt"]}
+tokio = {version = "1.52.3", features = ["sync", "macros", "net", "io-util", "rt", "rt-multi-thread"]}
 bytes = "1.10"
 tokio-util = {version = "0.7", features = ["codec"]}
 tokio-stream = "0.1.18"
 futures = "0.3.32"
+chrono = "0.4"
+tracing-subscriber = "0.3.23"
+clap = { version = "4.6.1", features = ["derive"] }

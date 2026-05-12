@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use tokio::sync::mpsc;
+use tracing::instrument;
 
 use crate::storage::{MemTable, Wal};
 use crate::{
@@ -117,6 +118,7 @@ impl Engine {
         }
     }
 
+    #[instrument(skip(compaction_tx, compaction_rx), fields(dir = %dir.display()))]
     pub fn open(
         dir: PathBuf,
         memtable_limit: usize,
@@ -190,10 +192,14 @@ impl Engine {
                 }
             }
 
-            r.seek(SeekFrom::End(-16))?;
-            let (index, index_offset) = IndexBlock::read_from_unchecked(&mut r)?;
-            let bloom_offset = r.stream_position()?;
-            let bloom = BloomFilter::decode(&mut r)?;
+            r.seek(SeekFrom::End(-16))
+                .context("engine.open: failed to seek to sstable footer")?;
+            let (index, index_offset) = IndexBlock::read_from_unchecked(&mut r)
+                .context("engine.open: failed to read index block from sstable")?;
+            let bloom_offset = r.stream_position()
+                .context("engine.open: failed to get bloom filter offset")?;
+            let bloom = BloomFilter::decode(&mut r)
+                .context("engine.open: failed to decode bloom filter")?;
 
             let meta = SSTableMeta {
                 id: file_id,
@@ -229,6 +235,7 @@ impl Engine {
         Ok(e)
     }
 
+    #[instrument(skip(self, value), fields(source_id, ts, key))]
     pub fn insert(
         &mut self,
         source_id: i64,
@@ -252,6 +259,7 @@ impl Engine {
         Ok(())
     }
 
+    #[instrument(skip(self, inserts))]
     pub fn batch_insert(&mut self, inserts: Vec<proto::Insert>) -> anyhow::Result<()> {
         let count = inserts.len();
         let mut records: Vec<Record> = Vec::with_capacity(count);
@@ -287,6 +295,7 @@ impl Engine {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     fn flush(&mut self) -> anyhow::Result<()> {
         let file_id = self.sst_counter;
         let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
@@ -333,6 +342,7 @@ impl Engine {
         Ok(())
     }
 
+    #[instrument(skip(self, filter), fields(source_id, key, start_ts, end_ts))]
     pub fn range(
         &self,
         source_id: i64,

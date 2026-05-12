@@ -7,19 +7,19 @@ use crate::storage::SSTableMeta;
 use crate::storage::iter::{MergeIter, SSTableScaner};
 
 #[derive(Debug)]
-pub(crate) struct CompactionCommand {
+pub struct CompactionCommand {
     pub(crate) tables: Vec<SSTableMeta>,
     pub(crate) new_file_path: PathBuf,
     pub(crate) new_file_id: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct CompactionResult {
+pub struct CompactionResult {
     pub(crate) new_meta: SSTableMeta,
     pub(crate) ids_to_remove: Vec<u64>,
 }
 
-pub async fn compactor_loop(
+pub async fn compaction_loop(
     mut cmd_rx: mpsc::Receiver<CompactionCommand>,
     result_tx: mpsc::Sender<CompactionResult>,
 ) -> anyhow::Result<()> {

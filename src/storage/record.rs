@@ -1,11 +1,9 @@
 use std::cmp;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 
 /// Record represents each entry in the SSTables as a byte vector.
-/// ```
 /// [source_id: i64] | [timestamp: i64] | [seq_num: u64] | [key_len: u32] | [key_content: [u8; key_len]] | [value_len: u32] | [value_content: [u8; value_len]]
-/// ```
 ///
 /// - source_id is the logs producer clients id
 /// - timestamp is the unix nano timestamp
@@ -111,9 +109,12 @@ impl Record {
     }
 
     pub fn extract_all_fields_owned(&self) -> anyhow::Result<(i64, i64, u64, String, String)> {
-        let (sid, ts, seq, _key, _val) = self.extract_all_fields_ref()?;
-        let key = String::from_utf8(_key.to_vec())?;
-        let value = String::from_utf8(_val.to_vec())?;
+        let (sid, ts, seq, _key, _val) = self.extract_all_fields_ref()
+            .context("extract_all_fields_owned: failed to extract fields")?;
+        let key = String::from_utf8(_key.to_vec())
+            .context("extract_all_fields_owned: failed to decode key as utf-8")?;
+        let value = String::from_utf8(_val.to_vec())
+            .context("extract_all_fields_owned: failed to decode value as utf-8")?;
         Ok((sid, ts, seq, key, value))
     }
 

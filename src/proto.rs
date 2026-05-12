@@ -12,8 +12,9 @@
 //! | 0x83      | RangeEnd (server)    | *no payload* |
 //! | 0xFF      | Error (server)       | [[err_len: u32 BE]][[err: err_len bytes]] |
 
-use std::io;
+use std::{fmt::Display, io};
 
+use anyhow::Context;
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Decoder, Encoder};
@@ -27,25 +28,25 @@ pub(crate) type Timestamp = i64;
 pub(crate) type SeqNum = u64;
 
 #[derive(Debug)]
-pub(crate) struct Insert {
-    pub(crate) source_id: SourceId,
-    pub(crate) ts: Timestamp,
-    pub(crate) key: String,
-    pub(crate) value: String,
+pub struct Insert {
+    pub source_id: SourceId,
+    pub ts: Timestamp,
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct Range {
-    pub(crate) source_id: SourceId,
-    pub(crate) key: String,
-    pub(crate) start_ts: Timestamp,
-    pub(crate) end_ts: Timestamp,
-    pub(crate) filter: String,
+pub struct Range {
+    pub source_id: SourceId,
+    pub key: String,
+    pub start_ts: Timestamp,
+    pub end_ts: Timestamp,
+    pub filter: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct BatchInsert {
-    pub(crate) records: Vec<Insert>,
+pub struct BatchInsert {
+    pub records: Vec<Insert>,
 }
 
 #[derive(Debug)]
@@ -56,12 +57,24 @@ pub(crate) enum ClientMessage {
 }
 
 #[derive(Debug)]
-pub(crate) struct Record {
+pub struct Record {
     pub(crate) source_id: SourceId,
     pub(crate) ts: Timestamp,
     pub(crate) seq: SeqNum,
     pub(crate) key: String,
     pub(crate) value: String,
+}
+
+impl Display for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "source={}, ts={}, seq={}: key={} value={}",
+            self.source_id,
+            self.ts,
+            self.seq,
+            self.key,
+            self.value,
+        )
+    }
 }
 
 impl TryFrom<storage::Record> for Record {
@@ -117,9 +130,15 @@ impl Decoder for ServerCodec {
         frame.advance(1);
 
         match msg_type {
-            0x01 => decode_insert(frame.as_ref()).map(|i| Some(ClientMessage::Insert(i))),
-            0x02 => decode_range(frame.as_ref()).map(|r| Some(ClientMessage::Range(r))),
-            0x03 => decode_batch_insert(frame.as_ref()).map(|bi| Some(ClientMessage::BatchInsert(bi))),
+            0x01 => decode_insert(frame.as_ref())
+                .map(|i| Some(ClientMessage::Insert(i)))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+            0x02 => decode_range(frame.as_ref())
+                .map(|r| Some(ClientMessage::Range(r)))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
+            0x03 => decode_batch_insert(frame.as_ref())
+                .map(|bi| Some(ClientMessage::BatchInsert(bi)))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
             t => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("server_codec.decode: unknown message type: {t:#04x}"),
@@ -158,38 +177,72 @@ impl Encoder<ServerMessage> for ServerCodec {
     }
 }
 
-fn decode_insert(buf: &[u8]) -> io::Result<Insert> {
-    let source_id = i64::from_be_bytes(array8(buf, 0)?);
-    let ts = i64::from_be_bytes(array8(buf, 8)?);
-    let key_len = u32::from_be_bytes(array4(buf, 16)?) as usize;
-    let key = from_utf8(&buf[20..20 + key_len])?;
-    let value_len = u32::from_be_bytes(array4(buf, 20 + key_len)?) as usize;
-    let value = from_utf8(&buf[24 + key_len..24 + key_len + value_len])?;
+fn decode_insert(buf: &[u8]) -> anyhow::Result<Insert> {
+    let source_id = i64::from_be_bytes(
+        array8(buf, 0).context("decode_insert: failed to read source_id")?,
+    );
+    let ts = i64::from_be_bytes(
+        array8(buf, 8).context("decode_insert: failed to read timestamp")?,
+    );
+    let key_len = u32::from_be_bytes(
+        array4(buf, 16).context("decode_insert: failed to read key length")?,
+    ) as usize;
+    let key = from_utf8(&buf[20..20 + key_len])
+        .context("decode_insert: failed to decode key")?;
+    let value_len = u32::from_be_bytes(
+        array4(buf, 20 + key_len).context("decode_insert: failed to read value length")?,
+    ) as usize;
+    let value = from_utf8(&buf[24 + key_len..24 + key_len + value_len])
+        .context("decode_insert: failed to decode value")?;
     Ok(Insert { source_id, ts, key, value })
 }
 
-fn decode_range(buf: &[u8]) -> io::Result<Range> {
-    let source_id = i64::from_be_bytes(array8(buf, 0)?);
-    let key_len = u32::from_be_bytes(array4(buf, 8)?) as usize;
-    let key = from_utf8(&buf[12..12 + key_len])?;
-    let start_ts = i64::from_be_bytes(array8(buf, 12 + key_len)?);
-    let end_ts = i64::from_be_bytes(array8(buf, 20 + key_len)?);
-    let filter_len = u32::from_be_bytes(array4(buf, 28 + key_len)?) as usize;
-    let filter = from_utf8(&buf[32 + key_len..32 + key_len + filter_len])?;
+fn decode_range(buf: &[u8]) -> anyhow::Result<Range> {
+    let source_id = i64::from_be_bytes(
+        array8(buf, 0).context("decode_range: failed to read source_id")?,
+    );
+    let key_len = u32::from_be_bytes(
+        array4(buf, 8).context("decode_range: failed to read key length")?,
+    ) as usize;
+    let key = from_utf8(&buf[12..12 + key_len])
+        .context("decode_range: failed to decode key")?;
+    let start_ts = i64::from_be_bytes(
+        array8(buf, 12 + key_len).context("decode_range: failed to read start_ts")?,
+    );
+    let end_ts = i64::from_be_bytes(
+        array8(buf, 20 + key_len).context("decode_range: failed to read end_ts")?,
+    );
+    let filter_len = u32::from_be_bytes(
+        array4(buf, 28 + key_len).context("decode_range: failed to read filter length")?,
+    ) as usize;
+    let filter = from_utf8(&buf[32 + key_len..32 + key_len + filter_len])
+        .context("decode_range: failed to decode filter")?;
     Ok(Range { source_id, key, start_ts, end_ts, filter })
 }
 
-fn decode_batch_insert(buf: &[u8]) -> io::Result<BatchInsert> {
-    let num = u32::from_be_bytes(array4(buf, 0)?) as usize;
+fn decode_batch_insert(buf: &[u8]) -> anyhow::Result<BatchInsert> {
+    let num = u32::from_be_bytes(
+        array4(buf, 0).context("decode_batch_insert: failed to read record count")?,
+    ) as usize;
     let mut offset = 4;
     let mut records = Vec::with_capacity(num);
-    for _ in 0..num {
-        let source_id = i64::from_be_bytes(array8(buf, offset)?);
-        let ts = i64::from_be_bytes(array8(buf, offset + 8)?);
-        let key_len = u32::from_be_bytes(array4(buf, offset + 16)?) as usize;
-        let key = from_utf8(&buf[offset + 20..offset + 20 + key_len])?;
-        let value_len = u32::from_be_bytes(array4(buf, offset + 20 + key_len)?) as usize;
-        let value = from_utf8(&buf[offset + 24 + key_len..offset + 24 + key_len + value_len])?;
+    for i in 0..num {
+        let source_id = i64::from_be_bytes(
+            array8(buf, offset).context(format!("decode_batch_insert: record {i}: failed to read source_id"))?,
+        );
+        let ts = i64::from_be_bytes(
+            array8(buf, offset + 8).context(format!("decode_batch_insert: record {i}: failed to read timestamp"))?,
+        );
+        let key_len = u32::from_be_bytes(
+            array4(buf, offset + 16).context(format!("decode_batch_insert: record {i}: failed to read key length"))?,
+        ) as usize;
+        let key = from_utf8(&buf[offset + 20..offset + 20 + key_len])
+            .context(format!("decode_batch_insert: record {i}: failed to decode key"))?;
+        let value_len = u32::from_be_bytes(
+            array4(buf, offset + 20 + key_len).context(format!("decode_batch_insert: record {i}: failed to read value length"))?,
+        ) as usize;
+        let value = from_utf8(&buf[offset + 24 + key_len..offset + 24 + key_len + value_len])
+            .context(format!("decode_batch_insert: record {i}: failed to decode value"))?;
         records.push(Insert { source_id, ts, key, value });
         offset += 24 + key_len + value_len;
     }
@@ -295,10 +348,12 @@ impl Decoder for ClientCodec {
         match msg_type {
             0x81 => Ok(Some(ServerMessage::InsertOk)),
             0x82 => decode_server_range_record(frame.as_ref())
-                .map(Some),
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
             0x83 => Ok(Some(ServerMessage::RangeEnd)),
             0xFF => decode_server_error(frame.as_ref())
-                .map(|e| Some(ServerMessage::Error(e))),
+                .map(|e| Some(ServerMessage::Error(e)))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
             t => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("client_codec.decode: unknown message type: {t:#04x}"),
@@ -307,18 +362,33 @@ impl Decoder for ClientCodec {
     }
 }
 
-fn decode_server_range_record(buf: &[u8]) -> io::Result<ServerMessage> {
-    let source_id = i64::from_be_bytes(array8(buf, 0)?);
-    let ts = i64::from_be_bytes(array8(buf, 8)?);
-    let seq = u64::from_be_bytes(array8(buf, 16)?);
-    let key_len = u32::from_be_bytes(array4(buf, 24)?) as usize;
-    let key = from_utf8(&buf[28..28 + key_len])?;
-    let value_len = u32::from_be_bytes(array4(buf, 28 + key_len)?) as usize;
-    let value = from_utf8(&buf[32 + key_len..32 + key_len + value_len])?;
+fn decode_server_range_record(buf: &[u8]) -> anyhow::Result<ServerMessage> {
+    let source_id = i64::from_be_bytes(
+        array8(buf, 0).context("decode_server_range_record: failed to read source_id")?,
+    );
+    let ts = i64::from_be_bytes(
+        array8(buf, 8).context("decode_server_range_record: failed to read timestamp")?,
+    );
+    let seq = u64::from_be_bytes(
+        array8(buf, 16).context("decode_server_range_record: failed to read seq_num")?,
+    );
+    let key_len = u32::from_be_bytes(
+        array4(buf, 24).context("decode_server_range_record: failed to read key length")?,
+    ) as usize;
+    let key = from_utf8(&buf[28..28 + key_len])
+        .context("decode_server_range_record: failed to decode key")?;
+    let value_len = u32::from_be_bytes(
+        array4(buf, 28 + key_len).context("decode_server_range_record: failed to read value length")?,
+    ) as usize;
+    let value = from_utf8(&buf[32 + key_len..32 + key_len + value_len])
+        .context("decode_server_range_record: failed to decode value")?;
     Ok(ServerMessage::RangeRecord(Record { source_id, ts, seq, key, value }))
 }
 
-fn decode_server_error(buf: &[u8]) -> io::Result<String> {
-    let msg_len = u32::from_be_bytes(array4(buf, 0)?) as usize;
+fn decode_server_error(buf: &[u8]) -> anyhow::Result<String> {
+    let msg_len = u32::from_be_bytes(
+        array4(buf, 0).context("decode_server_error: failed to read error message length")?,
+    ) as usize;
     from_utf8(&buf[4..4 + msg_len])
+        .context("decode_server_error: failed to decode error message")
 }

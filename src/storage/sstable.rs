@@ -53,7 +53,12 @@ impl SSTableMeta {
             w.write_all(rec.as_bytes())
                 .context("engine.flush: failed to write record")?;
 
-            bloom.insert(rec.extract_source_id()?, rec.extract_key()?);
+            bloom.insert(
+                rec.extract_source_id()
+                    .context("write_to_file: failed to extract source_id for bloom")?,
+                rec.extract_key()
+                    .context("write_to_file: failed to extract key for bloom")?,
+            );
 
             index
                 .try_insert(idx, &rec, record_offset)
@@ -138,7 +143,8 @@ impl BloomFilter {
 
         r.seek(io::SeekFrom::Start(bloom_offset))
             .context("bloom_filter.load_from: failed to seek to bloom filter start offset")?;
-        let bloom = Self::decode(&mut r)?;
+        let bloom = Self::decode(&mut r)
+            .context("bloom_filter.read_from_unchecked: failed to decode bloom filter")?;
         Ok((bloom, bloom_offset))
     }
 
