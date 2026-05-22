@@ -23,9 +23,9 @@ use crate::storage;
 
 const LENGTH_SZ: usize = 4;
 
-pub(crate) type SourceId = i64;
-pub(crate) type Timestamp = i64;
-pub(crate) type SeqNum = u64;
+pub type SourceId = i64;
+pub type Timestamp = i64;
+pub type SeqNum = u64;
 
 #[derive(Debug)]
 pub struct Insert {
@@ -44,13 +44,14 @@ pub struct Range {
     pub filter: String,
 }
 
+
 #[derive(Debug)]
 pub struct BatchInsert {
     pub records: Vec<Insert>,
 }
 
 #[derive(Debug)]
-pub(crate) enum ClientMessage {
+pub enum ClientMessage {
     Insert(Insert),
     Range(Range),
     BatchInsert(BatchInsert),
@@ -58,11 +59,11 @@ pub(crate) enum ClientMessage {
 
 #[derive(Debug)]
 pub struct Record {
-    pub(crate) source_id: SourceId,
-    pub(crate) ts: Timestamp,
-    pub(crate) seq: SeqNum,
-    pub(crate) key: String,
-    pub(crate) value: String,
+    pub source_id: SourceId,
+    pub ts: Timestamp,
+    pub seq: SeqNum,
+    pub key: String,
+    pub value: String,
 }
 
 impl Display for Record {
@@ -86,7 +87,7 @@ impl TryFrom<storage::Record> for Record {
 }
 
 #[derive(Debug)]
-pub(crate) enum ServerMessage {
+pub enum ServerMessage {
     InsertOk,
     RangeRecord(Record),
     RangeEnd,
@@ -95,19 +96,19 @@ pub(crate) enum ServerMessage {
 
 /// Internal engine commands.
 ///
-/// Each variant carries a channels needed to send results back
+/// Each variant carries the channels needed to send results back
 /// to the connection handler (based on the envelope method
 /// seen in tokios mini-redis):
-///   - Insert / BatchInsert: ACK via oneshot
-///   - Range: error | ACK via oneshot, streaming records from disk through mpsc
+///   - Insert: ACK via oneshot
+///   - Range: error | ACK via oneshot, batch-streaming records through mpsc
 pub enum Command {
     Insert(Insert, oneshot::Sender<anyhow::Result<()>>),
     BatchInsert(BatchInsert, oneshot::Sender<anyhow::Result<()>>),
-    Range(Range, oneshot::Sender<anyhow::Result<()>>, mpsc::Sender<Record>),
+    Range(Range, oneshot::Sender<anyhow::Result<()>>, mpsc::Sender<Vec<Record>>),
 }
 
 // Server codec is used to decode client messages and encode server messages
-pub(crate) struct ServerCodec;
+pub struct ServerCodec;
 
 impl Decoder for ServerCodec {
     type Item = ClientMessage;
@@ -137,7 +138,7 @@ impl Decoder for ServerCodec {
                 .map(|r| Some(ClientMessage::Range(r)))
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
             0x03 => decode_batch_insert(frame.as_ref())
-                .map(|bi| Some(ClientMessage::BatchInsert(bi)))
+                .map(|b| Some(ClientMessage::BatchInsert(b)))
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e)),
             t => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -221,30 +222,35 @@ fn decode_range(buf: &[u8]) -> anyhow::Result<Range> {
 }
 
 fn decode_batch_insert(buf: &[u8]) -> anyhow::Result<BatchInsert> {
-    let num = u32::from_be_bytes(
+    let num_records = u32::from_be_bytes(
         array4(buf, 0).context("decode_batch_insert: failed to read record count")?,
     ) as usize;
+    let mut records = Vec::with_capacity(num_records);
     let mut offset = 4;
-    let mut records = Vec::with_capacity(num);
-    for i in 0..num {
+    for _ in 0..num_records {
         let source_id = i64::from_be_bytes(
-            array8(buf, offset).context(format!("decode_batch_insert: record {i}: failed to read source_id"))?,
+            array8(buf, offset).context("decode_batch_insert: failed to read source_id")?,
         );
+        offset += 8;
         let ts = i64::from_be_bytes(
-            array8(buf, offset + 8).context(format!("decode_batch_insert: record {i}: failed to read timestamp"))?,
+            array8(buf, offset).context("decode_batch_insert: failed to read timestamp")?,
         );
+        offset += 8;
         let key_len = u32::from_be_bytes(
-            array4(buf, offset + 16).context(format!("decode_batch_insert: record {i}: failed to read key length"))?,
+            array4(buf, offset).context("decode_batch_insert: failed to read key length")?,
         ) as usize;
-        let key = from_utf8(&buf[offset + 20..offset + 20 + key_len])
-            .context(format!("decode_batch_insert: record {i}: failed to decode key"))?;
+        offset += 4;
+        let key = from_utf8(&buf[offset..offset + key_len])
+            .context("decode_batch_insert: failed to decode key")?;
+        offset += key_len;
         let value_len = u32::from_be_bytes(
-            array4(buf, offset + 20 + key_len).context(format!("decode_batch_insert: record {i}: failed to read value length"))?,
+            array4(buf, offset).context("decode_batch_insert: failed to read value length")?,
         ) as usize;
-        let value = from_utf8(&buf[offset + 24 + key_len..offset + 24 + key_len + value_len])
-            .context(format!("decode_batch_insert: record {i}: failed to decode value"))?;
+        offset += 4;
+        let value = from_utf8(&buf[offset..offset + value_len])
+            .context("decode_batch_insert: failed to decode value")?;
+        offset += value_len;
         records.push(Insert { source_id, ts, key, value });
-        offset += 24 + key_len + value_len;
     }
     Ok(BatchInsert { records })
 }
@@ -277,7 +283,7 @@ fn from_utf8(buf: &[u8]) -> io::Result<String> {
 }
 
 // ClientCodec is used to decode server messages and encode client messages
-pub(crate) struct ClientCodec;
+pub struct ClientCodec;
 
 impl Encoder<ClientMessage> for ClientCodec {
     type Error = io::Error;
@@ -308,13 +314,13 @@ impl Encoder<ClientMessage> for ClientCodec {
             ClientMessage::BatchInsert(b) => {
                 dst.put_u8(0x03);
                 dst.put_u32(b.records.len() as u32);
-                for rec in &b.records {
-                    dst.put_i64(rec.source_id);
-                    dst.put_i64(rec.ts);
-                    dst.put_u32(rec.key.len() as u32);
-                    dst.put_slice(rec.key.as_bytes());
-                    dst.put_u32(rec.value.len() as u32);
-                    dst.put_slice(rec.value.as_bytes());
+                for i in &b.records {
+                    dst.put_i64(i.source_id);
+                    dst.put_i64(i.ts);
+                    dst.put_u32(i.key.len() as u32);
+                    dst.put_slice(i.key.as_bytes());
+                    dst.put_u32(i.value.len() as u32);
+                    dst.put_slice(i.value.as_bytes());
                 }
             }
         }

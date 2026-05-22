@@ -1,11 +1,14 @@
 use std::io::{self, Read, Seek, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Ok};
 
+use crate::metrics::Metrics;
 use crate::storage::record::Record;
 
-pub struct Wal{
+pub struct Wal {
     w: io::BufWriter<std::fs::File>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Wal {
@@ -25,20 +28,43 @@ impl Wal {
                 file.try_clone()
                     .context("wal::new: failed to clone file descriptor")?,
             ),
+            metrics: None,
         })
     }
 
-    pub(crate) fn append(&mut self, rec: &Record) -> anyhow::Result<()> {
+    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
+        self.metrics = Some(metrics.clone());
+    }
+
+    pub(crate) fn write_one(&mut self, rec: &Record) -> anyhow::Result<()> {
         let len = rec.len() as u64;
         self.w.write_all(&len.to_le_bytes())
-            .context("wal.append: failed to write prefix len")?;
+            .context("wal.write_one: failed to write prefix len")?;
         self.w.write_all(rec.as_bytes())
-            .context("wal.append: failed to write record")?;
-        self.w.flush()
-            .context("wal.append: failed to flush")?;
-        self.w.get_ref().sync_all()
-            .context("wal.append: failed to sync_all")?;
+            .context("wal.write_one: failed to write record")?;
+        if let Some(ref m) = self.metrics {
+            m.wal.write_count.inc(1);
+            m.wal.write_bytes.inc(len);
+        }
+        Ok(())
+    }
 
+    pub(crate) fn write_many(&mut self, recs: &[Record]) -> anyhow::Result<()> {
+        let mut total_bytes = 0u64;
+        for rec in recs {
+            let len = rec.len() as u64;
+            self.w
+                .write_all(&len.to_le_bytes())
+                .context("wal.write_many: failed to write prefix len")?;
+            self.w
+                .write_all(rec.as_bytes())
+                .context("wal.write_many: failed to write record")?;
+            total_bytes += 8 + len; // 8 byte length prefix + record bytes
+        }
+        if let Some(ref m) = self.metrics {
+            m.wal.write_count.inc(recs.len() as u64);
+            m.wal.write_bytes.inc(total_bytes);
+        }
         Ok(())
     }
 
@@ -69,23 +95,19 @@ impl Wal {
         Ok(records)
     }
 
-    pub(crate) fn batch_append(&mut self, recs: &[Record]) -> anyhow::Result<()> {
-        for rec in recs {
-            let len = rec.len() as u64;
-            self.w
-                .write_all(&len.to_le_bytes())
-                .context("wal.batch_append: failed to write prefix len")?;
-            self.w
-                .write_all(rec.as_bytes())
-                .context("wal.batch_append: failed to write record")?;
-        }
+    pub(crate) fn sync(&mut self) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         self.w
             .flush()
-            .context("wal.batch_append: failed to flush")?;
+            .context("wal.sync: failed to flush")?;
         self.w
             .get_ref()
             .sync_all()
-            .context("wal.batch_append: failed to sync_all")?;
+            .context("wal.sync: failed to sync_all")?;
+        if let Some(ref m) = self.metrics {
+            m.wal.sync_count.inc(1);
+            m.wal.sync_latency.record_instant(start);
+        }
         Ok(())
     }
 
@@ -97,6 +119,16 @@ impl Wal {
             .context("wal.clear: failed to clone file")?;
         self.w = io::BufWriter::new(f_cloned);
 
+        Ok(())
+    }
+
+    pub(crate) fn clear_path(path: &std::path::Path) -> anyhow::Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("wal.clear_path: failed to open {:?}", path))?;
+        f.set_len(0).context("wal.clear_path: failed to truncate")?;
+        drop(f);
         Ok(())
     }
 }
@@ -116,7 +148,8 @@ mod tests {
 
         {
             let mut wal = Wal::new(wal_path).expect("failed to create WAL");
-            wal.append(&entry).expect("failed to append");
+            wal.write_one(&entry).expect("failed to write");
+            wal.sync().expect("failed to sync");
         }
 
         let mut wal = Wal::new(wal_path).expect("failed to re-open WAL");
@@ -140,8 +173,9 @@ mod tests {
         ];
 
         for e in &entries {
-            wal.append(e).unwrap();
+            wal.write_one(e).unwrap();
         }
+        wal.sync().unwrap();
 
         let recovered = wal.recover().unwrap();
 
@@ -158,7 +192,8 @@ mod tests {
         let wal_path = &wal_path_buf;
         let mut wal = Wal::new(wal_path).unwrap();
 
-        wal.append(&Record::from_raw_parts(1, 1, 0, "k", "v")).unwrap();
+        wal.write_one(&Record::from_raw_parts(1, 1, 0, "k", "v")).unwrap();
+        wal.sync().unwrap();
         wal.clear().expect("Failed to clear WAL");
 
         let recovered = wal.recover().unwrap();

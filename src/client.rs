@@ -3,7 +3,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-use crate::proto::{self, ClientMessage, ServerMessage};
+use crate::proto::{self, BatchInsert, ClientMessage, ServerMessage};
 
 pub struct Client {
     framed: Framed<TcpStream, proto::ClientCodec>,
@@ -14,6 +14,7 @@ impl Client {
         let conn = TcpStream::connect(addr).await.with_context(|| {
             format!("client.connect: failed to establish connection to addr {addr}")
         })?;
+        let _ = conn.set_nodelay(true);
         Ok(Self {
             framed: Framed::new(conn, proto::ClientCodec),
         })
@@ -34,8 +35,8 @@ impl Client {
         }
     }
 
-    pub async fn batch_insert(&mut self, inserts: Vec<proto::Insert>) -> anyhow::Result<()> {
-        let msg = ClientMessage::BatchInsert(proto::BatchInsert { records: inserts });
+    pub async fn batch_insert(&mut self, records: Vec<proto::Insert>) -> anyhow::Result<()> {
+        let msg = ClientMessage::BatchInsert(BatchInsert { records });
         self.framed
             .send(msg)
             .await
@@ -43,7 +44,7 @@ impl Client {
         match self.framed.next().await {
             Some(Ok(ServerMessage::InsertOk)) => return Ok(()),
             Some(Ok(ServerMessage::Error(e))) => return Err(format_err!(e)),
-            Some(Ok(resp)) => return Err(format_err!("client.batch_insert: response message: {:?}", resp)),
+            Some(Ok(resp)) => return Err(format_err!("client.batch_insert: unexpected response message: {:?}", resp)),
             Some(Err(e)) => return Err(format_err!(e)),
             None => return Err(format_err!("client.batch_insert: connection closed")),
         }

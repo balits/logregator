@@ -153,7 +153,7 @@ impl Iterator for MemTableIterOwned {
     type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
-        for r in self.inner.by_ref() {
+        while let Some(r) = self.inner.next() {
             let Ok((sid, ts, _seq, key, val)) = r.extract_all_fields_ref() else {
                 continue;
             };
@@ -164,8 +164,7 @@ impl Iterator for MemTableIterOwned {
                 && (self.filter.is_empty()
                     || unsafe { std::str::from_utf8_unchecked(val) }.contains(&self.filter))
             {
-                let rec = r.clone();
-                return Some(rec);
+                return Some(r);
             }
         }
         None
@@ -174,6 +173,7 @@ impl Iterator for MemTableIterOwned {
 
 //
 /// SSTableScan allows unfiltered scanning of an SSTable file with the help of its metadata.
+#[derive(Debug)]
 pub struct SSTableScaner {
     r: io::BufReader<fs::File>,
     buffer: Vec<u8>,
@@ -263,21 +263,51 @@ impl Ord for HeapItem {
     }
 }
 
+/// A type-erased record iterator — either backed by a file (SSTableIter / SSTableScaner)
+/// or by an in-memory vec (into_iter). Reading SSTables into memory upfront
+/// avoids scattered file I/O during the merge.
 #[derive(Debug)]
-pub struct MergeIter<I> {
-    heap: BinaryHeap<Reverse<HeapItem>>,
-    memtable_iter: Option<MemTableIterOwned>,
-    sstable_iters: Vec<I>,
-    last_item: Option<HeapItem>,
+pub(crate) enum RecordIter {
+    File(SSTableIter),
+    Scan(SSTableScaner),
+    Mem(std::vec::IntoIter<Record>),
 }
 
-impl<I> MergeIter<I>
-where
-    I: Iterator<Item = Record>,
-{
-    pub(crate) fn new(
+impl Iterator for RecordIter {
+    type Item = Record;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RecordIter::File(iter) => iter.next(),
+            RecordIter::Scan(iter) => iter.next(),
+            RecordIter::Mem(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RecordIter::File(iter) => iter.size_hint(),
+            RecordIter::Scan(iter) => iter.size_hint(),
+            RecordIter::Mem(iter) => iter.size_hint(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MergeIter {
+    heap: BinaryHeap<Reverse<HeapItem>>,
+
+    memtable_iter: Option<MemTableIterOwned>,
+
+    sstable_iters: Vec<RecordIter>,
+
+    last_item_idx: Option<Record>,
+}
+
+impl MergeIter {
+    pub fn new(
         mut memtable_iter: Option<MemTableIterOwned>,
-        mut sstable_iters: Vec<I>,
+        mut sstable_iters: Vec<RecordIter>,
     ) -> Self {
         let mut heap = BinaryHeap::new();
 
@@ -304,7 +334,7 @@ where
             heap,
             memtable_iter,
             sstable_iters,
-            last_item: None,
+            last_item_idx: None,
         }
     }
 
@@ -332,22 +362,20 @@ where
     }
 }
 
-impl<I> Iterator for MergeIter<I>
-where
-    I: Iterator<Item = Record>,
-{
-    type Item = I::Item;
+impl Iterator for MergeIter {
+    type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(item) = self.heap.pop() {
             self.refil(item.0.source_idx);
-            if let Some(ref prev) = self.last_item
-                && prev.eq(&item.0)
-            {
-                continue;
+            let record = item.0.record;
+            if let Some(ref prev) = self.last_item_idx {
+                if prev.cmp(&record) == std::cmp::Ordering::Equal {
+                    continue;
+                }
             }
-            self.last_item = Some(item.0.clone());
-            return Some(item.0.record);
+            self.last_item_idx = Some(record.clone());
+            return Some(record);
         }
 
         None
@@ -814,7 +842,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
         let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "");
-        let empty: Vec<vec::IntoIter<Record>> = vec![];
+        let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 2);
@@ -826,7 +854,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "a"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let merge = MergeIter::new(None, vec![sstable.into_iter()]);
+        let merge = MergeIter::new(None, vec![RecordIter::Mem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 2);
     }
@@ -842,7 +870,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "mid"),
             Record::from_raw_parts(1, 20, 0, "sys", "mid2"),
         ];
-        let merge = MergeIter::new(Some(mem_iter), vec![sstable.into_iter()]);
+        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Mem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 4);
         let ts: Vec<i64> = collected
@@ -862,7 +890,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
             Record::from_raw_parts(1, 40, 0, "sys", "d"),
         ];
-        let merge = MergeIter::new(None, vec![sst1.into_iter(), sst2.into_iter()]);
+        let merge = MergeIter::new(None, vec![RecordIter::Mem(sst1.into_iter()), RecordIter::Mem(sst2.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 4);
         let ts: Vec<i64> = collected
@@ -882,7 +910,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "dup"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let merge = MergeIter::new(None, vec![sst1.into_iter(), sst2.into_iter()]);
+        let merge = MergeIter::new(None, vec![RecordIter::Mem(sst1.into_iter()), RecordIter::Mem(sst2.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 3);
         let ts: Vec<i64> = collected
@@ -894,7 +922,7 @@ mod merge_iter_tests {
 
     #[test]
     fn test_merge_empty_sstables() {
-        let merge = MergeIter::new(None, vec![] as Vec<vec::IntoIter<Record>>);
+        let merge = MergeIter::new(None, vec![]);
         assert!(merge.collect::<Vec<_>>().is_empty());
     }
 
@@ -905,7 +933,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
         let mem_iter = MemTableIterOwned::filtered(records, 2, b"other", 0, 100, "");
-        let empty: Vec<vec::IntoIter<Record>> = vec![];
+        let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         assert!(merge.collect::<Vec<_>>().is_empty());
     }
@@ -919,7 +947,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 40, 0, "sys", "memory leak"),
         ];
         let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "mem");
-        let empty: Vec<vec::IntoIter<Record>> = vec![];
+        let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 2);
@@ -936,7 +964,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "mem high"),
         ];
         let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "nonexistent");
-        let empty: Vec<vec::IntoIter<Record>> = vec![];
+        let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         assert!(merge.collect::<Vec<_>>().is_empty());
     }
@@ -954,7 +982,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "mid"),
             Record::from_raw_parts(1, 20, 0, "sys", "mid2"),
         ];
-        let merge = MergeIter::new(Some(mem_iter), vec![sstable.into_iter()]);
+        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Mem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         // sstable records pass through unfiltered, memtable only yields "late"
         assert_eq!(collected.len(), 3);

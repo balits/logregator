@@ -1,8 +1,5 @@
 /target
-
-
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
+# data directory for load testing benchmarks
+/load_tests
+# data directory for regular server runs
+/server_data

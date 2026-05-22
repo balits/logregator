@@ -9,10 +9,17 @@ use anyhow::{Context, bail};
 /// - timestamp is the unix nano timestamp
 /// - seq_num is the global monotonic revision number issued by the storage engine
 /// - key and value are the logs key and value
+/// 
+/// with key and value being 1 byte long, the minimum size of a byte is
+/// x = 34 = 8 + 8 + 8 + 4 + 1 + 4 + 1 
 #[derive(Clone, Debug)]
 pub struct Record(Vec<u8>);
 
 impl Record {
+    /// with key and value being 1 byte long, the minimum size of a byte is
+    /// x = 34 = 8 + 8 + 8 + 4 + 1 + 4 + 1 
+    pub const MIN_RECORD_SIZE: usize = 34;
+
     pub fn from_raw_parts(source_id: i64, timestamp: i64, seq_num: u64, key: &str, value: &str) -> Self {
         let len = 8 + 8 + 8 + 4 + key.len() + 4 + value.len();
         let mut v = Vec::with_capacity(len);
