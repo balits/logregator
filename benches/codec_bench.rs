@@ -1,5 +1,6 @@
 use bytes::BytesMut;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use logregator::proto::{self, ClientMessage, Insert, Record, ServerMessage};
 use tokio_util::codec::{Decoder, Encoder};

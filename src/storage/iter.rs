@@ -25,7 +25,7 @@ pub struct SSTableIter {
 }
 
 impl SSTableIter {
-    pub(crate) fn new(
+    pub fn new(
         meta: &SSTableMeta,
         source_id: i64,
         key: &str,
@@ -120,7 +120,7 @@ impl Iterator for SSTableIter {
 /// Iterates over the MemTable's BTreeSet, yielding only records matching
 /// the given source_id, key, and time range.
 #[derive(Debug)]
-pub(crate) struct MemTableIterOwned {
+pub struct MemTableIterOwned {
     inner: vec::IntoIter<Record>,
     source_id: i64,
     key: Vec<u8>,
@@ -153,7 +153,7 @@ impl Iterator for MemTableIterOwned {
     type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(r) = self.inner.next() {
+        for r in self.inner.by_ref() {
             let Ok((sid, ts, _seq, key, val)) = r.extract_all_fields_ref() else {
                 continue;
             };
@@ -226,7 +226,7 @@ impl Iterator for SSTableScaner {
         }
 
         let rec = Record::from_vec(self.buffer[8..].to_vec());
-        return Some(rec);
+        Some(rec)
     }
 }
 
@@ -237,7 +237,7 @@ impl Iterator for SSTableScaner {
 ///
 /// HeapItems implement <code>Ord</code> by delegating it to the underlying record.
 #[derive(Clone, Debug)]
-struct HeapItem {
+pub struct HeapItem {
     record: Record,
     /// 0 if memtable, > 0 if sstable iter
     source_idx: usize,
@@ -253,7 +253,7 @@ impl Eq for HeapItem {}
 
 impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.record.partial_cmp(&other.record)
+        Some(self.cmp(other))
     }
 }
 
@@ -267,7 +267,7 @@ impl Ord for HeapItem {
 /// or by an in-memory vec (into_iter). Reading SSTables into memory upfront
 /// avoids scattered file I/O during the merge.
 #[derive(Debug)]
-pub(crate) enum RecordIter {
+pub enum RecordIter {
     File(SSTableIter),
     Scan(SSTableScaner),
     Mem(std::vec::IntoIter<Record>),
@@ -369,10 +369,10 @@ impl Iterator for MergeIter {
         while let Some(item) = self.heap.pop() {
             self.refil(item.0.source_idx);
             let record = item.0.record;
-            if let Some(ref prev) = self.last_item_idx {
-                if prev.cmp(&record) == std::cmp::Ordering::Equal {
-                    continue;
-                }
+            if let Some(ref prev) = self.last_item_idx
+                && prev.cmp(&record) == std::cmp::Ordering::Equal
+            {
+                continue;
             }
             self.last_item_idx = Some(record.clone());
             return Some(record);
@@ -386,7 +386,10 @@ impl Iterator for MergeIter {
 mod sstable_iter_tests {
     use super::*;
     use crate::storage::{IndexBlock, SSTableMeta};
-    use std::{io::Write, path::PathBuf};
+    use std::{
+        io::Write,
+        path::{Path, PathBuf},
+    };
     use tempfile::tempdir;
 
     fn make_meta(path: PathBuf, end_pos: u64) -> SSTableMeta {
@@ -406,6 +409,7 @@ mod sstable_iter_tests {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // if it exists (shouldn't)
             .open(path)
             .unwrap();
         let mut w = std::io::BufWriter::new(f);
@@ -490,6 +494,7 @@ mod sstable_iter_tests {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // if it exists (shouldn't)
             .open(&path)
             .unwrap();
         drop(f);
@@ -531,6 +536,7 @@ mod sstable_iter_tests {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // if it exists (shouldn't)
             .open(&path)
             .unwrap();
 
@@ -570,8 +576,12 @@ mod sstable_iter_tests {
     #[test]
     fn test_index_binary_seek_exact_match() {
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
-        index.try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128).unwrap();
+        index
+            .try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42)
+            .unwrap();
+        index
+            .try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128)
+            .unwrap();
 
         let target = Record::from_raw_parts(1, 100, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 42);
@@ -580,8 +590,12 @@ mod sstable_iter_tests {
     #[test]
     fn test_index_binary_seek_between_entries() {
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
-        index.try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128).unwrap();
+        index
+            .try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42)
+            .unwrap();
+        index
+            .try_insert(16, &Record::from_raw_parts(1, 200, 10, "sys", "v"), 128)
+            .unwrap();
 
         let target = Record::from_raw_parts(1, 150, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 42);
@@ -590,7 +604,9 @@ mod sstable_iter_tests {
     #[test]
     fn test_index_binary_seek_before_all() {
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+        index
+            .try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42)
+            .unwrap();
 
         let target = Record::from_raw_parts(1, 50, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 0);
@@ -599,7 +615,9 @@ mod sstable_iter_tests {
     #[test]
     fn test_index_binary_seek_after_all() {
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+        index
+            .try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42)
+            .unwrap();
 
         let target = Record::from_raw_parts(1, 200, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 42);
@@ -609,7 +627,9 @@ mod sstable_iter_tests {
     fn test_index_binary_seek_ignores_seq_num() {
         // Index entry has seq=25, target has seq=0 — binary_seek should still match on ts
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(16, &Record::from_raw_parts(1, 116, 25, "sys", "v"), 200).unwrap();
+        index
+            .try_insert(16, &Record::from_raw_parts(1, 116, 25, "sys", "v"), 200)
+            .unwrap();
 
         let target = Record::from_raw_parts(1, 116, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 200);
@@ -618,16 +638,17 @@ mod sstable_iter_tests {
     #[test]
     fn test_index_binary_seek_different_source_id() {
         let mut index = IndexBlock::with_capacity(4);
-        index.try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42).unwrap();
+        index
+            .try_insert(0, &Record::from_raw_parts(1, 100, 5, "sys", "v"), 42)
+            .unwrap();
 
         let target = Record::from_raw_parts(2, 100, 0, "sys", "");
         assert_eq!(index.binary_seek(&target), 42); // falls back to previous (or 0 since no entry for sid=2)
     }
 
-
-    fn write_indexed_sstable(path: &PathBuf, records: &[Record]) -> SSTableMeta {
+    fn write_indexed_sstable(path: &Path, records: &[Record]) -> SSTableMeta {
         let len = records.len();
-        SSTableMeta::write_to_file(path.clone(), 1, records.iter().cloned(), len).unwrap()
+        SSTableMeta::write_to_file(path.to_path_buf(), 1, records.iter().cloned(), len).unwrap()
     }
 
     #[test]
@@ -639,7 +660,10 @@ mod sstable_iter_tests {
             .collect();
         let meta = write_indexed_sstable(&path, &records);
 
-        assert!(!meta.index.inner.is_empty(), "index should have entries for 33 records");
+        assert!(
+            !meta.index.inner.is_empty(),
+            "index should have entries for 33 records"
+        );
 
         let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
@@ -655,7 +679,10 @@ mod sstable_iter_tests {
             .collect();
         let meta = write_indexed_sstable(&path, &records);
 
-        assert!(meta.index.inner.len() >= 2, "33 records should produce >=2 index entries");
+        assert!(
+            meta.index.inner.len() >= 2,
+            "33 records should produce >=2 index entries"
+        );
 
         // Range [116, 120) — binary_seek should land on entry at ts=116
         let iter = SSTableIter::new(&meta, 1, "sys", 116, 120, "").unwrap();
@@ -663,7 +690,11 @@ mod sstable_iter_tests {
         assert_eq!(collected.len(), 4);
         for rec in &collected {
             let ts = rec.extract_timestamp().unwrap();
-            assert!(ts >= 116 && ts < 120, "timestamp {} should be in [116, 120)", ts);
+            assert!(
+                (116..120).contains(&ts),
+                "timestamp {} should be in [116, 120)",
+                ts
+            );
         }
     }
 
@@ -674,7 +705,13 @@ mod sstable_iter_tests {
         let mut records = Vec::with_capacity(48);
         for i in 0..48 {
             let sid = if i < 16 { 1 } else { 2 };
-            records.push(Record::from_raw_parts(sid, 100 + i, i as u64, "sys", &format!("val{}", i)));
+            records.push(Record::from_raw_parts(
+                sid,
+                100 + i,
+                i as u64,
+                "sys",
+                &format!("val{}", i),
+            ));
         }
         let meta = write_indexed_sstable(&path, &records);
 
@@ -685,7 +722,7 @@ mod sstable_iter_tests {
         for rec in &collected {
             assert_eq!(rec.extract_source_id().unwrap(), 2);
             let ts = rec.extract_timestamp().unwrap();
-            assert!(ts >= 116 && ts < 120);
+            assert!((116..120).contains(&ts));
         }
     }
 
@@ -728,6 +765,7 @@ mod sstable_scanner_tests {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // if it exists (shouldn't)
             .open(path)
             .unwrap();
         let mut w = std::io::BufWriter::new(f);
@@ -776,6 +814,7 @@ mod sstable_scanner_tests {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true) // if it exists (shouldn't)
             .open(&path)
             .unwrap();
         drop(f);
@@ -890,7 +929,13 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
             Record::from_raw_parts(1, 40, 0, "sys", "d"),
         ];
-        let merge = MergeIter::new(None, vec![RecordIter::Mem(sst1.into_iter()), RecordIter::Mem(sst2.into_iter())]);
+        let merge = MergeIter::new(
+            None,
+            vec![
+                RecordIter::Mem(sst1.into_iter()),
+                RecordIter::Mem(sst2.into_iter()),
+            ],
+        );
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 4);
         let ts: Vec<i64> = collected
@@ -910,7 +955,13 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "dup"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let merge = MergeIter::new(None, vec![RecordIter::Mem(sst1.into_iter()), RecordIter::Mem(sst2.into_iter())]);
+        let merge = MergeIter::new(
+            None,
+            vec![
+                RecordIter::Mem(sst1.into_iter()),
+                RecordIter::Mem(sst2.into_iter()),
+            ],
+        );
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 3);
         let ts: Vec<i64> = collected

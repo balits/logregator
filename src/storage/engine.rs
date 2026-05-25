@@ -13,16 +13,13 @@ use tracing::instrument;
 
 use crate::metrics::Metrics;
 use crate::proto;
-use crate::storage::{MemTable, Wal};
 use crate::storage::{
-    BloomFilter,
-    IndexBlock,
-    SSTableMeta,
+    BloomFilter, IndexBlock, SSTableMeta,
     compaction::{self, CompactionCommand, CompactionResult},
     iter::{MemTableIterOwned, MergeIter, RecordIter, SSTableIter},
     record::Record,
 };
-
+use crate::storage::{MemTable, Wal};
 
 pub struct Engine {
     pub(crate) dir: PathBuf,
@@ -153,7 +150,9 @@ impl Engine {
             }
 
             if let Some(ref m) = self.metrics {
-                m.engine.memtable_bytes.set(self.memtable.size_hint() as i64);
+                m.engine
+                    .memtable_bytes
+                    .set(self.memtable.size_hint() as i64);
                 m.engine.sstable_count.set(self.sstable_map.len() as i64);
             }
             if let Some(ref tx) = self.stats_tx {
@@ -176,10 +175,13 @@ impl Engine {
                             match proto::Record::try_from(raw_rec) {
                                 Ok(rec) => {
                                     batch.push(rec);
-                                    if batch.len() >= BATCH_SIZE {
-                                        if record_sender.send(std::mem::take(&mut batch)).await.is_err() {
-                                            break;
-                                        }
+                                    if batch.len() >= BATCH_SIZE
+                                        && record_sender
+                                            .send(std::mem::take(&mut batch))
+                                            .await
+                                            .is_err()
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(err) => {
@@ -217,11 +219,7 @@ impl Engine {
         }
     }
 
-    fn apply_compaction(
-        &mut self,
-        new_meta: SSTableMeta,
-        ids_to_remove: Vec<u64>,
-    ) {
+    fn apply_compaction(&mut self, new_meta: SSTableMeta, ids_to_remove: Vec<u64>) {
         for file_id in ids_to_remove {
             self.sstable_map.remove(&file_id);
             let file_path = SSTableMeta::format_file_path(&self.dir, file_id);
@@ -232,11 +230,7 @@ impl Engine {
         self.sstable_map.insert(new_meta.id, new_meta);
 
         if self.sstable_map.len() >= 4 {
-            let tables: Vec<SSTableMeta> = self
-                .sstable_map
-                .iter()
-                .map(|(_, m)| m.clone())
-                .collect();
+            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
             let new_file_id = self.sst_counter;
             let new_file_path = SSTableMeta::format_file_path(&self.dir, new_file_id);
             let cmd = compaction::CompactionCommand {
@@ -328,7 +322,8 @@ impl Engine {
                 .context("engine.open: failed to seek to sstable footer")?;
             let (index, index_offset) = IndexBlock::read_from_unchecked(&mut r)
                 .context("engine.open: failed to read index block from sstable")?;
-            let bloom_offset = r.stream_position()
+            let bloom_offset = r
+                .stream_position()
                 .context("engine.open: failed to get bloom filter offset")?;
             let bloom = BloomFilter::decode(&mut r)
                 .context("engine.open: failed to decode bloom filter")?;
@@ -431,8 +426,9 @@ impl Engine {
 
         let path = SSTableMeta::format_file_path(&self.dir, file_id);
         let records_len = memtable_records.len();
-        let new_meta = SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
-            .context("engine.flush: failed to write sstable file")?;
+        let new_meta =
+            SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
+                .context("engine.flush: failed to write sstable file")?;
 
         self.sstable_map.insert(file_id, new_meta);
         self.sst_counter += 1;
@@ -451,11 +447,7 @@ impl Engine {
         }
 
         if need_compaction {
-            let tables: Vec<SSTableMeta> = self
-                .sstable_map
-                .iter()
-                .map(|(_, m)| m.clone())
-                .collect();
+            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
 
             let new_file_id = self.sst_counter;
             let new_file_path = self.dir.join(format!("{:010}.sst", new_file_id));
@@ -496,9 +488,10 @@ impl Engine {
         let new_meta = tokio::task::spawn_blocking(move || {
             SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
                 .context("engine.flush: failed to write sstable file (on bg task)")
-        }).await
-            .context("engine.flush: spawn_blocking join failed (on bg task)")?
-            .context("engine.flush: I/O failed (on bg task)")?;
+        })
+        .await
+        .context("engine.flush: spawn_blocking join failed (on bg task)")?
+        .context("engine.flush: I/O failed (on bg task)")?;
 
         self.sstable_map.insert(file_id, new_meta);
         self.sst_counter += 1;
@@ -510,11 +503,7 @@ impl Engine {
         }
 
         if need_compaction {
-            let tables: Vec<SSTableMeta> = self
-                .sstable_map
-                .iter()
-                .map(|(_, m)| m.clone())
-                .collect();
+            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
 
             let new_file_id = self.sst_counter;
             let new_file_path = self.dir.join(format!("{:010}.sst", new_file_id));
@@ -914,8 +903,16 @@ mod tests {
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 4);
-        assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch1_a"));
-        assert!(result.iter().any(|r| r.extract_value().unwrap() == b"batch2_b"));
+        assert!(
+            result
+                .iter()
+                .any(|r| r.extract_value().unwrap() == b"batch1_a")
+        );
+        assert!(
+            result
+                .iter()
+                .any(|r| r.extract_value().unwrap() == b"batch2_b")
+        );
     }
 
     #[test]
@@ -957,7 +954,10 @@ mod tests {
         engine.insert(1, 10, "sys", "cpu normal").unwrap();
         engine.insert(1, 20, "sys", "mem high").unwrap();
 
-        let result: Vec<_> = engine.range(1, "sys", 0, 100, "nonexistent").unwrap().collect();
+        let result: Vec<_> = engine
+            .range(1, "sys", 0, 100, "nonexistent")
+            .unwrap()
+            .collect();
         assert!(result.is_empty());
     }
 
@@ -979,7 +979,10 @@ mod tests {
         assert_eq!(result.len(), 1);
 
         // filter matches no records
-        let result: Vec<_> = engine.range(1, "sys", 0, 100, "nonexistent").unwrap().collect();
+        let result: Vec<_> = engine
+            .range(1, "sys", 0, 100, "nonexistent")
+            .unwrap()
+            .collect();
         assert!(result.is_empty());
     }
 }

@@ -1,6 +1,11 @@
-use std::{fmt::Write, fs, sync::Arc, time::{Duration, Instant}};
+use std::{
+    fmt::Write,
+    fs,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// A single memory sample point.
 #[derive(Debug, Clone)]
@@ -14,7 +19,7 @@ pub struct MemSample {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSample {
     pub elapsed_secs: f64,
-    pub memtable_bytes: u64, 
+    pub memtable_bytes: u64,
     pub sst_count: u64,
     pub rss_bytes: u64,
     pub delta: i64,
@@ -53,11 +58,23 @@ fn read_vm_rss() -> (u64, u64, u64) {
     let mut data = 0u64;
     for line in status.lines() {
         if let Some(val) = line.strip_prefix("VmRSS:") {
-            rss = val.trim().split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            rss = val
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
         } else if let Some(val) = line.strip_prefix("VmSize:") {
-            vms = val.trim().split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            vms = val
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
         } else if let Some(val) = line.strip_prefix("VmData:") {
-            data = val.trim().split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            data = val
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
         }
     }
     (rss, vms, data)
@@ -85,12 +102,15 @@ impl MemProfiler {
                     }
                 }
                 let (rss, vms, data) = read_vm_rss();
-                if tx.try_send(MemSample {
-                    elapsed_secs: start.elapsed().as_secs_f64(),
-                    rss_kb: rss,
-                    vms_kb: vms,
-                    data_kb: data,
-                }).is_err() {
+                if tx
+                    .try_send(MemSample {
+                        elapsed_secs: start.elapsed().as_secs_f64(),
+                        rss_kb: rss,
+                        vms_kb: vms,
+                        data_kb: data,
+                    })
+                    .is_err()
+                {
                     // channel full skip this sample
                 }
             }
@@ -134,29 +154,44 @@ impl MemProfiler {
         let em_samples = engine_samples.len();
 
         writeln!(out, "==> MEMORY PROFILE <==\n").unwrap();
-        writeln!(out, "{:>10} {:>10} {:>10} {:>10} {:>8} {:>8}",
-            "RSS_MIN", "RSS_AVG", "RSS_MAX", "RSS_END", "SAMPLES", "DUR_S").unwrap();
-        writeln!(out, "{:>10} {:>10} {:>10} {:>10} {:>8} {:>8.1}",
+        writeln!(
+            out,
+            "{:>10} {:>10} {:>10} {:>10} {:>8} {:>8}",
+            "RSS_MIN", "RSS_AVG", "RSS_MAX", "RSS_END", "SAMPLES", "DUR_S"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "{:>10} {:>10} {:>10} {:>10} {:>8} {:>8.1}",
             format_size(rss_min),
             format_size(rss_avg),
             format_size(rss_max),
             format_size(rss_last),
             samples.len(),
             dur,
-        ).unwrap();
-        writeln!(out, "Growth rate: {:.1} KB/s ({} MB over {:.0}s)",
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "Growth rate: {:.1} KB/s ({} MB over {:.0}s)",
             growth_rate,
             (growth_rate * dur / 1024.0) as u64,
             dur,
-        ).unwrap();
+        )
+        .unwrap();
 
         if em_samples > 0 {
             writeln!(out, "\n==> ENGINE STATE SAMPLES ({} total) <==", em_samples).unwrap();
-            writeln!(out, "{:>10} {:>12} {:>12} {:>12} {:>12}",
-                "ELAPSED", "MEMTBL_KB", "SST_CNT", "RSS_KB", "DELTA_KB").unwrap();
+            writeln!(
+                out,
+                "{:>10} {:>12} {:>12} {:>12} {:>12}",
+                "ELAPSED", "MEMTBL_KB", "SST_CNT", "RSS_KB", "DELTA_KB"
+            )
+            .unwrap();
             for (i, (elapsed, mt_bytes, sst_cnt)) in engine_samples.iter().enumerate() {
                 if i % std::cmp::max(1, em_samples / 20) == 0 || i == em_samples - 1 {
-                    let rss = samples.iter()
+                    let rss = samples
+                        .iter()
                         .find(|s| (s.elapsed_secs - elapsed).abs() < 0.5)
                         .map(|s| s.rss_kb)
                         .unwrap_or(0);
@@ -165,9 +200,16 @@ impl MemProfiler {
                     } else {
                         0
                     };
-                    writeln!(out, "{:>10.2} {:>12} {:>12} {:>12} {:>12}",
-                        elapsed, mt_bytes / 1024, sst_cnt, rss, delta
-                    ).unwrap();
+                    writeln!(
+                        out,
+                        "{:>10.2} {:>12} {:>12} {:>12} {:>12}",
+                        elapsed,
+                        mt_bytes / 1024,
+                        sst_cnt,
+                        rss,
+                        delta
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -191,20 +233,26 @@ impl MemProfiler {
             } else {
                 String::new()
             };
-            writeln!(out, "{:>6} |{:-<width$}| {} {:>8} KB",
+            writeln!(
+                out,
+                "{:>6} |{:-<width$}| {} {:>8} KB",
                 label,
                 "█".repeat(bar_len),
                 delta,
                 s.rss_kb,
                 width = width,
-            ).unwrap();
+            )
+            .unwrap();
             prev_bar = Some(s.rss_kb as f64);
         }
 
         out
     }
 
-    pub fn new_report(samples: &[MemSample], engine_samples: &[(f64, usize, usize)]) -> Option<MemReport> {
+    pub fn new_report(
+        samples: &[MemSample],
+        engine_samples: &[(f64, usize, usize)],
+    ) -> Option<MemReport> {
         if samples.is_empty() {
             tracing::info!("No memory samples collected.");
             return None;
@@ -219,23 +267,25 @@ impl MemProfiler {
         report.rss_avg = report.rss_sum / report.rss_values.len() as u64;
         report.rss_last = report.rss_values[report.rss_values.len() - 1];
 
-        report.duration = samples.last().unwrap().elapsed_secs - samples.first().unwrap().elapsed_secs;
+        report.duration =
+            samples.last().unwrap().elapsed_secs - samples.first().unwrap().elapsed_secs;
         if report.duration > 0.0 {
-            report.growth_rate_kb = (report.rss_last as f64 - report.rss_values[0] as f64) / report.duration;
+            report.growth_rate_kb =
+                (report.rss_last as f64 - report.rss_values[0] as f64) / report.duration;
             report.growth_rate_mb = report.growth_rate_kb * report.duration / 1024.0;
         }
 
         let em_samples = engine_samples.len();
 
-        report.engine_samples.extend(
-            engine_samples
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (elapsed, mt_bytes, sst_cnt))| {
+        report
+            .engine_samples
+            .extend(engine_samples.iter().enumerate().filter_map(
+                |(i, (elapsed, mt_bytes, sst_cnt))| {
                     if i % std::cmp::max(1, em_samples / 20) != 0 && i != em_samples - 1 {
-                        return None
+                        return None;
                     }
-                    let rss = samples.iter()
+                    let rss = samples
+                        .iter()
                         .find(|s| (s.elapsed_secs - elapsed).abs() < 0.5)
                         .map(|s| s.rss_kb)
                         .unwrap_or(0);
@@ -250,10 +300,10 @@ impl MemProfiler {
                         memtable_bytes: *mt_bytes as u64 / 1024,
                         sst_count: *sst_cnt as u64,
                         rss_bytes: rss,
-                        delta: delta as i64,
+                        delta,
                     })
-            })
-        );
+                },
+            ));
 
         Some(report)
     }

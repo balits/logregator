@@ -3,7 +3,10 @@
 //! and helper objects like the bloom filter and index block.
 
 use std::{
-    fs, hash::{BuildHasher, Hasher, RandomState}, io::{self, Seek, Write}, path::PathBuf
+    fs,
+    hash::{BuildHasher, Hasher, RandomState},
+    io::{self, Seek, Write},
+    path::{Path, PathBuf},
 };
 
 use anyhow::Context;
@@ -11,23 +14,23 @@ use anyhow::Context;
 use crate::storage::Record;
 
 #[derive(Debug, Clone)]
-pub(crate) struct SSTableMeta {
-    pub(crate) id: u64,
-    pub(crate) path: PathBuf,
-    pub(crate) bloom: BloomFilter,
-    pub(crate) bloom_offset: u64,
-    pub(crate) index: IndexBlock,
-    pub(crate) index_offset: u64,
-    pub(crate) file_size: u64,
-    pub(crate) num_records: usize,
+pub struct SSTableMeta {
+    pub id: u64,
+    pub path: PathBuf,
+    pub bloom: BloomFilter,
+    pub bloom_offset: u64,
+    pub index: IndexBlock,
+    pub index_offset: u64,
+    pub file_size: u64,
+    pub num_records: usize,
 }
 
 impl SSTableMeta {
-    pub(crate) fn format_file_path(base_path: &PathBuf, id: u64) -> PathBuf {
+    pub fn format_file_path(base_path: &Path, id: u64) -> PathBuf {
         base_path.join(format!("{:010}.sst", id))
     }
 
-    pub(crate) fn write_to_file<I:Iterator<Item = Record>>(
+    pub fn write_to_file<I: Iterator<Item = Record>>(
         path: PathBuf,
         id: u64,
         source: I,
@@ -42,11 +45,9 @@ impl SSTableMeta {
         let mut bloom = BloomFilter::new(source_len, 0.01);
         let mut index = IndexBlock::with_capacity(source_len);
 
+        let mut record_offset = 0u64;
         let mut num_records = 0usize;
         for (idx, rec) in source.enumerate() {
-            let record_offset = w
-                .stream_position()
-                .context("engine.flush: failed to get records offset")?;
             let len_buf = (rec.len() as u64).to_le_bytes();
             w.write_all(&len_buf)
                 .context("engine.flush: failed to write record length")?;
@@ -64,6 +65,7 @@ impl SSTableMeta {
                 .try_insert(idx, &rec, record_offset)
                 .context("engine.flush: failed to insert record into index block")?;
 
+            record_offset += 8 + rec.len() as u64;
             num_records += 1
         }
 
@@ -106,13 +108,13 @@ impl SSTableMeta {
             num_records,
             file_size,
         };
-    
+
         Ok(meta)
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BloomFilter {
+pub struct BloomFilter {
     bitmap: Vec<u8>,
     n_bits: usize,
     n_hashes: usize,
@@ -123,7 +125,7 @@ impl BloomFilter {
     const SALT1: &[u8] = b"bloom_salt_1";
     const SALT2: &[u8] = b"bloom_salt_2";
 
-    pub(crate) fn new(n: usize, fpr: f64) -> Self {
+    pub fn new(n: usize, fpr: f64) -> Self {
         let m = (-(n as f64 * fpr.ln()) / 2f64.ln().powi(2)).ceil() as usize;
         let k = ((m as f64 / (n as f64)) * 2f64.ln()) as usize;
         Self {
@@ -135,7 +137,9 @@ impl BloomFilter {
     }
 
     /// read_from_unchecked parses a reader (and seaker) and returns the filter and its file offset.
-    pub(crate) fn read_from_unchecked(mut r: impl io::Read + io::Seek) -> anyhow::Result<(Self, u64)> {
+    pub unsafe fn read_from_unchecked(
+        mut r: impl io::Read + io::Seek,
+    ) -> anyhow::Result<(Self, u64)> {
         let mut bloom_offset_buf = [0u8; 8];
         r.read_exact(&mut bloom_offset_buf)
             .context("bloom_filter.load_from: failed to read bloom filter offset")?;
@@ -148,7 +152,7 @@ impl BloomFilter {
         Ok((bloom, bloom_offset))
     }
 
-    pub(crate) fn positions(&self, source_id: i64, key: &[u8]) -> Vec<usize> {
+    pub fn positions(&self, source_id: i64, key: &[u8]) -> Vec<usize> {
         let mut hbuf = Vec::with_capacity(8 + key.len());
         hbuf.extend_from_slice(&source_id.to_le_bytes());
         hbuf.extend_from_slice(key);
@@ -159,13 +163,13 @@ impl BloomFilter {
             .collect()
     }
 
-    pub(crate) fn insert(&mut self, source_id: i64, key: &[u8]) {
+    pub fn insert(&mut self, source_id: i64, key: &[u8]) {
         for pos in self.positions(source_id, key) {
             self.set_bit(pos);
         }
     }
 
-    pub(crate) fn contains(&self, source_id: i64, key: &[u8]) -> bool {
+    pub fn contains(&self, source_id: i64, key: &[u8]) -> bool {
         self.positions(source_id, key)
             .into_iter()
             .all(|pos| self.get_bit(pos))
@@ -176,7 +180,7 @@ impl BloomFilter {
     /// [[n_bits u64]] [[n_hashes u64]] [[bf_len u64]] [bf_content [[u8; bf_len]]]
     ///
     /// NOTE: this does not append the bloom_filter start offset
-    pub(crate) fn encode(&self, mut w: impl io::Write) -> anyhow::Result<()> {
+    pub fn encode(&self, mut w: impl io::Write) -> anyhow::Result<()> {
         w.write_all(&(self.n_bits as u64).to_le_bytes())
             .context("bloom_filter.encode: failed to write n_bits")?;
         w.write_all(&(self.n_hashes as u64).to_le_bytes())
@@ -191,7 +195,7 @@ impl BloomFilter {
     /// <code>[n_bits u64][n_hashes u64][bf_len u64][bf_content [u8; bf_len]]</code>
     ///
     /// NOTE: decode assumes the reader points to the beginning of the bloom filter footer.
-    pub(crate) fn decode(mut r: impl io::Read) -> anyhow::Result<Self> {
+    pub fn decode(mut r: impl io::Read) -> anyhow::Result<Self> {
         let mut u64_buf = [0u8; 8];
         r.read_exact(&mut u64_buf)
             .context("bloom_filter.decode: failed to read n_bits")?;
@@ -239,45 +243,44 @@ impl BloomFilter {
 ///
 /// <code>[[source_id: i64 LE]][[timestamp: i64 LE]][[seq_num: u64 LE]][[key_len: u32 LE]][[key: key_len bytes]][[offset: u64 LE]]</code>
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IndexBlock {
-    /// inner is expected to be sorted, since we only insert 
-    /// elements produced by memtable or merge iterator 
+pub struct IndexBlock {
+    /// inner is expected to be sorted, since we only insert
+    /// elements produced by memtable or merge iterator
     /// which are both sorted.
-    /// 
+    ///
     /// Sadly i dont know how to make this a type level constrain
     /// I could use a BinaryHeap here too, but ugh..?
-    pub(crate) inner: Vec<RecordIndex>,
+    pub inner: Vec<RecordIndex>,
 }
 
-
 impl IndexBlock {
-    pub(crate) const PERIOD_SZ: usize = 16;
+    pub const PERIOD_SZ: usize = 16;
 
-    pub(crate) fn with_capacity(cap: usize) -> Self {
+    pub fn with_capacity(cap: usize) -> Self {
         Self {
             inner: Vec::with_capacity(cap),
         }
     }
 
     /// try_insert converts the key bytes to utf8 Strings, and inserts the (key, offset) pair if <code>index % PERIOD_SZ == 0</code>
-    pub(crate) fn try_insert(
-        &mut self,
-        idx: usize,
-        rec: &Record,
-        offset: u64,
-    ) -> anyhow::Result<bool> {
-        if idx % Self::PERIOD_SZ != 0 {
+    pub fn try_insert(&mut self, idx: usize, rec: &Record, offset: u64) -> anyhow::Result<bool> {
+        if idx.is_multiple_of(Self::PERIOD_SZ) {
             return Ok(false);
         }
 
-        let (source_id, timestamp, seq_num, key) = rec.extract_all_fields_no_value_ref()
+        let (source_id, timestamp, seq_num, key) = rec
+            .extract_all_fields_no_value_ref()
             .context("record_index.try_insert: failed to extract fields from record bytes")?;
 
         let key = String::from_utf8(key.to_vec())
             .context("record_index.try_insert: failed to turn key into utf8 string")?;
 
         let i = RecordIndex {
-            source_id, timestamp, seq_num, key, offset
+            source_id,
+            timestamp,
+            seq_num,
+            key,
+            offset,
         };
 
         self.inner.push(i);
@@ -285,7 +288,7 @@ impl IndexBlock {
     }
 
     /// read_from_unchecked parses a reader (and seaker) and returns the index and its file offset.
-    pub(crate) fn read_from_unchecked(mut r: impl io::Read + io::Seek) -> anyhow::Result<(Self, u64)> {
+    pub fn read_from_unchecked(mut r: impl io::Read + io::Seek) -> anyhow::Result<(Self, u64)> {
         let mut offset_buf = [0u8; 8];
         r.read_exact(&mut offset_buf)
             .context("record_index.load_from: failed to read index offset")?;
@@ -344,7 +347,7 @@ impl IndexBlock {
         Ok(Self { inner: vec })
     }
 
-    pub(crate) fn encode(&self, mut w: impl io::Write) -> anyhow::Result<()> {
+    pub fn encode(&self, mut w: impl io::Write) -> anyhow::Result<()> {
         w.write_all(&(self.inner.len() as u32).to_le_bytes())
             .context("record_index.encode: failed to write index len")?;
         for entry in self.inner.iter() {
@@ -369,7 +372,7 @@ impl IndexBlock {
     /// range-start sentinels always carry seq_num=0 and can never match index entries
     /// which carry real seq_nums.
     /// Returns 0 if the index is empty or all entries are > target.
-    pub(crate) fn binary_seek(&self, target: &Record) -> u64 {
+    pub fn binary_seek(&self, target: &Record) -> u64 {
         let Ok((target_sid, target_ts, _target_seq, target_key)) =
             target.extract_all_fields_no_value_ref()
         else {
@@ -390,12 +393,11 @@ impl IndexBlock {
     }
 }
 
-
 // RecordIndex the actual pointer to a record in an SSTable file.
 // Aside from its offset it tracks other metadata so that even
 // filtered queries can be executed in O(log N).
 #[derive(Debug, Clone)]
-pub(crate) struct RecordIndex {
+pub struct RecordIndex {
     source_id: i64,
     timestamp: i64,
     seq_num: u64,
@@ -404,7 +406,7 @@ pub(crate) struct RecordIndex {
 }
 
 impl RecordIndex {
-    pub(crate) fn cmp_record(&self, other: &Record) -> Option<std::cmp::Ordering> {
+    pub fn cmp_record(&self, other: &Record) -> Option<std::cmp::Ordering> {
         let (sid, ts, seq, key) = other.extract_all_fields_no_value_ref().ok()?;
         Some(
             self.source_id

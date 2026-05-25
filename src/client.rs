@@ -27,11 +27,14 @@ impl Client {
             .await
             .context("client.insert: failed to send client message")?;
         match self.framed.next().await {
-            Some(Ok(ServerMessage::InsertOk)) => return Ok(()),
-            Some(Ok(ServerMessage::Error(e))) => return Err(format_err!(e)),
-            Some(Ok(resp)) => return Err(format_err!("client.insert: unexpected response message: {:?}", resp)),
-            Some(Err(e)) => return Err(format_err!(e)),
-            None => return Err(format_err!("client.insert: connection closed")),
+            Some(Ok(ServerMessage::InsertOk)) => Ok(()),
+            Some(Ok(ServerMessage::Error(e))) => Err(format_err!(e)),
+            Some(Ok(resp)) => Err(format_err!(
+                "client.insert: unexpected response message: {:?}",
+                resp
+            )),
+            Some(Err(e)) => Err(format_err!(e)),
+            None => Err(format_err!("client.insert: connection closed")),
         }
     }
 
@@ -42,11 +45,14 @@ impl Client {
             .await
             .context("client.batch_insert: failed to send client message")?;
         match self.framed.next().await {
-            Some(Ok(ServerMessage::InsertOk)) => return Ok(()),
-            Some(Ok(ServerMessage::Error(e))) => return Err(format_err!(e)),
-            Some(Ok(resp)) => return Err(format_err!("client.batch_insert: unexpected response message: {:?}", resp)),
-            Some(Err(e)) => return Err(format_err!(e)),
-            None => return Err(format_err!("client.batch_insert: connection closed")),
+            Some(Ok(ServerMessage::InsertOk)) => Ok(()),
+            Some(Ok(ServerMessage::Error(e))) => Err(format_err!(e)),
+            Some(Ok(resp)) => Err(format_err!(
+                "client.batch_insert: unexpected response message: {:?}",
+                resp
+            )),
+            Some(Err(e)) => Err(format_err!(e)),
+            None => Err(format_err!("client.batch_insert: connection closed")),
         }
     }
 
@@ -66,7 +72,12 @@ impl Client {
                     return Ok(v);
                 }
                 Some(Ok(ServerMessage::Error(e))) => return Err(format_err!(e)),
-                Some(Ok(resp)) => return Err(format_err!("client.batch_insert: response message: {:?}", resp)),
+                Some(Ok(resp)) => {
+                    return Err(format_err!(
+                        "client.batch_insert: response message: {:?}",
+                        resp
+                    ));
+                }
                 Some(Err(e)) => return Err(format_err!(e)),
                 None => return Err(format_err!("client.batch_insert: connection closed")),
             }

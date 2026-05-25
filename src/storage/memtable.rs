@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, btree_set}};
+use std::collections::{BTreeSet, btree_set};
 
 use crate::storage::record::Record;
 
@@ -7,72 +7,72 @@ use crate::storage::record::Record;
 /// of the memtable, returning a true if the table has exceeded
 /// its capacity and is in need of flushing.
 #[derive(Clone)]
-pub(crate) struct MemTable {
+pub struct MemTable {
     current_sz: usize,
     limit: usize,
     bset: BTreeSet<Record>,
 }
 
-
 impl MemTable {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub fn new(limit: usize) -> Self {
         // let cap = limit.div_euclid(Record::MIN_RECORD_SIZE);
-        Self { current_sz: 0, limit, bset: BTreeSet::new() }
+        Self {
+            current_sz: 0,
+            limit,
+            bset: BTreeSet::new(),
+        }
     }
 
-    pub(crate) fn insert(&mut self, rec: Record) -> bool {
+    pub fn insert(&mut self, rec: Record) -> bool {
         let rec_sz = rec.len();
         self.bset.insert(rec);
         self.current_sz += rec_sz;
         self.current_sz > self.limit
     }
 
-    pub(crate) fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.limit
     }
 
-    pub(crate) fn size_hint(&self) -> usize {
+    pub fn size_hint(&self) -> usize {
         self.current_sz
     }
 
-    pub(crate) fn iter(&self) -> btree_set::Iter<'_, Record> {
+    pub fn iter(&self) -> btree_set::Iter<'_, Record> {
         self.bset.iter()
     }
 
     /// Clones only records within [source_id, start_ts) .. (source_id, end_ts),
     /// reducing allocations vs cloning the entire memtable.
-    pub(crate) fn range_cloned(&self, source_id: i64, start_ts: i64, end_ts: i64) -> Vec<Record> {
+    pub fn range_cloned(&self, source_id: i64, start_ts: i64, end_ts: i64) -> Vec<Record> {
         let range_start = Record::from_raw_parts(source_id, start_ts, 0, "", "");
         let range_end = Record::from_raw_parts(source_id, end_ts, 0, "", "");
         self.bset.range(range_start..range_end).cloned().collect()
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.bset.clear();
         self.current_sz = 0;
     }
 
-    pub(crate) fn freeze(&mut self) -> BTreeSet<Record> {
+    #[allow(unused)]
+    pub fn freeze(&mut self) -> BTreeSet<Record> {
         let old = std::mem::take(&mut self.bset);
         self.clear();
-        return old;
+        old
     }
 
     #[cfg(test)]
-    pub(crate) fn get(&self, source_id: i64, timestamp: i64, key: &str) -> Option<&Record> {
+    pub fn get(&self, source_id: i64, timestamp: i64, key: &str) -> Option<&Record> {
         let start = Record::from_raw_parts(source_id, timestamp, 0, key, "");
-        self.bset.range(start..)
+        self.bset
+            .range(start..)
             .take_while(|r| {
                 r.extract_source_id().ok() == Some(source_id)
                     && r.extract_timestamp().ok() == Some(timestamp)
             })
             .filter(|r| r.extract_key().ok() == Some(key.as_bytes()))
             .last()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.bset.len()
     }
 }
 
@@ -127,7 +127,10 @@ mod tests {
 
         assert_eq!(mt.size_hint(), size_1 + size_2);
         assert_eq!(
-            mt.get(1, 100, "sys_metric").unwrap().extract_value().unwrap(),
+            mt.get(1, 100, "sys_metric")
+                .unwrap()
+                .extract_value()
+                .unwrap(),
             b"cpu: 45%, mem: 80%"
         );
     }

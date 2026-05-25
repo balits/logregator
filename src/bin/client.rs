@@ -1,6 +1,6 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
 use chrono::{DateTime, Utc};
+use clap::{Parser, Subcommand};
 use logregator::{client::Client, proto};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -37,13 +37,21 @@ enum Command {
         end_timestamp: i64,
         #[arg(long, short, help = "key of the log")]
         key: String,
-        #[arg(long, short, help="optional filter (needle) to search in the value (haystack)")]
+        #[arg(
+            long,
+            short,
+            help = "optional filter (needle) to search in the value (haystack)"
+        )]
         filter: Option<String>,
     },
     BatchInsert {
-        #[arg(long, short, help="path of the JSON input file containing a list of insert request")]
+        #[arg(
+            long,
+            short,
+            help = "path of the JSON input file containing a list of insert request"
+        )]
         path: String,
-    }
+    },
 }
 
 #[test]
@@ -69,21 +77,28 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_main() ->  anyhow::Result<()>{
-
+async fn run_main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let mut client = Client::connect(&args.addr).await
+    let mut client = Client::connect(&args.addr)
+        .await
         .context("failed to connect to server")?;
     tracing::info!("client connected");
 
     match args.command {
-        Command::Insert { source_id, timestamp, key, value } => {
-            let res = client.insert(proto::Insert{
-                source_id,
-                ts: timestamp,
-                key,
-                value
-            }).await;
+        Command::Insert {
+            source_id,
+            timestamp,
+            key,
+            value,
+        } => {
+            let res = client
+                .insert(proto::Insert {
+                    source_id,
+                    ts: timestamp,
+                    key,
+                    value,
+                })
+                .await;
 
             match res {
                 Err(e) => {
@@ -94,14 +109,22 @@ async fn run_main() ->  anyhow::Result<()>{
                 }
             }
         }
-        Command::Range { source_id, start_timestamp, end_timestamp, key, filter } => {
-            let res = client.range(proto::Range{
-                source_id,
-                start_ts: start_timestamp,
-                end_ts: end_timestamp,
-                key,
-                filter: filter.unwrap_or_default(),
-            }).await;
+        Command::Range {
+            source_id,
+            start_timestamp,
+            end_timestamp,
+            key,
+            filter,
+        } => {
+            let res = client
+                .range(proto::Range {
+                    source_id,
+                    start_ts: start_timestamp,
+                    end_ts: end_timestamp,
+                    key,
+                    filter: filter.unwrap_or_default(),
+                })
+                .await;
             match res {
                 Err(e) => {
                     tracing::error!("failed to range over record: {e}")
@@ -115,17 +138,14 @@ async fn run_main() ->  anyhow::Result<()>{
                 }
             }
         }
-        _ => unimplemented!()
+        _ => unimplemented!(),
     }
 
     Ok(())
-
 }
 
 fn timestamp_parser(arg: &str) -> Result<i64, String> {
     arg.parse::<i64>()
         .or_else(|_| arg.parse::<DateTime<Utc>>().map(|dt| dt.timestamp()))
-        .map_err(|_| {
-            format!("'{arg}' is neither a Unix timestamp integer nor an RFC3339 datetime")
-        })
+        .map_err(|_| format!("'{arg}' is neither a Unix timestamp integer nor an RFC3339 datetime"))
 }

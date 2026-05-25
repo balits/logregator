@@ -14,12 +14,11 @@ pub struct Wal {
 impl Wal {
     pub const WAL_PATH_FMT: &'static str = "wal.log";
 
-    pub(crate) fn new(path: &std::path::Path) -> anyhow::Result<Self>  {
+    pub fn new(path: &std::path::Path) -> anyhow::Result<Self> {
         let file: std::fs::File = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
-            
             .open(path)
             .with_context(|| format!("wal: failed to open file {:?}", path))?;
 
@@ -36,11 +35,13 @@ impl Wal {
         self.metrics = Some(metrics.clone());
     }
 
-    pub(crate) fn write_one(&mut self, rec: &Record) -> anyhow::Result<()> {
+    pub fn write_one(&mut self, rec: &Record) -> anyhow::Result<()> {
         let len = rec.len() as u64;
-        self.w.write_all(&len.to_le_bytes())
+        self.w
+            .write_all(&len.to_le_bytes())
             .context("wal.write_one: failed to write prefix len")?;
-        self.w.write_all(rec.as_bytes())
+        self.w
+            .write_all(rec.as_bytes())
             .context("wal.write_one: failed to write record")?;
         if let Some(ref m) = self.metrics {
             m.wal.write_count.inc(1);
@@ -49,7 +50,7 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn write_many(&mut self, recs: &[Record]) -> anyhow::Result<()> {
+    pub fn write_many(&mut self, recs: &[Record]) -> anyhow::Result<()> {
         let mut total_bytes = 0u64;
         for rec in recs {
             let len = rec.len() as u64;
@@ -68,8 +69,11 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn recover(&mut self) -> anyhow::Result<Vec<Record>> {
-        let mut f = self.w.get_ref().try_clone()
+    pub fn recover(&mut self) -> anyhow::Result<Vec<Record>> {
+        let mut f = self
+            .w
+            .get_ref()
+            .try_clone()
             .context("wal.recover: failed to rewind to beginning of file")?;
         f.rewind()
             .context("wal.recover: failed to rewind to start of file")?;
@@ -95,11 +99,9 @@ impl Wal {
         Ok(records)
     }
 
-    pub(crate) fn sync(&mut self) -> anyhow::Result<()> {
+    pub fn sync(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
-        self.w
-            .flush()
-            .context("wal.sync: failed to flush")?;
+        self.w.flush().context("wal.sync: failed to flush")?;
         self.w
             .get_ref()
             .sync_all()
@@ -111,26 +113,30 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn clear(&mut self) -> anyhow::Result<()> {
+    pub fn clear(&mut self) -> anyhow::Result<()> {
         let f = self.w.get_mut();
         f.set_len(0).context("wal.clear: failed to truncate")?;
-        f.rewind().context("wal.clear: failed to rewind to beginning of file")?;
-        let f_cloned = self.w.get_ref().try_clone()
+        f.rewind()
+            .context("wal.clear: failed to rewind to beginning of file")?;
+        let f_cloned = self
+            .w
+            .get_ref()
+            .try_clone()
             .context("wal.clear: failed to clone file")?;
         self.w = io::BufWriter::new(f_cloned);
 
         Ok(())
     }
 
-    pub(crate) fn clear_path(path: &std::path::Path) -> anyhow::Result<()> {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .with_context(|| format!("wal.clear_path: failed to open {:?}", path))?;
-        f.set_len(0).context("wal.clear_path: failed to truncate")?;
-        drop(f);
-        Ok(())
-    }
+    // pub fn clear_path(path: &std::path::Path) -> anyhow::Result<()> {
+    //     let f = std::fs::OpenOptions::new()
+    //         .write(true)
+    //         .open(path)
+    //         .with_context(|| format!("wal.clear_path: failed to open {:?}", path))?;
+    //     f.set_len(0).context("wal.clear_path: failed to truncate")?;
+    //     drop(f);
+    //     Ok(())
+    // }
 }
 
 #[cfg(test)]
@@ -192,7 +198,8 @@ mod tests {
         let wal_path = &wal_path_buf;
         let mut wal = Wal::new(wal_path).unwrap();
 
-        wal.write_one(&Record::from_raw_parts(1, 1, 0, "k", "v")).unwrap();
+        wal.write_one(&Record::from_raw_parts(1, 1, 0, "k", "v"))
+            .unwrap();
         wal.sync().unwrap();
         wal.clear().expect("Failed to clear WAL");
 

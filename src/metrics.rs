@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use hdrhistogram::Histogram as HdrHist;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default)]
 pub struct Counter(AtomicU64);
@@ -49,7 +49,7 @@ impl Latency {
         ))
     }
     pub fn record_us(&self, us: f64) {
-        let v = us.max(0.0).min(3_600_000_000.0) as u64;
+        let v = us.clamp(0.0, 3_600_000_000.0) as u64;
         if let Ok(mut h) = self.0.lock() {
             let _ = h.record(v);
         }
@@ -57,12 +57,12 @@ impl Latency {
     pub fn record_instant(&self, start: Instant) {
         self.record_us(start.elapsed().as_secs_f64() * 1_000_000.0);
     }
-    pub fn snapshot(&self) -> Option<Snapshot> {
+    pub fn snapshot(&self) -> Option<LatencySnapshot> {
         let h = self.0.lock().ok()?;
-        if h.len() == 0 {
+        if h.is_empty() {
             return None;
         }
-        Some(Snapshot {
+        Some(LatencySnapshot {
             min: h.min(),
             p50: h.value_at_percentile(50.0),
             p90: h.value_at_percentile(90.0),
@@ -76,8 +76,8 @@ impl Latency {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Snapshot {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySnapshot {
     pub min: u64,
     pub p50: u64,
     pub p90: u64,
@@ -89,15 +89,15 @@ pub struct Snapshot {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalSnapshot {
     pub write_count: u64,
     pub write_bytes: u64,
     pub sync_count: u64,
-    pub sync_latency: Option<Snapshot>,
+    pub sync_latency: Option<LatencySnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSnapshot {
     pub insert_count: u64,
     pub batch_insert_count: u64,
@@ -111,14 +111,14 @@ pub struct EngineSnapshot {
     pub sstable_count: i64,
     pub flush_count: u64,
     pub compaction_count: u64,
-    pub insert_latency: Option<Snapshot>,
-    pub batch_insert_latency: Option<Snapshot>,
-    pub range_latency: Option<Snapshot>,
-    pub flush_duration: Option<Snapshot>,
-    pub compaction_duration: Option<Snapshot>,
+    pub insert_latency: Option<LatencySnapshot>,
+    pub batch_insert_latency: Option<LatencySnapshot>,
+    pub range_latency: Option<LatencySnapshot>,
+    pub flush_duration: Option<LatencySnapshot>,
+    pub compaction_duration: Option<LatencySnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSnapshot {
     pub connections_accepted: u64,
     pub connections_active: i64,
@@ -126,7 +126,7 @@ pub struct ServerSnapshot {
     pub frames_written: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub wal: WalSnapshot,
     pub engine: EngineSnapshot,
@@ -140,7 +140,6 @@ pub struct WalMetrics {
     pub sync_count: Counter,
     pub sync_latency: Latency,
 }
-
 
 #[derive(Debug, Default)]
 pub struct EngineMetrics {
@@ -204,8 +203,18 @@ impl Metrics {
         writeln!(
             out,
             "{:>8} {:>8} {:>10} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10} {:>5} {:>8} {:>8}",
-            "INSERTS", "BATCH", "RECORDS", "FAIL", "RANGES", "R_FAIL", "SCANNED",
-            "MT_BYTES", "MT_LIM", "SST", "FLUSHES", "COMPACT"
+            "INSERTS",
+            "BATCH",
+            "RECORDS",
+            "FAIL",
+            "RANGES",
+            "R_FAIL",
+            "SCANNED",
+            "MT_BYTES",
+            "MT_LIM",
+            "SST",
+            "FLUSHES",
+            "COMPACT"
         )
         .unwrap();
         writeln!(
@@ -227,12 +236,7 @@ impl Metrics {
         .unwrap();
 
         writeln!(out, "\n==> WAL METRICS <==").unwrap();
-        writeln!(
-            out,
-            "{:>10} {:>12} {:>8}",
-            "WRITES", "BYTES", "SYNCS"
-        )
-        .unwrap();
+        writeln!(out, "{:>10} {:>12} {:>8}", "WRITES", "BYTES", "SYNCS").unwrap();
         writeln!(
             out,
             "{:>10} {:>12} {:>8}",

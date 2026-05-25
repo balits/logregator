@@ -1,0 +1,130 @@
+{
+  "args": {
+    "duration_secs": 3,
+    "workloads": [
+      "Write"
+    ],
+    "addr": "127.0.0.1:4321",
+    "batch_size": 512,
+    "channel_capacity": 8192,
+    "concurrency_min": 1,
+    "concurrency_max": 1,
+    "concurrency_step": 2,
+    "sources": 4,
+    "keys": 4,
+    "value_size": 128,
+    "range_fraction": 0.5,
+    "range_window": 60,
+    "out": null,
+    "profile_mem": 0,
+    "memtable_mb": 32,
+    "verbose": false,
+    "tag": null
+  },
+  "runs": [
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 0,
+        "workload": "Write",
+        "concurrency": 1,
+        "duration_secs": 3,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 140800,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 46933.333333333336,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 7192.0,
+        "p50_us": 10271.0,
+        "p90_us": 12527.0,
+        "p95_us": 13231.0,
+        "p99_us": 14095.0,
+        "p99_9_us": 26895.0,
+        "max_us": 26895.0,
+        "mean_us": 10562.327272727276,
+        "stddev_us": 1793.5749476652943,
+        "sample_count": 275
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 0
+    }
+  ],
+  "metrics": {
+    "wal": {
+      "write_count": 140800,
+      "write_bytes": 24358400,
+      "sync_count": 275,
+      "sync_latency": {
+        "min": 1155,
+        "p50": 1797,
+        "p90": 2297,
+        "p95": 2561,
+        "p99": 3841,
+        "p99_9": 5327,
+        "max": 5327,
+        "mean": 1835,
+        "count": 275
+      }
+    },
+    "engine": {
+      "insert_count": 0,
+      "batch_insert_count": 275,
+      "records_inserted": 140800,
+      "insert_failures": 0,
+      "range_count": 0,
+      "range_failures": 0,
+      "records_scanned": 0,
+      "memtable_bytes": 23232000,
+      "memtable_limit": 33554432,
+      "sstable_count": 0,
+      "flush_count": 0,
+      "compaction_count": 0,
+      "insert_latency": null,
+      "batch_insert_latency": {
+        "min": 5244,
+        "p50": 7707,
+        "p90": 9479,
+        "p95": 10095,
+        "p99": 11519,
+        "p99_9": 20223,
+        "max": 20223,
+        "mean": 7904,
+        "count": 275
+      },
+      "range_latency": null,
+      "flush_duration": null,
+      "compaction_duration": null
+    },
+    "server": {
+      "connections_accepted": 1,
+      "connections_active": 1,
+      "frames_read": 275,
+      "frames_written": 275
+    }
+  },
+  "saturation": null,
+  "mem": null
+}
