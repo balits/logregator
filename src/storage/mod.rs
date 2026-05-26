@@ -15,10 +15,11 @@
 //! - [ ] 2. SSTable index blocks
 //!      SSTableIter scans from byte 0 every time. With an index block footer ([key_offset_pairs...][index_offset: u64]), you'd binary-search to the nearest offset, reducing scan cost from O(N) to O(log N). For a bloom miss, you skip the file entirely (done). For a bloom hit, the index avoids re-reading all preceding records.
 //! - [ ] 3. Block compression?
-//!     zstd-compressed 64KB blocks within SSTables. Big win for disk/IO, small CPU cost.
+//!      zstd-compressed 64KB blocks within SSTables. Big win for disk/IO, small CPU cost.
 //! - [ ] 4. memmap reads?
 
 pub mod compaction;
+mod backend;
 mod engine;
 mod iter;
 mod memtable;
@@ -28,7 +29,8 @@ mod wal;
 
 #[allow(unused)]
 pub use engine::Engine;
-pub(crate) use memtable::MemTable;
+pub use memtable::MemTable;
 pub use record::Record;
-pub(crate) use sstable::*;
-pub(crate) use wal::Wal;
+pub use sstable::*;
+pub use wal::Wal;
+pub use backend::Backend;

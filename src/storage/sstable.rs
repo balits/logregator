@@ -264,7 +264,7 @@ impl IndexBlock {
 
     /// try_insert converts the key bytes to utf8 Strings, and inserts the (key, offset) pair if <code>index % PERIOD_SZ == 0</code>
     pub fn try_insert(&mut self, idx: usize, rec: &Record, offset: u64) -> anyhow::Result<bool> {
-        if idx.is_multiple_of(Self::PERIOD_SZ) {
+        if !idx.is_multiple_of(Self::PERIOD_SZ) {
             return Ok(false);
         }
 

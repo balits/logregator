@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, ValueEnum};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +41,7 @@ fn workload_parser(arg: &str) -> Result<WorkloadKind, String> {
     }
 }
 
-#[derive(Debug, Parser, Serialize, Deserialize)]
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
 pub struct BenchmarkArgs {
     #[arg(long, default_value = "10")]
     pub duration_secs: u32,
@@ -83,6 +83,7 @@ pub struct BenchmarkArgs {
     pub memtable_mb: u64,
 
     #[arg(long)]
+    #[serde(default)]
     pub verbose: bool,
 
     #[arg(long)]
@@ -241,6 +242,7 @@ pub struct BenchmarkResult {
     pub args: BenchmarkArgs,
     pub runs: Vec<RunResult>,
     pub metrics: metrics::MetricsSnapshot,
+    #[serde(default)]
     pub saturations: Vec<Saturation>,
     pub mem: Option<mem_profile::MemReport>,
 }

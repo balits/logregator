@@ -6,10 +6,9 @@ use tokio::sync::mpsc;
 fn bench_engine_insert(c: &mut Criterion) {
     let dir = tempdir().unwrap();
     let (cmd_tx, _) = mpsc::channel(1);
-    let (_, res_rx) = mpsc::channel(1);
 
     let mut engine =
-        Engine::open(dir.path().to_path_buf(), 64 * 1024 * 1024, cmd_tx, res_rx).unwrap();
+        Engine::open(dir.path().to_path_buf(), 64 * 1024 * 1024, cmd_tx).unwrap();
     let mut i = 0;
 
     c.bench_function("engine_insert", |b| {
@@ -30,13 +29,11 @@ fn bench_engine_insert(c: &mut Criterion) {
 fn bench_engine_range_memtable(c: &mut Criterion) {
     let dir = tempdir().unwrap();
     let (cmd_tx, _) = mpsc::channel(1);
-    let (_, res_rx) = mpsc::channel(1);
 
     let mut engine = Engine::open(
         dir.path().to_path_buf(),
         64 * 1024 * 1024, // big memtable so we dont flush
         cmd_tx,
-        res_rx,
     )
     .unwrap();
     let source_id = 64;
@@ -67,13 +64,11 @@ fn bench_engine_range_memtable(c: &mut Criterion) {
 fn bench_engine_range_sstable(c: &mut Criterion) {
     let dir = tempdir().unwrap();
     let (cmd_tx, _) = mpsc::channel(1);
-    let (_, res_rx) = mpsc::channel(1);
 
     let mut engine = Engine::open(
         dir.path().to_path_buf(),
         256, // frequent flushes -> many sstables -> MergeIter might be slower
         cmd_tx,
-        res_rx,
     )
     .unwrap();
     let source_id = 64;

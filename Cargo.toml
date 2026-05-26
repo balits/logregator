@@ -13,7 +13,7 @@ bench=false
 name = "client"
 bench=false
 [[bin]]
-name = "loadgen"
+name = "benchmark"
 bench=false
 
 [[bench]]

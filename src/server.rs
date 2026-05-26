@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
-use tracing::Instrument;
+use tracing::{Instrument, instrument};
 
 use crate::metrics::Metrics;
 use crate::proto::{self, ServerMessage};
@@ -35,8 +35,7 @@ impl Server {
 
     pub async fn run_main_loop(
         &self,
-        insert_tx: Sender<proto::Command>,
-        range_tx: Sender<proto::Command>,
+        cmd_tx: Sender<proto::Command>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<()> {
         let server_addr = self
@@ -51,9 +50,8 @@ impl Server {
                 .await
                 .context("server.main_loop: failed to accept connection")?;
 
-            let batch_size = insert_tx.max_capacity();
-            let insert_tx = insert_tx.clone();
-            let range_tx = range_tx.clone();
+            let batch_size = cmd_tx.max_capacity();
+            let cmd_tx = cmd_tx.clone();
             let metrics = metrics.clone();
             metrics.server.connections_accepted.inc(1);
             metrics.server.connections_active.add(1);
@@ -61,7 +59,7 @@ impl Server {
             tokio::spawn(
                 async move {
                     if let Err(e) =
-                        Self::handle_conn(conn, addr, insert_tx, range_tx, batch_size, metrics)
+                        Self::handle_conn(conn, addr, cmd_tx, batch_size, metrics)
                             .await
                     {
                         tracing::error!(error = %e, "connection handler failed");
@@ -72,11 +70,11 @@ impl Server {
         }
     }
 
+    #[instrument(fields(conn, addr))]
     async fn handle_conn(
         conn: TcpStream,
         addr: SocketAddr,
-        insert_tx: Sender<proto::Command>,
-        range_tx: Sender<proto::Command>,
+        cmd_tx: Sender<proto::Command>,
         _batch_size: usize,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<()> {
@@ -93,7 +91,7 @@ impl Server {
                 proto::ClientMessage::Insert(i) => {
                     let (tx, rx) = oneshot::channel();
                     let cmd = proto::Command::Insert(i, tx);
-                    insert_tx.send(cmd).await.context(
+                    cmd_tx.send(cmd).await.context(
                         "server.handle_conn(cmd=INSERT): failed to send insert cmd to engine",
                     )?;
                     let res = rx
@@ -111,7 +109,7 @@ impl Server {
                 proto::ClientMessage::BatchInsert(b) => {
                     let (tx, rx) = oneshot::channel();
                     let cmd = proto::Command::BatchInsert(b, tx);
-                    insert_tx
+                    cmd_tx
                         .send(cmd)
                         .await
                         .context("server.handle_conn(cmd=BATCH_INSERT): failed to send batch insert cmd to engine")?;
@@ -131,7 +129,7 @@ impl Server {
                     let (record_send, mut record_recv) = mpsc::channel(512);
                     let cmd = proto::Command::Range(r, end_send, record_send);
 
-                    range_tx.send(cmd).await.context(
+                    cmd_tx.send(cmd).await.context(
                         "server.handle_conn(cmd=RANGE): failed to send range cmd to engine",
                     )?;
 
@@ -204,7 +202,7 @@ mod integration_tests {
 
     use crate::client::Client;
     use crate::proto;
-    use crate::storage::Engine;
+    use crate::storage::{Backend, Engine};
     use crate::storage::compaction::{CompactionCommand, CompactionResult};
 
     use super::Server;
@@ -222,18 +220,18 @@ mod integration_tests {
         let dir = tempdir().unwrap();
         let batch_size = 64;
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let (insert_tx, insert_rx) = mpsc::channel::<proto::Command>(batch_size);
-        let (range_tx, range_rx) = mpsc::channel::<proto::Command>(batch_size);
-        let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
-        let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
+        let m1 = metrics.clone();
+        let (cmd_sender, cmd_reciever) = mpsc::channel::<proto::Command>(batch_size);
+        let (compaction_cmd_sender, compaction_cmd_recv) = mpsc::channel::<CompactionCommand>(1);
+        let (compaction_result_sender, compaction_result_recv) = mpsc::channel::<CompactionResult>(1);
 
         let mut engine =
-            Engine::open(dir.path().join("data"), 1024, compaction_tx, result_rx).unwrap();
+            Engine::open(dir.path().join("data"), 1024, compaction_cmd_sender.clone()).unwrap();
         engine.set_metrics(&metrics);
-        let m1 = metrics.clone();
-        tokio::spawn(async move { engine.engine_loop(insert_rx, range_rx).await });
+        let mut backend = Backend::new(engine, compaction_cmd_sender.clone(), compaction_result_recv);
+        tokio::spawn(async move { backend.engine_loop(cmd_reciever).await });
         tokio::spawn(async move {
-            crate::storage::compaction::compaction_loop(compaction_rx, result_tx, Some(metrics))
+            crate::storage::compaction::compaction_loop(compaction_cmd_recv, compaction_result_sender, Some(metrics))
                 .await
         });
 
@@ -241,7 +239,7 @@ mod integration_tests {
             .await
             .unwrap();
         let addr = server.addr();
-        tokio::spawn(async move { server.run_main_loop(insert_tx, range_tx, m1).await });
+        tokio::spawn(async move { server.run_main_loop(cmd_sender, m1).await });
 
         let client = Client::connect(&addr.to_string()).await.unwrap();
         (client, dir)
@@ -317,16 +315,15 @@ mod integration_tests {
         let dir = tempdir().unwrap();
         let batch_size = 64;
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let (insert_tx, insert_rx) = mpsc::channel::<proto::Command>(batch_size);
-        let (range_tx, range_rx) = mpsc::channel::<proto::Command>(batch_size);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<proto::Command>(batch_size);
         let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
         let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
 
-        let mut engine =
-            Engine::open(dir.path().join("data"), 80, compaction_tx, result_rx).unwrap();
+        let mut engine = Engine::open(dir.path().join("data"), 80, compaction_tx.clone()).unwrap();
         engine.set_metrics(&metrics);
+        let mut backend = Backend::new(engine, compaction_tx, result_rx);
         let m1 = metrics.clone();
-        tokio::spawn(async move { engine.engine_loop(insert_rx, range_rx).await });
+        tokio::spawn(async move { backend.engine_loop(cmd_rx).await });
         tokio::spawn(async move {
             crate::storage::compaction::compaction_loop(compaction_rx, result_tx, Some(metrics))
                 .await
@@ -336,7 +333,7 @@ mod integration_tests {
             .await
             .unwrap();
         let addr = server.addr();
-        tokio::spawn(async move { server.run_main_loop(insert_tx, range_tx, m1).await });
+        tokio::spawn(async move { server.run_main_loop(cmd_tx, m1).await });
 
         let mut client = Client::connect(&addr.to_string()).await.unwrap();
 

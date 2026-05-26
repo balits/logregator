@@ -15,7 +15,7 @@ use crate::metrics::Metrics;
 use crate::proto;
 use crate::storage::{
     BloomFilter, IndexBlock, SSTableMeta,
-    compaction::{self, CompactionCommand, CompactionResult},
+    compaction::{self, CompactionCommand},
     iter::{MemTableIterOwned, MergeIter, RecordIter, SSTableIter},
     record::Record,
 };
@@ -25,7 +25,6 @@ pub struct Engine {
     pub(crate) dir: PathBuf,
     pub(crate) wal: Wal,
     pub(crate) compaction_tx: mpsc::Sender<CompactionCommand>,
-    pub(crate) compaction_rx: mpsc::Receiver<CompactionResult>,
 
     pub(crate) memtable: MemTable,
     pub(crate) sstable_map: BTreeMap<u64, SSTableMeta>,
@@ -36,220 +35,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn set_stats_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(usize, usize)>) {
-        self.stats_tx = Some(tx);
-    }
-
-    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
-        let m = metrics.clone();
-        m.engine.memtable_limit.set(self.memtable.capacity() as i64);
-        self.metrics = Some(m.clone());
-        self.wal.set_metrics(&m);
-    }
-
-    pub async fn engine_loop(
-        &mut self,
-        mut insert_rx: mpsc::Receiver<proto::Command>,
-        mut range_rx: mpsc::Receiver<proto::Command>,
-    ) -> anyhow::Result<()> {
-        let cmd_limit = insert_rx.max_capacity();
-        let mut cmd_buf = Vec::with_capacity(cmd_limit);
-        loop {
-            let mut needs_flush = false;
-
-            tokio::select! {
-                biased;
-                Some(CompactionResult { new_meta, ids_to_remove }) = self.compaction_rx.recv() => {
-                    let _t0 = Instant::now();
-                    self.apply_compaction(new_meta, ids_to_remove);
-                    if let Some(ref m) = self.metrics {
-                        m.engine.compaction_count.inc(1);
-                        m.engine.compaction_duration.record_instant(_t0);
-                    }
-                    continue;
-                }
-                n = insert_rx.recv_many(&mut cmd_buf, cmd_limit) => {
-                    if n == 0 { return Ok(()); }
-                    for cmd in cmd_buf.drain(0..n) {
-                        match cmd {
-                            proto::Command::Insert(i, sender) => {
-                                let _t0 = Instant::now();
-                                match self.insert(i.source_id, i.ts, &i.key, &i.value) {
-                                    Ok(true) => needs_flush = true,
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        if let Some(ref m) = self.metrics {
-                                            m.engine.insert_failures.inc(1);
-                                        }
-                                        let _ = sender.send(Err(e));
-                                        continue;
-                                    }
-                                }
-                                if let Some(ref m) = self.metrics {
-                                    m.engine.insert_count.inc(1);
-                                    m.engine.records_inserted.inc(1);
-                                    m.engine.insert_latency.record_instant(_t0);
-                                }
-                                let _ = sender.send(Ok(()));
-                            }
-                            proto::Command::BatchInsert(batch, sender) => {
-                                let _t0 = Instant::now();
-                                let count = batch.records.len() as u64;
-                                match self.batch_insert(batch.records) {
-                                    Ok(true) => needs_flush = true,
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        if let Some(ref m) = self.metrics {
-                                            m.engine.insert_failures.inc(count);
-                                        }
-                                        let _ = sender.send(Err(e));
-                                        continue;
-                                    }
-                                }
-                                if let Some(ref m) = self.metrics {
-                                    m.engine.batch_insert_count.inc(1);
-                                    m.engine.records_inserted.inc(count);
-                                    m.engine.batch_insert_latency.record_instant(_t0);
-                                }
-                                let _ = sender.send(Ok(()));
-                            }
-                            proto::Command::Range(_, _, _) => {
-                                unreachable!("Range command should not appear in insert_rx");
-                            }
-                        }
-                    }
-                    // After draining inserts, process one range if pending
-                    if let Ok(cmd) = range_rx.try_recv() {
-                        self.process_range(cmd).await;
-                    }
-
-                    // Sync WAL once for all commands in this batch
-                    if let Err(e) = self.wal.sync() {
-                        tracing::error!(error = %e, "engine.loop: failed to sync WAL");
-                    }
-                }
-                Some(cmd) = range_rx.recv() => {
-                    let _t0 = Instant::now();
-                    self.process_range(cmd).await;
-                    if let Some(ref m) = self.metrics {
-                        m.engine.range_count.inc(1);
-                        m.engine.range_latency.record_instant(_t0);
-                    }
-                }
-            }
-
-            if needs_flush {
-                let _t0 = Instant::now();
-                if let Err(e) = self.flush().await {
-                    tracing::error!(error = %e, "engine.loop: failed to flush");
-                }
-                if let Some(ref m) = self.metrics {
-                    m.engine.flush_count.inc(1);
-                    m.engine.flush_duration.record_instant(_t0);
-                }
-            }
-
-            if let Some(ref m) = self.metrics {
-                m.engine
-                    .memtable_bytes
-                    .set(self.memtable.size_hint() as i64);
-                m.engine.sstable_count.set(self.sstable_map.len() as i64);
-            }
-            if let Some(ref tx) = self.stats_tx {
-                let _ = tx.send((self.memtable.size_hint(), self.sstable_map.len()));
-            }
-        }
-    }
-
-    async fn process_range(&mut self, cmd: proto::Command) {
-        const BATCH_SIZE: usize = 32;
-        match cmd {
-            proto::Command::Range(r, end_sender, record_sender) => {
-                let mut end_sender = Some(end_sender);
-                let mut batch = Vec::with_capacity(BATCH_SIZE);
-                let mut scanned: u64 = 0;
-                match self.range(r.source_id, &r.key, r.start_ts, r.end_ts, &r.filter) {
-                    Ok(iter) => {
-                        for raw_rec in iter {
-                            scanned += 1;
-                            match proto::Record::try_from(raw_rec) {
-                                Ok(rec) => {
-                                    batch.push(rec);
-                                    if batch.len() >= BATCH_SIZE
-                                        && record_sender
-                                            .send(std::mem::take(&mut batch))
-                                            .await
-                                            .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(err) => {
-                                    if let Some(s) = end_sender.take() {
-                                        let _ = s.send(Err(err));
-                                    }
-                                    if let Some(ref m) = self.metrics {
-                                        m.engine.range_failures.inc(1);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        if !batch.is_empty() {
-                            let _ = record_sender.send(batch).await;
-                        }
-                        if let Some(s) = end_sender.take() {
-                            let _ = s.send(Ok(()));
-                        }
-                        if let Some(ref m) = self.metrics {
-                            m.engine.records_scanned.inc(scanned);
-                        }
-                    }
-                    Err(err) => {
-                        if let Some(ref m) = self.metrics {
-                            m.engine.range_failures.inc(1);
-                        }
-                        if let Some(s) = end_sender.take() {
-                            let _ = s.send(Err(err));
-                        }
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn apply_compaction(&mut self, new_meta: SSTableMeta, ids_to_remove: Vec<u64>) {
-        for file_id in ids_to_remove {
-            self.sstable_map.remove(&file_id);
-            let file_path = SSTableMeta::format_file_path(&self.dir, file_id);
-            if let Err(e) = fs::remove_file(&file_path) {
-                tracing::error!(error = %e, "engine.loop: failed to remove file {}", file_path.display())
-            }
-        }
-        self.sstable_map.insert(new_meta.id, new_meta);
-
-        if self.sstable_map.len() >= 4 {
-            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
-            let new_file_id = self.sst_counter;
-            let new_file_path = SSTableMeta::format_file_path(&self.dir, new_file_id);
-            let cmd = compaction::CompactionCommand {
-                new_file_id,
-                new_file_path,
-                tables,
-            };
-            if let Err(e) = self.compaction_tx.try_send(cmd) {
-                tracing::warn!(error = %e, "engine.loop: re-trigger compaction failed")
-            }
-        }
-    }
-
-    #[instrument(skip(compaction_tx, compaction_rx), fields(dir = %dir.display()))]
+    #[instrument(skip(compaction_tx), fields(dir = %dir.display()))]
     pub fn open(
         dir: PathBuf,
         memtable_limit: usize,
         compaction_tx: mpsc::Sender<CompactionCommand>,
-        compaction_rx: mpsc::Receiver<CompactionResult>,
     ) -> anyhow::Result<Self> {
         if !dir.exists() {
             fs::create_dir_all(&dir).context("engine.open: directory does not exist")?;
@@ -350,7 +140,6 @@ impl Engine {
             sstable_map,
             sst_counter: max_sst_id + 1,
             seq_counter: max_seq_num + 1,
-            compaction_rx,
             compaction_tx,
             stats_tx: None,
             metrics: None,
@@ -362,6 +151,17 @@ impl Engine {
         }
 
         Ok(e)
+    }
+
+    pub fn set_stats_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(usize, usize)>) {
+        self.stats_tx = Some(tx);
+    }
+
+    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
+        let m = metrics.clone();
+        m.engine.memtable_limit.set(self.memtable.capacity() as i64);
+        self.metrics = Some(m.clone());
+        self.wal.set_metrics(&m);
     }
 
     #[instrument(skip(self, value), fields(source_id, ts, key))]
@@ -465,8 +265,40 @@ impl Engine {
         Ok(())
     }
 
+
+    pub fn handle_compaction(&mut self, new_meta: SSTableMeta, ids_to_remove: Vec<u64>) {
+        let _t0 = Instant::now();
+        for file_id in ids_to_remove {
+            self.sstable_map.remove(&file_id);
+            let file_path = SSTableMeta::format_file_path(&self.dir, file_id);
+            if let Err(e) = fs::remove_file(&file_path) {
+                tracing::error!(error = %e, "engine.loop: failed to remove file {}", file_path.display())
+            }
+        }
+        self.sstable_map.insert(new_meta.id, new_meta);
+
+        if self.sstable_map.len() >= 4 {
+            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
+            let new_file_id = self.sst_counter;
+            let new_file_path = SSTableMeta::format_file_path(&self.dir, new_file_id);
+            let cmd = compaction::CompactionCommand {
+                new_file_id,
+                new_file_path,
+                tables,
+            };
+            if let Err(e) = self.compaction_tx.try_send(cmd) {
+                tracing::warn!(error = %e, "engine.loop: re-trigger compaction failed")
+            }
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.engine.compaction_count.inc(1);
+            m.engine.compaction_duration.record_instant(_t0);
+        }
+    }
+
     #[instrument(skip(self))]
-    async fn flush(&mut self) -> anyhow::Result<()> {
+    pub async fn flush(&mut self) -> anyhow::Result<()> {
         let _t0 = Instant::now();
         let file_id = self.sst_counter;
         let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
@@ -504,9 +336,8 @@ impl Engine {
 
         if need_compaction {
             let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
-
             let new_file_id = self.sst_counter;
-            let new_file_path = self.dir.join(format!("{:010}.sst", new_file_id));
+            let new_file_path = SSTableMeta::format_file_path(self.dir.as_path(), new_file_id);
             let cmd = compaction::CompactionCommand {
                 new_file_id,
                 new_file_path,
@@ -578,8 +409,7 @@ mod tests {
 
     fn open_engine(dir: PathBuf, limit: usize) -> Engine {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<CompactionCommand>(1);
-        let (_res_tx, res_rx) = tokio::sync::mpsc::channel::<CompactionResult>(1);
-        Engine::open(dir, limit, cmd_tx, res_rx).unwrap()
+        Engine::open(dir, limit, cmd_tx).unwrap()
     }
 
     #[test]

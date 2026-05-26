@@ -1,5 +1,6 @@
-loadgen tag="" out="" profile-mem="1000":
-    cargo run --bin loadgen --release -- \
+bench tag="" out="" profile-mem="1000":
+    cargo run --bin benchmark --release \
+        -- loadgen \
         --workloads write,read,mixed,tail \
         --concurrency-min   1 \
         --concurrency-max  16 \
@@ -15,4 +16,4 @@ ci:
     cargo test
 
 cpu-bench:
-    cargo run --release --bin loadgen
+    cargo bench

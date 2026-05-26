@@ -296,11 +296,8 @@ impl Iterator for RecordIter {
 #[derive(Debug)]
 pub struct MergeIter {
     heap: BinaryHeap<Reverse<HeapItem>>,
-
     memtable_iter: Option<MemTableIterOwned>,
-
     sstable_iters: Vec<RecordIter>,
-
     last_item_idx: Option<Record>,
 }
 

@@ -25,6 +25,9 @@ impl Gauge {
     pub fn add(&self, delta: i64) {
         self.0.fetch_add(delta, Ordering::Relaxed);
     }
+    pub fn dec(&self, delta: i64) {
+        self.0.fetch_sub(delta, Ordering::Relaxed);
+    }
     pub fn set(&self, v: i64) {
         self.0.store(v, Ordering::Relaxed);
     }

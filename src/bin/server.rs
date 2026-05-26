@@ -8,6 +8,7 @@ use logregator::metrics::Metrics;
 use logregator::proto::Command;
 use logregator::server::Server;
 use logregator::storage;
+use logregator::storage::Backend;
 use logregator::storage::compaction;
 use logregator::storage::compaction::{CompactionCommand, CompactionResult};
 
@@ -45,20 +46,20 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&path).context("failed to create server data directory")?;
 
     let metrics = Arc::new(Metrics::default());
-    let (insert_tx, insert_rx) = mpsc::channel::<Command>(args.batch_size);
-    let (range_tx, range_rx) = mpsc::channel::<Command>(args.batch_size);
-    let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
-    let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
+    let (cmd_sender, cmd_reciever) = mpsc::channel::<Command>(args.batch_size);
+    let (comp_cmd_sender, comp_cmd_reciever) = mpsc::channel::<CompactionCommand>(1);
+    let (comp_result_sender, comp_result_reciever) = mpsc::channel::<CompactionResult>(1);
 
-    let mut engine = storage::Engine::open(path, 64 * 1024 * 1024, compaction_tx, result_rx)
+    let mut engine = storage::Engine::open(path, 64 * 1024 * 1024, comp_cmd_sender.clone())
         .context("failed to open storage engine")?;
     engine.set_metrics(&metrics);
+    let mut backend = Backend::new(engine, comp_cmd_sender, comp_result_reciever);
 
-    tokio::spawn(async move { engine.engine_loop(insert_rx, range_rx).await });
+    tokio::spawn(async move { backend.engine_loop(cmd_reciever).await });
     tracing::info!("engine running");
     let comp_metrics = metrics.clone();
     tokio::spawn(async move {
-        compaction::compaction_loop(compaction_rx, result_tx, Some(comp_metrics)).await
+        compaction::compaction_loop(comp_cmd_reciever, comp_result_sender, Some(comp_metrics)).await
     });
     tracing::info!("compaction running");
 
@@ -68,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("server running on {}", server.addr());
     let svr_metrics = metrics.clone();
     if let Err(e) = server
-        .run_main_loop(insert_tx, range_tx, svr_metrics)
+        .run_main_loop(cmd_sender, svr_metrics)
         .await
         .context("server main loop exited with error")
     {
