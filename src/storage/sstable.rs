@@ -3,6 +3,7 @@
 //! and helper objects like the bloom filter and index block.
 
 use std::{
+    borrow::Borrow,
     fs,
     hash::{BuildHasher, Hasher, RandomState},
     io::{self, Seek, Write},
@@ -30,12 +31,17 @@ impl SSTableMeta {
         base_path.join(format!("{:010}.sst", id))
     }
 
-    pub fn write_to_file<I: Iterator<Item = Record>>(
-        path: PathBuf,
+    pub fn write_to_file<R, S>(
+        base_path: PathBuf,
         id: u64,
-        source: I,
+        source: S,
         source_len: usize,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        R: Borrow<Record>,
+        S: Iterator<Item = R>,
+    {
+        let path = Self::format_file_path(base_path.as_path(), id);
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -48,24 +54,26 @@ impl SSTableMeta {
         let mut record_offset = 0u64;
         let mut num_records = 0usize;
         for (idx, rec) in source.enumerate() {
-            let len_buf = (rec.len() as u64).to_le_bytes();
+            let len_buf = (rec.borrow().len() as u64).to_le_bytes();
             w.write_all(&len_buf)
                 .context("engine.flush: failed to write record length")?;
-            w.write_all(rec.as_bytes())
+            w.write_all(rec.borrow().as_bytes())
                 .context("engine.flush: failed to write record")?;
 
             bloom.insert(
-                rec.extract_source_id()
+                rec.borrow()
+                    .extract_source_id()
                     .context("write_to_file: failed to extract source_id for bloom")?,
-                rec.extract_key()
+                rec.borrow()
+                    .extract_key()
                     .context("write_to_file: failed to extract key for bloom")?,
             );
 
             index
-                .try_insert(idx, &rec, record_offset)
+                .try_insert(idx, rec.borrow(), record_offset)
                 .context("engine.flush: failed to insert record into index block")?;
 
-            record_offset += 8 + rec.len() as u64;
+            record_offset += 8 + rec.borrow().len() as u64;
             num_records += 1
         }
 

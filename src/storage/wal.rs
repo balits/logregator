@@ -1,41 +1,56 @@
-use std::io::{self, Read, Seek, Write};
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet, fs, io::{self, Read, Write}, path::{Path, PathBuf}, sync::Arc
+};
 
-use anyhow::{Context, Ok};
+use anyhow::Context;
+use tracing::instrument;
 
-use crate::metrics::Metrics;
-use crate::storage::record::Record;
+use crate::{metrics::Metrics, storage::record::Record};
 
 pub struct Wal {
+    path: PathBuf,
     w: io::BufWriter<std::fs::File>,
     metrics: Option<Arc<Metrics>>,
 }
 
 impl Wal {
-    pub const WAL_PATH_FMT: &'static str = "wal.log";
+    pub const WAL_DIR: &'static str = "wals";
+    pub const ACTIVE_WAL_NAME: &'static str = "__active_wal.log";
 
-    pub fn new(path: &std::path::Path) -> anyhow::Result<Self> {
-        let file: std::fs::File = std::fs::OpenOptions::new()
+    pub fn format_inactive_wal_path(base_path: &Path, id: u64) -> PathBuf {
+        base_path.join(format!("{}/wal_{:010}.log", Self::WAL_DIR, id))
+    }
+    
+    pub fn format_active_wal_path(base_path: &Path) -> PathBuf {
+        base_path.join(Self::WAL_DIR).join(Self::ACTIVE_WAL_NAME)
+    }
+
+    pub(super) fn open_active(base_path: &Path) -> anyhow::Result<Self> {
+        let path = base_path.join(Self::WAL_DIR).join(Self::ACTIVE_WAL_NAME);
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
-            .open(path)
-            .with_context(|| format!("wal: failed to open file {:?}", path))?;
+            .open(&path)
+            .with_context(|| format!("wal::new: failed to open file {:?}", path))?;
+
+        let w = io::BufWriter::new(
+            file.try_clone()
+                .context("wal::new: failed to clone file descriptor")?,
+        );
 
         Ok(Wal {
-            w: io::BufWriter::new(
-                file.try_clone()
-                    .context("wal::new: failed to clone file descriptor")?,
-            ),
+            path: path,
+            w,
             metrics: None,
         })
     }
 
-    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
+    pub(super) fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
         self.metrics = Some(metrics.clone());
     }
 
-    pub fn write_one(&mut self, rec: &Record) -> anyhow::Result<()> {
+    pub(super) fn write_one(&mut self, rec: &Record) -> anyhow::Result<()> {
         let len = rec.len() as u64;
         self.w
             .write_all(&len.to_le_bytes())
@@ -50,7 +65,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn write_many(&mut self, recs: &[Record]) -> anyhow::Result<()> {
+    pub(super) fn write_many(&mut self, recs: &[Record]) -> anyhow::Result<()> {
         let mut total_bytes = 0u64;
         for rec in recs {
             let len = rec.len() as u64;
@@ -69,14 +84,28 @@ impl Wal {
         Ok(())
     }
 
-    pub fn recover(&mut self) -> anyhow::Result<Vec<Record>> {
-        let mut f = self
-            .w
-            .get_ref()
-            .try_clone()
-            .context("wal.recover: failed to rewind to beginning of file")?;
-        f.rewind()
-            .context("wal.recover: failed to rewind to start of file")?;
+    #[instrument(skip_all, err)]
+    pub(super) fn recover_all(base_path: &Path) -> anyhow::Result<Vec<Record>>{
+        let mut records = BTreeSet::new();
+        let files =  fs::read_dir(base_path.join(Self::WAL_DIR))
+            .context("wal.recover_all: failed to read wal dir")?;
+        for f in files {
+            let path = f?.path();
+            if path.extension().and_then(|n| n.to_str()) == Some("log") {
+                if let Ok(rec) = Self::recover_file(path.as_path()) {
+                    records.extend(rec.into_iter());
+                }
+            }
+        }
+
+        Ok(records.into_iter().collect())
+    }
+
+    pub(super) fn recover_file(path: &Path) -> anyhow::Result<Vec<Record>> {
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("wal.recover_file: failed to open {}", path.display()))?;
         let mut r = io::BufReader::new(f);
         let mut records = Vec::new();
 
@@ -99,45 +128,70 @@ impl Wal {
         Ok(records)
     }
 
-    pub fn sync(&mut self) -> anyhow::Result<()> {
-        let start = std::time::Instant::now();
-        self.w.flush().context("wal.sync: failed to flush")?;
-        self.w
-            .get_ref()
-            .sync_all()
-            .context("wal.sync: failed to sync_all")?;
-        if let Some(ref m) = self.metrics {
-            m.wal.sync_count.inc(1);
-            m.wal.sync_latency.record_instant(start);
-        }
+    #[instrument(skip_all, err)]
+    pub(super) fn flush_buffer(&mut self) -> anyhow::Result<()> {
+        self.w.flush()?;
         Ok(())
     }
 
-    pub fn clear(&mut self) -> anyhow::Result<()> {
-        let f = self.w.get_mut();
-        f.set_len(0).context("wal.clear: failed to truncate")?;
-        f.rewind()
-            .context("wal.clear: failed to rewind to beginning of file")?;
-        let f_cloned = self
-            .w
-            .get_ref()
-            .try_clone()
-            .context("wal.clear: failed to clone file")?;
-        self.w = io::BufWriter::new(f_cloned);
+    /// creates a new active WAL file, returning the old files new, rotated path
+    #[instrument(skip_all, err)]
+    pub(super) fn rotate(&mut self, base_path: &Path, sst_id: u64) -> anyhow::Result<PathBuf> {
+        self.flush_buffer()?;
 
-        Ok(())
+        let rotated_path = Self::format_inactive_wal_path(base_path, sst_id);
+        fs::rename(self.path.as_path(), rotated_path.as_path())
+            .context("wal.rotate: failed to rename old WAL")?;
+
+        let new_active_path = base_path.join(Self::WAL_DIR).join(Self::ACTIVE_WAL_NAME);
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&new_active_path)
+            .with_context(|| format!("wal.rotate: failed to open file {:?}", &new_active_path))?;
+
+        let w = io::BufWriter::new(
+            f.try_clone()
+                .context("wal.rotate: failed to clone file descriptor")?,
+        );
+        self.path = new_active_path;
+        self.w = w;
+
+        Ok(rotated_path)
     }
-
-    // pub fn clear_path(path: &std::path::Path) -> anyhow::Result<()> {
-    //     let f = std::fs::OpenOptions::new()
-    //         .write(true)
-    //         .open(path)
-    //         .with_context(|| format!("wal.clear_path: failed to open {:?}", path))?;
-    //     f.set_len(0).context("wal.clear_path: failed to truncate")?;
-    //     drop(f);
-    //     Ok(())
-    // }
 }
+
+/// Simple wrapper around a file that only exposes an fsync() call
+pub struct WalSyncer(std::fs::File);
+
+impl WalSyncer {
+    pub(super) fn fsync(&mut self) -> anyhow::Result<()> {
+        self.0.sync_all().context("io_worker: fsync() failed")?;
+        Ok(())
+    }
+
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("wal_syncer.open: failed to create directory {}", parent.display()))?;
+        }
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        Ok(WalSyncer(f))
+    }
+}
+
+impl From<fs::File> for WalSyncer {
+    fn from(f: fs::File) -> Self {
+        Self(f)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -147,19 +201,17 @@ mod tests {
     #[test]
     fn test_wal_persistence() {
         let dir = tempdir().unwrap();
-        let wal_path_buf = dir.path().join("test.wal");
-        let wal_path = &wal_path_buf;
+        let wals_dir = dir.path().join(Wal::WAL_DIR);
+        std::fs::create_dir_all(&wals_dir).unwrap();
 
         let entry = Record::from_raw_parts(1, 12345, 0, "user_1", "login_event");
 
         {
-            let mut wal = Wal::new(wal_path).expect("failed to create WAL");
+            let mut wal = Wal::open_active(dir.path()).expect("failed to create WAL");
             wal.write_one(&entry).expect("failed to write");
-            wal.sync().expect("failed to sync");
         }
 
-        let mut wal = Wal::new(wal_path).expect("failed to re-open WAL");
-        let recovered = wal.recover().expect("failed to recover");
+        let recovered = Wal::recover_all(dir.path()).expect("failed to recover");
 
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].cmp(&entry), std::cmp::Ordering::Equal);
@@ -168,9 +220,9 @@ mod tests {
     #[test]
     fn test_wal_ordering() {
         let dir = tempdir().unwrap();
-        let wal_path_buf = dir.path().join("ordering.wal");
-        let wal_path = &wal_path_buf;
-        let mut wal = Wal::new(wal_path).unwrap();
+        let wals_dir = dir.path().join(Wal::WAL_DIR);
+        std::fs::create_dir_all(&wals_dir).unwrap();
+        let mut wal = Wal::open_active(dir.path()).unwrap();
 
         let entries = vec![
             Record::from_raw_parts(1, 1, 0, "a", "v1"),
@@ -181,29 +233,13 @@ mod tests {
         for e in &entries {
             wal.write_one(e).unwrap();
         }
-        wal.sync().unwrap();
+        wal.flush_buffer().unwrap();
 
-        let recovered = wal.recover().unwrap();
+        let recovered = Wal::recover_all(dir.path()).unwrap();
 
         assert_eq!(recovered.len(), entries.len());
         for (r, e) in recovered.iter().zip(entries.iter()) {
             assert_eq!(r.cmp(e), std::cmp::Ordering::Equal);
         }
-    }
-
-    #[test]
-    fn test_wal_clear() {
-        let dir = tempdir().unwrap();
-        let wal_path_buf = dir.path().join("clear.wal");
-        let wal_path = &wal_path_buf;
-        let mut wal = Wal::new(wal_path).unwrap();
-
-        wal.write_one(&Record::from_raw_parts(1, 1, 0, "k", "v"))
-            .unwrap();
-        wal.sync().unwrap();
-        wal.clear().expect("Failed to clear WAL");
-
-        let recovered = wal.recover().unwrap();
-        assert_eq!(recovered.len(), 0);
     }
 }

@@ -8,13 +8,13 @@ use std::{
 
 use anyhow::{Context, bail};
 
-use crate::storage::{SSTableMeta, record::Record};
+use crate::storage::{SSTableMeta, memtable, record::Record};
 
-/// SSTableIter reads key-values from an SSTable file
+/// Iterator that reads key-values from an SSTable file
 /// within a [start, end) range, using the index block to
 /// binary-seek to the nearest offset and then scanning linearly.
 #[derive(Debug)]
-pub struct SSTableIter {
+pub struct SSTableIterFiltered {
     r: io::BufReader<fs::File>,
     start: Record,
     end: Record, // exclusive
@@ -24,7 +24,7 @@ pub struct SSTableIter {
     filter: String,
 }
 
-impl SSTableIter {
+impl SSTableIterFiltered {
     pub fn new(
         meta: &SSTableMeta,
         source_id: i64,
@@ -65,7 +65,7 @@ impl SSTableIter {
     }
 }
 
-impl Iterator for SSTableIter {
+impl Iterator for SSTableIterFiltered {
     type Item = Record;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -117,70 +117,16 @@ impl Iterator for SSTableIter {
     }
 }
 
-/// Iterates over the MemTable's BTreeSet, yielding only records matching
-/// the given source_id, key, and time range.
-#[derive(Debug)]
-pub struct MemTableIterOwned {
-    inner: vec::IntoIter<Record>,
-    source_id: i64,
-    key: Vec<u8>,
-    start_ts: i64,
-    end_ts: i64,
-    filter: String,
-}
-
-impl MemTableIterOwned {
-    pub(crate) fn filtered(
-        memtable_records: Vec<Record>,
-        source_id: i64,
-        key: &[u8],
-        start_ts: i64,
-        end_ts: i64,
-        filter: &str,
-    ) -> Self {
-        MemTableIterOwned {
-            inner: memtable_records.into_iter(),
-            source_id,
-            key: key.to_vec(),
-            start_ts,
-            end_ts,
-            filter: filter.to_string(),
-        }
-    }
-}
-
-impl Iterator for MemTableIterOwned {
-    type Item = Record;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for r in self.inner.by_ref() {
-            let Ok((sid, ts, _seq, key, val)) = r.extract_all_fields_ref() else {
-                continue;
-            };
-            if sid == self.source_id
-                && ts >= self.start_ts
-                && ts < self.end_ts
-                && key == self.key.as_slice()
-                && (self.filter.is_empty()
-                    || unsafe { std::str::from_utf8_unchecked(val) }.contains(&self.filter))
-            {
-                return Some(r);
-            }
-        }
-        None
-    }
-}
-
 //
 /// SSTableScan allows unfiltered scanning of an SSTable file with the help of its metadata.
 #[derive(Debug)]
-pub struct SSTableScaner {
+pub struct SSTableIterUnfiltered {
     r: io::BufReader<fs::File>,
     buffer: Vec<u8>,
     meta: SSTableMeta,
 }
 
-impl SSTableScaner {
+impl SSTableIterUnfiltered {
     pub(crate) fn new(meta: SSTableMeta) -> anyhow::Result<Self> {
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -196,7 +142,7 @@ impl SSTableScaner {
     }
 }
 
-impl Iterator for SSTableScaner {
+impl Iterator for SSTableIterUnfiltered {
     type Item = Record;
     fn next(&mut self) -> Option<Self::Item> {
         if self.r.stream_position().ok()? >= self.meta.index_offset {
@@ -268,9 +214,9 @@ impl Ord for HeapItem {
 /// avoids scattered file I/O during the merge.
 #[derive(Debug)]
 pub enum RecordIter {
-    File(SSTableIter),
-    Scan(SSTableScaner),
-    Mem(std::vec::IntoIter<Record>),
+    Filtered(SSTableIterFiltered),
+    Unfiltered(SSTableIterUnfiltered),
+    Inmem(std::vec::IntoIter<Record>),
 }
 
 impl Iterator for RecordIter {
@@ -278,17 +224,17 @@ impl Iterator for RecordIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            RecordIter::File(iter) => iter.next(),
-            RecordIter::Scan(iter) => iter.next(),
-            RecordIter::Mem(iter) => iter.next(),
+            RecordIter::Filtered(iter) => iter.next(),
+            RecordIter::Unfiltered(iter) => iter.next(),
+            RecordIter::Inmem(iter) => iter.next(),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            RecordIter::File(iter) => iter.size_hint(),
-            RecordIter::Scan(iter) => iter.size_hint(),
-            RecordIter::Mem(iter) => iter.size_hint(),
+            RecordIter::Filtered(iter) => iter.size_hint(),
+            RecordIter::Unfiltered(iter) => iter.size_hint(),
+            RecordIter::Inmem(iter) => iter.size_hint(),
         }
     }
 }
@@ -296,14 +242,14 @@ impl Iterator for RecordIter {
 #[derive(Debug)]
 pub struct MergeIter {
     heap: BinaryHeap<Reverse<HeapItem>>,
-    memtable_iter: Option<MemTableIterOwned>,
+    memtable_iter: Option<memtable::IntoIterFiltered>,
     sstable_iters: Vec<RecordIter>,
     last_item_idx: Option<Record>,
 }
 
 impl MergeIter {
     pub fn new(
-        mut memtable_iter: Option<MemTableIterOwned>,
+        mut memtable_iter: Option<memtable::IntoIterFiltered>,
         mut sstable_iters: Vec<RecordIter>,
     ) -> Self {
         let mut heap = BinaryHeap::new();
@@ -430,7 +376,7 @@ mod sstable_iter_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 10, 40, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 10, 40, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -449,7 +395,7 @@ mod sstable_iter_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 10, 30, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 10, 30, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -467,7 +413,7 @@ mod sstable_iter_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 10, 20, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 10, 20, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_timestamp().unwrap(), 10);
@@ -480,7 +426,7 @@ mod sstable_iter_tests {
         let records = vec![Record::from_raw_parts(1, 10, 0, "sys", "a")];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 10, 10, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 10, 10, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -498,7 +444,7 @@ mod sstable_iter_tests {
 
         let len = std::fs::metadata(&path).unwrap().len();
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 100, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -509,7 +455,7 @@ mod sstable_iter_tests {
         let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_value().unwrap(), b"loner");
@@ -522,7 +468,7 @@ mod sstable_iter_tests {
         let records = vec![Record::from_raw_parts(1, 20, 0, "sys", "a")];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 10, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 10, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
@@ -538,8 +484,8 @@ mod sstable_iter_tests {
             .unwrap();
 
         let meta = make_meta(path, 0);
-        assert!(SSTableIter::new(&meta, 1, "sys", 10, 5, "").is_err());
-        assert!(SSTableIter::new(&meta, 1, "sys", -1, 10, "").is_err());
+        assert!(SSTableIterFiltered::new(&meta, 1, "sys", 10, 5, "").is_err());
+        assert!(SSTableIterFiltered::new(&meta, 1, "sys", -1, 10, "").is_err());
     }
 
     #[test]
@@ -553,7 +499,7 @@ mod sstable_iter_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path, len);
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 2);
         assert!(
@@ -643,26 +589,25 @@ mod sstable_iter_tests {
         assert_eq!(index.binary_seek(&target), 42); // falls back to previous (or 0 since no entry for sid=2)
     }
 
-    fn write_indexed_sstable(path: &Path, records: &[Record]) -> SSTableMeta {
+    fn write_indexed_sstable(base_path: &Path, records: &[Record]) -> SSTableMeta {
         let len = records.len();
-        SSTableMeta::write_to_file(path.to_path_buf(), 1, records.iter().cloned(), len).unwrap()
+        SSTableMeta::write_to_file(base_path.to_path_buf(), 1, records.iter(), len).unwrap()
     }
 
     #[test]
     fn test_iter_real_index_returns_all_records() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("indexed.sst");
         let records: Vec<Record> = (0..33)
             .map(|i| Record::from_raw_parts(1, i, i as u64, "sys", &format!("val{}", i)))
             .collect();
-        let meta = write_indexed_sstable(&path, &records);
+        let meta = write_indexed_sstable(dir.path(), &records);
 
         assert!(
             !meta.index.inner.is_empty(),
             "index should have entries for 33 records"
         );
 
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 100, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 100, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 33);
     }
@@ -670,11 +615,10 @@ mod sstable_iter_tests {
     #[test]
     fn test_iter_real_index_skips_early_records() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("indexed.sst");
         let records: Vec<Record> = (0..33)
             .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
             .collect();
-        let meta = write_indexed_sstable(&path, &records);
+        let meta = write_indexed_sstable(dir.path(), &records);
 
         assert!(
             meta.index.inner.len() >= 2,
@@ -682,7 +626,7 @@ mod sstable_iter_tests {
         );
 
         // Range [116, 120) — binary_seek should land on entry at ts=116
-        let iter = SSTableIter::new(&meta, 1, "sys", 116, 120, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 116, 120, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 4);
         for rec in &collected {
@@ -698,7 +642,6 @@ mod sstable_iter_tests {
     #[test]
     fn test_iter_real_index_skips_early_records_different_source() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("indexed.sst");
         let mut records = Vec::with_capacity(48);
         for i in 0..48 {
             let sid = if i < 16 { 1 } else { 2 };
@@ -710,10 +653,10 @@ mod sstable_iter_tests {
                 &format!("val{}", i),
             ));
         }
-        let meta = write_indexed_sstable(&path, &records);
+        let meta = write_indexed_sstable(dir.path(), &records);
 
         // Source_id=2 records start at index 16 (ts=116)
-        let iter = SSTableIter::new(&meta, 2, "sys", 116, 120, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 2, "sys", 116, 120, "").unwrap();
         let collected: Vec<Record> = iter.collect();
         assert_eq!(collected.len(), 4);
         for rec in &collected {
@@ -726,27 +669,25 @@ mod sstable_iter_tests {
     #[test]
     fn test_iter_real_index_range_before_start() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("indexed.sst");
         let records: Vec<Record> = (0..33)
             .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
             .collect();
-        let meta = write_indexed_sstable(&path, &records);
+        let meta = write_indexed_sstable(dir.path(), &records);
 
         // Range before all records
-        let iter = SSTableIter::new(&meta, 1, "sys", 0, 50, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 0, 50, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 
     #[test]
     fn test_iter_real_index_range_after_end() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("indexed.sst");
         let records: Vec<Record> = (0..33)
             .map(|i| Record::from_raw_parts(1, 100 + i, i as u64, "sys", &format!("val{}", i)))
             .collect();
-        let meta = write_indexed_sstable(&path, &records);
+        let meta = write_indexed_sstable(dir.path(), &records);
 
-        let iter = SSTableIter::new(&meta, 1, "sys", 200, 300, "").unwrap();
+        let iter = SSTableIterFiltered::new(&meta, 1, "sys", 200, 300, "").unwrap();
         assert!(iter.collect::<Vec<_>>().is_empty());
     }
 }
@@ -799,7 +740,7 @@ mod sstable_scanner_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScaner::new(meta.clone()).unwrap();
+        let scanner = SSTableIterUnfiltered::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 3);
     }
@@ -816,7 +757,7 @@ mod sstable_scanner_tests {
             .unwrap();
         drop(f);
         let meta = make_meta(path.clone(), 0, 0);
-        let scanner = SSTableScaner::new(meta.clone()).unwrap();
+        let scanner = SSTableIterUnfiltered::new(meta.clone()).unwrap();
         assert!(scanner.collect::<Vec<_>>().is_empty());
     }
 
@@ -827,7 +768,7 @@ mod sstable_scanner_tests {
         let records = vec![Record::from_raw_parts(1, 50, 0, "sys", "loner")];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScaner::new(meta.clone()).unwrap();
+        let scanner = SSTableIterUnfiltered::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 1);
         assert_eq!(collected[0].extract_value().unwrap(), b"loner");
@@ -844,7 +785,7 @@ mod sstable_scanner_tests {
         let len = write_sstable(&path, &records);
         // bloom_offset < file_len — scanner should stop before extra garbage
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScaner::new(meta.clone()).unwrap();
+        let scanner = SSTableIterUnfiltered::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 2);
     }
@@ -861,7 +802,7 @@ mod sstable_scanner_tests {
         ];
         let len = write_sstable(&path, &records);
         let meta = make_meta(path.clone(), len, len);
-        let scanner = SSTableScaner::new(meta.clone()).unwrap();
+        let scanner = SSTableIterUnfiltered::new(meta.clone()).unwrap();
         let collected: Vec<Record> = scanner.collect();
         assert_eq!(collected.len(), 4);
     }
@@ -870,6 +811,7 @@ mod sstable_scanner_tests {
 #[cfg(test)]
 mod merge_iter_tests {
     use super::*;
+    use crate::storage::memtable::IntoIterFiltered;
 
     #[test]
     fn test_merge_memtable_only() {
@@ -877,7 +819,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "a"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "");
+        let mem_iter = IntoIterFiltered::new(records, 1, b"sys", 0, 100, "");
         let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         let collected: Vec<Record> = merge.collect();
@@ -890,7 +832,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "a"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let merge = MergeIter::new(None, vec![RecordIter::Mem(sstable.into_iter())]);
+        let merge = MergeIter::new(None, vec![RecordIter::Inmem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 2);
     }
@@ -901,12 +843,12 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 5, 0, "sys", "early"),
             Record::from_raw_parts(1, 25, 0, "sys", "late"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(mem_records, 1, b"sys", 0, 100, "");
+        let mem_iter = IntoIterFiltered::new(mem_records, 1, b"sys", 0, 100, "");
         let sstable = vec![
             Record::from_raw_parts(1, 10, 0, "sys", "mid"),
             Record::from_raw_parts(1, 20, 0, "sys", "mid2"),
         ];
-        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Mem(sstable.into_iter())]);
+        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Inmem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         assert_eq!(collected.len(), 4);
         let ts: Vec<i64> = collected
@@ -929,8 +871,8 @@ mod merge_iter_tests {
         let merge = MergeIter::new(
             None,
             vec![
-                RecordIter::Mem(sst1.into_iter()),
-                RecordIter::Mem(sst2.into_iter()),
+                RecordIter::Inmem(sst1.into_iter()),
+                RecordIter::Inmem(sst2.into_iter()),
             ],
         );
         let collected: Vec<Record> = merge.collect();
@@ -955,8 +897,8 @@ mod merge_iter_tests {
         let merge = MergeIter::new(
             None,
             vec![
-                RecordIter::Mem(sst1.into_iter()),
-                RecordIter::Mem(sst2.into_iter()),
+                RecordIter::Inmem(sst1.into_iter()),
+                RecordIter::Inmem(sst2.into_iter()),
             ],
         );
         let collected: Vec<Record> = merge.collect();
@@ -980,7 +922,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "a"),
             Record::from_raw_parts(1, 20, 0, "sys", "b"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(records, 2, b"other", 0, 100, "");
+        let mem_iter = IntoIterFiltered::new(records, 2, b"other", 0, 100, "");
         let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         assert!(merge.collect::<Vec<_>>().is_empty());
@@ -994,7 +936,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 30, 0, "sys", "disk full"),
             Record::from_raw_parts(1, 40, 0, "sys", "memory leak"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "mem");
+        let mem_iter = IntoIterFiltered::new(records, 1, b"sys", 0, 100, "mem");
         let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         let collected: Vec<Record> = merge.collect();
@@ -1011,7 +953,7 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 10, 0, "sys", "cpu normal"),
             Record::from_raw_parts(1, 20, 0, "sys", "mem high"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(records, 1, b"sys", 0, 100, "nonexistent");
+        let mem_iter = IntoIterFiltered::new(records, 1, b"sys", 0, 100, "nonexistent");
         let empty: Vec<RecordIter> = vec![];
         let merge = MergeIter::new(Some(mem_iter), empty);
         assert!(merge.collect::<Vec<_>>().is_empty());
@@ -1024,13 +966,13 @@ mod merge_iter_tests {
             Record::from_raw_parts(1, 5, 0, "sys", "early"),
             Record::from_raw_parts(1, 25, 0, "sys", "late"),
         ];
-        let mem_iter = MemTableIterOwned::filtered(mem_records, 1, b"sys", 0, 100, "late");
+        let mem_iter = IntoIterFiltered::new(mem_records, 1, b"sys", 0, 100, "late");
         // sstable vec iterator (no filter applied)
         let sstable = vec![
             Record::from_raw_parts(1, 10, 0, "sys", "mid"),
             Record::from_raw_parts(1, 20, 0, "sys", "mid2"),
         ];
-        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Mem(sstable.into_iter())]);
+        let merge = MergeIter::new(Some(mem_iter), vec![RecordIter::Inmem(sstable.into_iter())]);
         let collected: Vec<Record> = merge.collect();
         // sstable records pass through unfiltered, memtable only yields "late"
         assert_eq!(collected.len(), 3);

@@ -1,0 +1,2022 @@
+{
+  "args": {
+    "duration_secs": 30,
+    "workloads": [
+      "Write",
+      "Read",
+      "Mixed",
+      "Tail"
+    ],
+    "addr": "127.0.0.1:4321",
+    "batch_size": 512,
+    "channel_capacity": 8192,
+    "concurrency_min": 1,
+    "concurrency_max": 16,
+    "concurrency_step": 2,
+    "sources": 4,
+    "keys": 4,
+    "value_size": 128,
+    "range_fraction": 0.5,
+    "range_window": 60,
+    "out": null,
+    "profile_mem": 1000,
+    "memtable_mb": 32,
+    "verbose": false,
+    "tag": "latest",
+    "external_server": true
+  },
+  "runs": [
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 0,
+        "workload": "Write",
+        "concurrency": 1,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 3678208,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 122606.93333333333,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 2130.0,
+        "p50_us": 3667.0,
+        "p90_us": 5487.0,
+        "p95_us": 6199.0,
+        "p99_us": 8295.0,
+        "p99_9_us": 39711.0,
+        "max_us": 114495.0,
+        "mean_us": 4086.247772828498,
+        "stddev_us": 2899.1527236707702,
+        "sample_count": 7184
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 9
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 1,
+        "workload": "Write",
+        "concurrency": 2,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2752000,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 91733.33333333333,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 4176.0,
+        "p50_us": 10519.0,
+        "p90_us": 13199.0,
+        "p95_us": 14255.0,
+        "p99_us": 21599.0,
+        "p99_9_us": 58431.0,
+        "max_us": 92863.0,
+        "mean_us": 11057.915534883705,
+        "stddev_us": 4030.4844975229244,
+        "sample_count": 5375
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 13
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 2,
+        "workload": "Write",
+        "concurrency": 4,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2481152,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 82705.06666666667,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 6324.0,
+        "p50_us": 23503.0,
+        "p90_us": 28415.0,
+        "p95_us": 30591.0,
+        "p99_us": 57151.0,
+        "p99_9_us": 101375.0,
+        "max_us": 138367.0,
+        "mean_us": 24661.774246801462,
+        "stddev_us": 6576.935714565392,
+        "sample_count": 4846
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 14
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 3,
+        "workload": "Write",
+        "concurrency": 6,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2229248,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 74308.26666666666,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 6824.0,
+        "p50_us": 39103.0,
+        "p90_us": 48447.0,
+        "p95_us": 52959.0,
+        "p99_us": 85887.0,
+        "p99_9_us": 166655.0,
+        "max_us": 189695.0,
+        "mean_us": 41257.165365181456,
+        "stddev_us": 10589.651068024914,
+        "sample_count": 4354
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 17
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 4,
+        "workload": "Write",
+        "concurrency": 8,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2045440,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 68181.33333333333,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 8824.0,
+        "p50_us": 54303.0,
+        "p90_us": 68799.0,
+        "p95_us": 89663.0,
+        "p99_us": 214911.0,
+        "p99_9_us": 413951.0,
+        "max_us": 447231.0,
+        "mean_us": 60004.2342928661,
+        "stddev_us": 29135.069951134446,
+        "sample_count": 3995
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 17
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 5,
+        "workload": "Write",
+        "concurrency": 10,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2078720,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 69290.66666666667,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 6680.0,
+        "p50_us": 71487.0,
+        "p90_us": 80063.0,
+        "p95_us": 89663.0,
+        "p99_us": 147967.0,
+        "p99_9_us": 230527.0,
+        "max_us": 255103.0,
+        "mean_us": 73864.65665024628,
+        "stddev_us": 14779.043665552852,
+        "sample_count": 4060
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 20
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 6,
+        "workload": "Write",
+        "concurrency": 12,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2088448,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 69614.93333333333,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 9360.0,
+        "p50_us": 85823.0,
+        "p90_us": 97087.0,
+        "p95_us": 113471.0,
+        "p99_us": 147967.0,
+        "p99_9_us": 254591.0,
+        "max_us": 257279.0,
+        "mean_us": 88249.26011277264,
+        "stddev_us": 15329.478808494705,
+        "sample_count": 4079
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 20
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 7,
+        "workload": "Write",
+        "concurrency": 14,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2066432,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 68881.06666666667,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 25728.0,
+        "p50_us": 101567.0,
+        "p90_us": 115583.0,
+        "p95_us": 129535.0,
+        "p99_us": 156671.0,
+        "p99_9_us": 211071.0,
+        "max_us": 213759.0,
+        "mean_us": 104124.76709613486,
+        "stddev_us": 14149.9071374438,
+        "sample_count": 4036
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 21
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 8,
+        "workload": "Write",
+        "concurrency": 16,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 1896960,
+      "range_queries_completed": 0,
+      "records_scanned": 0,
+      "insert_ops_per_sec": 63232.0,
+      "range_ops_per_sec": 0.0,
+      "insert_latency": {
+        "min_us": 10616.0,
+        "p50_us": 121663.0,
+        "p90_us": 147583.0,
+        "p95_us": 161535.0,
+        "p99_us": 260479.0,
+        "p99_9_us": 481023.0,
+        "max_us": 492799.0,
+        "mean_us": 129699.3090418355,
+        "stddev_us": 31451.98875564676,
+        "sample_count": 3705
+      },
+      "range_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 0.0,
+      "sstable_count": 21
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 9,
+        "workload": "Read",
+        "concurrency": 1,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 3,
+      "records_scanned": 678341,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 0.1,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 9142272.0,
+        "p50_us": 10641407.0,
+        "p90_us": 11943935.0,
+        "p95_us": 11943935.0,
+        "p99_us": 11943935.0,
+        "p99_9_us": 11943935.0,
+        "max_us": 11943935.0,
+        "mean_us": 10574506.666666666,
+        "stddev_us": 1141294.5387051592,
+        "sample_count": 3
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 226113.66666666666,
+      "sstable_count": 13
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 10,
+        "workload": "Read",
+        "concurrency": 2,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 8,
+      "records_scanned": 1880826,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 0.26666666666666666,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 8896512.0,
+        "p50_us": 9101311.0,
+        "p90_us": 9871359.0,
+        "p95_us": 9871359.0,
+        "p99_us": 9871359.0,
+        "p99_9_us": 9871359.0,
+        "max_us": 9871359.0,
+        "mean_us": 9209856.0,
+        "stddev_us": 321966.1835659143,
+        "sample_count": 8
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 235103.25,
+      "sstable_count": 10
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 11,
+        "workload": "Read",
+        "concurrency": 4,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 16,
+      "records_scanned": 3764981,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 0.5333333333333333,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 8327168.0,
+        "p50_us": 8830975.0,
+        "p90_us": 9707519.0,
+        "p95_us": 9838591.0,
+        "p99_us": 9838591.0,
+        "p99_9_us": 9838591.0,
+        "max_us": 9838591.0,
+        "mean_us": 9060736.0,
+        "stddev_us": 526680.1520771406,
+        "sample_count": 16
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 235311.3125,
+      "sstable_count": 6
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 12,
+        "workload": "Read",
+        "concurrency": 6,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 30,
+      "records_scanned": 4777909,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 1.0,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 4567040.0,
+        "p50_us": 6459391.0,
+        "p90_us": 8376319.0,
+        "p95_us": 8396799.0,
+        "p99_us": 8396799.0,
+        "p99_9_us": 8396799.0,
+        "max_us": 8396799.0,
+        "mean_us": 6460552.533333334,
+        "stddev_us": 1300321.9217030767,
+        "sample_count": 30
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 159263.63333333333,
+      "sstable_count": 6
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 13,
+        "workload": "Read",
+        "concurrency": 8,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 88,
+      "records_scanned": 4918334,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 2.933333333333333,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 2301952.0,
+        "p50_us": 2562047.0,
+        "p90_us": 4048895.0,
+        "p95_us": 4669439.0,
+        "p99_us": 4710399.0,
+        "p99_9_us": 4710399.0,
+        "max_us": 4710399.0,
+        "mean_us": 2911464.7272727275,
+        "stddev_us": 742212.987742258,
+        "sample_count": 88
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 55890.15909090909,
+      "sstable_count": 6
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 14,
+        "workload": "Read",
+        "concurrency": 10,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 110,
+      "records_scanned": 4907798,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 3.6666666666666665,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 2473984.0,
+        "p50_us": 2783231.0,
+        "p90_us": 3018751.0,
+        "p95_us": 3174399.0,
+        "p99_us": 3190783.0,
+        "p99_9_us": 3192831.0,
+        "max_us": 3192831.0,
+        "mean_us": 2783641.6,
+        "stddev_us": 210861.65722073885,
+        "sample_count": 110
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 44616.34545454545,
+      "sstable_count": 6
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 15,
+        "workload": "Read",
+        "concurrency": 12,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 180,
+      "records_scanned": 5903210,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 6.0,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 1679360.0,
+        "p50_us": 2047999.0,
+        "p90_us": 2439167.0,
+        "p95_us": 2469887.0,
+        "p99_us": 2490367.0,
+        "p99_9_us": 2512895.0,
+        "max_us": 2512895.0,
+        "mean_us": 2074146.1333333326,
+        "stddev_us": 219105.7165367744,
+        "sample_count": 180
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 32795.61111111111,
+      "sstable_count": 5
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 16,
+        "workload": "Read",
+        "concurrency": 14,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 224,
+      "records_scanned": 5834332,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 7.466666666666667,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 1739776.0,
+        "p50_us": 1879039.0,
+        "p90_us": 1994751.0,
+        "p95_us": 2008063.0,
+        "p99_us": 2022399.0,
+        "p99_9_us": 2041855.0,
+        "max_us": 2041855.0,
+        "mean_us": 1894166.8571428568,
+        "stddev_us": 57535.61408238149,
+        "sample_count": 224
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 26046.125,
+      "sstable_count": 5
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 17,
+        "workload": "Read",
+        "concurrency": 16,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 0,
+      "range_queries_completed": 240,
+      "records_scanned": 6247332,
+      "insert_ops_per_sec": 0.0,
+      "range_ops_per_sec": 8.0,
+      "insert_latency": {
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p95_us": 0.0,
+        "p99_us": 0.0,
+        "p99_9_us": 0.0,
+        "max_us": 0.0,
+        "mean_us": 0.0,
+        "stddev_us": 0.0,
+        "sample_count": 0
+      },
+      "range_latency": {
+        "min_us": 1319936.0,
+        "p50_us": 2050047.0,
+        "p90_us": 2205695.0,
+        "p95_us": 2285567.0,
+        "p99_us": 2416639.0,
+        "p99_9_us": 2422783.0,
+        "max_us": 2422783.0,
+        "mean_us": 2065574.4,
+        "stddev_us": 115811.52840530746,
+        "sample_count": 240
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 26030.55,
+      "sstable_count": 3
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 18,
+        "workload": "Mixed",
+        "concurrency": 1,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 55,
+      "range_queries_completed": 61,
+      "records_scanned": 1588123,
+      "insert_ops_per_sec": 1.8333333333333333,
+      "range_ops_per_sec": 2.033333333333333,
+      "insert_latency": {
+        "min_us": 824.0,
+        "p50_us": 824.0,
+        "p90_us": 824.0,
+        "p95_us": 824.0,
+        "p99_us": 824.0,
+        "p99_9_us": 824.0,
+        "max_us": 824.0,
+        "mean_us": 824.0,
+        "stddev_us": 0.0,
+        "sample_count": 1
+      },
+      "range_latency": {
+        "min_us": 449536.0,
+        "p50_us": 482815.0,
+        "p90_us": 516351.0,
+        "p95_us": 552447.0,
+        "p99_us": 716287.0,
+        "p99_9_us": 716287.0,
+        "max_us": 716287.0,
+        "mean_us": 490122.4918032788,
+        "stddev_us": 41032.449336809055,
+        "sample_count": 61
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 26034.803278688523,
+      "sstable_count": 3
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 19,
+        "workload": "Mixed",
+        "concurrency": 2,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 101,
+      "range_queries_completed": 108,
+      "records_scanned": 2821630,
+      "insert_ops_per_sec": 3.3666666666666667,
+      "range_ops_per_sec": 3.6,
+      "insert_latency": {
+        "min_us": 646.0,
+        "p50_us": 646.0,
+        "p90_us": 715.0,
+        "p95_us": 715.0,
+        "p99_us": 715.0,
+        "p99_9_us": 715.0,
+        "max_us": 715.0,
+        "mean_us": 680.5,
+        "stddev_us": 34.5,
+        "sample_count": 2
+      },
+      "range_latency": {
+        "min_us": 529408.0,
+        "p50_us": 551935.0,
+        "p90_us": 569343.0,
+        "p95_us": 573439.0,
+        "p99_us": 744959.0,
+        "p99_9_us": 760319.0,
+        "max_us": 760319.0,
+        "mean_us": 555780.7407407408,
+        "stddev_us": 29390.571973556158,
+        "sample_count": 108
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 26126.203703703704,
+      "sstable_count": 3
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 20,
+        "workload": "Mixed",
+        "concurrency": 4,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 166,
+      "range_queries_completed": 164,
+      "records_scanned": 4096260,
+      "insert_ops_per_sec": 5.533333333333333,
+      "range_ops_per_sec": 5.466666666666667,
+      "insert_latency": {
+        "min_us": 527.0,
+        "p50_us": 574.0,
+        "p90_us": 930.0,
+        "p95_us": 930.0,
+        "p99_us": 930.0,
+        "p99_9_us": 930.0,
+        "max_us": 930.0,
+        "mean_us": 657.5,
+        "stddev_us": 159.437291748198,
+        "sample_count": 4
+      },
+      "range_latency": {
+        "min_us": 615424.0,
+        "p50_us": 709631.0,
+        "p90_us": 748543.0,
+        "p95_us": 912895.0,
+        "p99_us": 1976319.0,
+        "p99_9_us": 1980415.0,
+        "max_us": 1980415.0,
+        "mean_us": 742484.2926829268,
+        "stddev_us": 220539.00737591382,
+        "sample_count": 164
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 24977.19512195122,
+      "sstable_count": 3
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 21,
+        "workload": "Mixed",
+        "concurrency": 6,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 316,
+      "range_queries_completed": 300,
+      "records_scanned": 5159451,
+      "insert_ops_per_sec": 10.533333333333333,
+      "range_ops_per_sec": 10.0,
+      "insert_latency": {
+        "min_us": 408.0,
+        "p50_us": 711.0,
+        "p90_us": 1295.0,
+        "p95_us": 1295.0,
+        "p99_us": 1295.0,
+        "p99_9_us": 1295.0,
+        "max_us": 1295.0,
+        "mean_us": 763.3333333333334,
+        "stddev_us": 273.3975534313031,
+        "sample_count": 6
+      },
+      "range_latency": {
+        "min_us": 435712.0,
+        "p50_us": 599551.0,
+        "p90_us": 708607.0,
+        "p95_us": 731135.0,
+        "p99_us": 913919.0,
+        "p99_9_us": 924671.0,
+        "max_us": 924671.0,
+        "mean_us": 599555.8399999997,
+        "stddev_us": 100322.49055375233,
+        "sample_count": 300
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 17198.17,
+      "sstable_count": 3
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 22,
+        "workload": "Mixed",
+        "concurrency": 8,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 513,
+      "range_queries_completed": 520,
+      "records_scanned": 6219424,
+      "insert_ops_per_sec": 17.1,
+      "range_ops_per_sec": 17.333333333333332,
+      "insert_latency": {
+        "min_us": 812.0,
+        "p50_us": 1226.0,
+        "p90_us": 2553.0,
+        "p95_us": 2553.0,
+        "p99_us": 2553.0,
+        "p99_9_us": 2553.0,
+        "max_us": 2553.0,
+        "mean_us": 1456.875,
+        "stddev_us": 581.9191175541495,
+        "sample_count": 8
+      },
+      "range_latency": {
+        "min_us": 421376.0,
+        "p50_us": 446975.0,
+        "p90_us": 526847.0,
+        "p95_us": 539647.0,
+        "p99_us": 578559.0,
+        "p99_9_us": 588287.0,
+        "max_us": 588287.0,
+        "mean_us": 466118.64615384606,
+        "stddev_us": 38243.47858189713,
+        "sample_count": 520
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11960.430769230768,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 23,
+        "workload": "Mixed",
+        "concurrency": 10,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 568,
+      "range_queries_completed": 560,
+      "records_scanned": 6687827,
+      "insert_ops_per_sec": 18.933333333333334,
+      "range_ops_per_sec": 18.666666666666668,
+      "insert_latency": {
+        "min_us": 596.0,
+        "p50_us": 885.0,
+        "p90_us": 1454.0,
+        "p95_us": 1466.0,
+        "p99_us": 1466.0,
+        "p99_9_us": 1466.0,
+        "max_us": 1466.0,
+        "mean_us": 1025.6,
+        "stddev_us": 292.391928753172,
+        "sample_count": 10
+      },
+      "range_latency": {
+        "min_us": 441088.0,
+        "p50_us": 518143.0,
+        "p90_us": 604159.0,
+        "p95_us": 688127.0,
+        "p99_us": 782335.0,
+        "p99_9_us": 807423.0,
+        "max_us": 807423.0,
+        "mean_us": 540033.1428571426,
+        "stddev_us": 58238.18118487605,
+        "sample_count": 560
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11942.548214285714,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 24,
+        "workload": "Mixed",
+        "concurrency": 12,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 615,
+      "range_queries_completed": 600,
+      "records_scanned": 7177480,
+      "insert_ops_per_sec": 20.5,
+      "range_ops_per_sec": 20.0,
+      "insert_latency": {
+        "min_us": 618.0,
+        "p50_us": 1108.0,
+        "p90_us": 1675.0,
+        "p95_us": 1875.0,
+        "p99_us": 1875.0,
+        "p99_9_us": 1875.0,
+        "max_us": 1875.0,
+        "mean_us": 1195.0833333333333,
+        "stddev_us": 369.4079629022032,
+        "sample_count": 12
+      },
+      "range_latency": {
+        "min_us": 540672.0,
+        "p50_us": 599039.0,
+        "p90_us": 646655.0,
+        "p95_us": 654335.0,
+        "p99_us": 671743.0,
+        "p99_9_us": 678399.0,
+        "max_us": 678399.0,
+        "mean_us": 606643.2,
+        "stddev_us": 22496.6229975375,
+        "sample_count": 600
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11962.466666666667,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 25,
+        "workload": "Mixed",
+        "concurrency": 14,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 602,
+      "range_queries_completed": 602,
+      "records_scanned": 7207662,
+      "insert_ops_per_sec": 20.066666666666666,
+      "range_ops_per_sec": 20.066666666666666,
+      "insert_latency": {
+        "min_us": 460.0,
+        "p50_us": 789.0,
+        "p90_us": 1505.0,
+        "p95_us": 1684.0,
+        "p99_us": 1684.0,
+        "p99_9_us": 1684.0,
+        "max_us": 1684.0,
+        "mean_us": 920.4285714285714,
+        "stddev_us": 390.68304915616596,
+        "sample_count": 14
+      },
+      "range_latency": {
+        "min_us": 609792.0,
+        "p50_us": 696831.0,
+        "p90_us": 741887.0,
+        "p95_us": 760831.0,
+        "p99_us": 813567.0,
+        "p99_9_us": 824319.0,
+        "max_us": 824319.0,
+        "mean_us": 704977.2225913613,
+        "stddev_us": 29201.716882016193,
+        "sample_count": 602
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11972.860465116279,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 26,
+        "workload": "Mixed",
+        "concurrency": 16,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 599,
+      "range_queries_completed": 576,
+      "records_scanned": 6905992,
+      "insert_ops_per_sec": 19.966666666666665,
+      "range_ops_per_sec": 19.2,
+      "insert_latency": {
+        "min_us": 510.0,
+        "p50_us": 954.0,
+        "p90_us": 1751.0,
+        "p95_us": 2907.0,
+        "p99_us": 2907.0,
+        "p99_9_us": 2907.0,
+        "max_us": 2907.0,
+        "mean_us": 1053.25,
+        "stddev_us": 563.6817031800837,
+        "sample_count": 16
+      },
+      "range_latency": {
+        "min_us": 761344.0,
+        "p50_us": 795647.0,
+        "p90_us": 968703.0,
+        "p95_us": 1040383.0,
+        "p99_us": 1181695.0,
+        "p99_9_us": 1203199.0,
+        "max_us": 1203199.0,
+        "mean_us": 845503.1111111112,
+        "stddev_us": 92086.23528995275,
+        "sample_count": 576
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11989.569444444445,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 27,
+        "workload": "Tail",
+        "concurrency": 1,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 1258,
+      "range_queries_completed": 132,
+      "records_scanned": 1573353,
+      "insert_ops_per_sec": 41.93333333333333,
+      "range_ops_per_sec": 4.4,
+      "insert_latency": {
+        "min_us": 1571.0,
+        "p50_us": 3209.0,
+        "p90_us": 5763.0,
+        "p95_us": 5763.0,
+        "p99_us": 5763.0,
+        "p99_9_us": 5763.0,
+        "max_us": 5763.0,
+        "mean_us": 3514.0,
+        "stddev_us": 1724.5074659159932,
+        "sample_count": 3
+      },
+      "range_latency": {
+        "min_us": 195712.0,
+        "p50_us": 216575.0,
+        "p90_us": 253823.0,
+        "p95_us": 271103.0,
+        "p99_us": 446975.0,
+        "p99_9_us": 449023.0,
+        "max_us": 449023.0,
+        "mean_us": 226815.03030303033,
+        "stddev_us": 37069.37235858854,
+        "sample_count": 132
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11919.34090909091,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 28,
+        "workload": "Tail",
+        "concurrency": 2,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 2065,
+      "range_queries_completed": 222,
+      "records_scanned": 2643660,
+      "insert_ops_per_sec": 68.83333333333333,
+      "range_ops_per_sec": 7.4,
+      "insert_latency": {
+        "min_us": 739.0,
+        "p50_us": 3049.0,
+        "p90_us": 3803.0,
+        "p95_us": 3803.0,
+        "p99_us": 3803.0,
+        "p99_9_us": 3803.0,
+        "max_us": 3803.0,
+        "mean_us": 2742.2,
+        "stddev_us": 1098.820167270332,
+        "sample_count": 5
+      },
+      "range_latency": {
+        "min_us": 215296.0,
+        "p50_us": 256511.0,
+        "p90_us": 313599.0,
+        "p95_us": 346623.0,
+        "p99_us": 486143.0,
+        "p99_9_us": 555519.0,
+        "max_us": 555519.0,
+        "mean_us": 269528.50450450456,
+        "stddev_us": 52406.10688055454,
+        "sample_count": 222
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 11908.378378378378,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 29,
+        "workload": "Tail",
+        "concurrency": 4,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 3529,
+      "range_queries_completed": 404,
+      "records_scanned": 4866760,
+      "insert_ops_per_sec": 117.63333333333334,
+      "range_ops_per_sec": 13.466666666666667,
+      "insert_latency": {
+        "min_us": 2354.0,
+        "p50_us": 2995.0,
+        "p90_us": 8335.0,
+        "p95_us": 8335.0,
+        "p99_us": 8335.0,
+        "p99_9_us": 8335.0,
+        "max_us": 8335.0,
+        "mean_us": 4175.375,
+        "stddev_us": 1933.9455096705801,
+        "sample_count": 8
+      },
+      "range_latency": {
+        "min_us": 279808.0,
+        "p50_us": 293887.0,
+        "p90_us": 305151.0,
+        "p95_us": 310783.0,
+        "p99_us": 408575.0,
+        "p99_9_us": 521983.0,
+        "max_us": 521983.0,
+        "mean_us": 297820.51485148526,
+        "stddev_us": 25718.10297833483,
+        "sample_count": 404
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12046.435643564357,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 30,
+        "workload": "Tail",
+        "concurrency": 6,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 4537,
+      "range_queries_completed": 492,
+      "records_scanned": 5997428,
+      "insert_ops_per_sec": 151.23333333333332,
+      "range_ops_per_sec": 16.4,
+      "insert_latency": {
+        "min_us": 1814.0,
+        "p50_us": 3805.0,
+        "p90_us": 5863.0,
+        "p95_us": 7251.0,
+        "p99_us": 7251.0,
+        "p99_9_us": 7251.0,
+        "max_us": 7251.0,
+        "mean_us": 4239.916666666667,
+        "stddev_us": 1572.5092717444377,
+        "sample_count": 12
+      },
+      "range_latency": {
+        "min_us": 346368.0,
+        "p50_us": 360191.0,
+        "p90_us": 384255.0,
+        "p95_us": 389631.0,
+        "p99_us": 572927.0,
+        "p99_9_us": 579583.0,
+        "max_us": 579583.0,
+        "mean_us": 365675.7073170732,
+        "stddev_us": 25968.019842654216,
+        "sample_count": 492
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12189.894308943089,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 31,
+        "workload": "Tail",
+        "concurrency": 8,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 5215,
+      "range_queries_completed": 565,
+      "records_scanned": 6925151,
+      "insert_ops_per_sec": 173.83333333333334,
+      "range_ops_per_sec": 18.833333333333332,
+      "insert_latency": {
+        "min_us": 753.0,
+        "p50_us": 2055.0,
+        "p90_us": 8359.0,
+        "p95_us": 9359.0,
+        "p99_us": 9359.0,
+        "p99_9_us": 9359.0,
+        "max_us": 9359.0,
+        "mean_us": 4343.3125,
+        "stddev_us": 3006.957343369498,
+        "sample_count": 16
+      },
+      "range_latency": {
+        "min_us": 238720.0,
+        "p50_us": 435455.0,
+        "p90_us": 452095.0,
+        "p95_us": 457983.0,
+        "p99_us": 549375.0,
+        "p99_9_us": 1018879.0,
+        "max_us": 1018879.0,
+        "mean_us": 426127.74513274286,
+        "stddev_us": 42646.563752459166,
+        "sample_count": 565
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12256.90442477876,
+      "sstable_count": 1
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 32,
+        "workload": "Tail",
+        "concurrency": 10,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 5712,
+      "range_queries_completed": 620,
+      "records_scanned": 7650669,
+      "insert_ops_per_sec": 190.4,
+      "range_ops_per_sec": 20.666666666666668,
+      "insert_latency": {
+        "min_us": 350.0,
+        "p50_us": 5759.0,
+        "p90_us": 9671.0,
+        "p95_us": 11671.0,
+        "p99_us": 11671.0,
+        "p99_9_us": 11671.0,
+        "max_us": 11671.0,
+        "mean_us": 4689.684210526316,
+        "stddev_us": 3643.241848057153,
+        "sample_count": 19
+      },
+      "range_latency": {
+        "min_us": 446208.0,
+        "p50_us": 481791.0,
+        "p90_us": 498943.0,
+        "p95_us": 518911.0,
+        "p99_us": 526335.0,
+        "p99_9_us": 533503.0,
+        "max_us": 533503.0,
+        "mean_us": 483551.5870967741,
+        "stddev_us": 13786.59814260356,
+        "sample_count": 620
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12339.78870967742,
+      "sstable_count": 1
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 33,
+        "workload": "Tail",
+        "concurrency": 12,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 5351,
+      "range_queries_completed": 589,
+      "records_scanned": 7304201,
+      "insert_ops_per_sec": 178.36666666666667,
+      "range_ops_per_sec": 19.633333333333333,
+      "insert_latency": {
+        "min_us": 2654.0,
+        "p50_us": 6259.0,
+        "p90_us": 12439.0,
+        "p95_us": 13495.0,
+        "p99_us": 13495.0,
+        "p99_9_us": 13495.0,
+        "max_us": 13495.0,
+        "mean_us": 7828.833333333333,
+        "stddev_us": 3386.2074368761814,
+        "sample_count": 12
+      },
+      "range_latency": {
+        "min_us": 203136.0,
+        "p50_us": 603647.0,
+        "p90_us": 656895.0,
+        "p95_us": 673279.0,
+        "p99_us": 803327.0,
+        "p99_9_us": 812031.0,
+        "max_us": 812031.0,
+        "mean_us": 611034.9473684211,
+        "stddev_us": 44594.63520010571,
+        "sample_count": 589
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12401.020373514431,
+      "sstable_count": 1
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 34,
+        "workload": "Tail",
+        "concurrency": 14,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 4880,
+      "range_queries_completed": 532,
+      "records_scanned": 6562725,
+      "insert_ops_per_sec": 162.66666666666666,
+      "range_ops_per_sec": 17.733333333333334,
+      "insert_latency": {
+        "min_us": 2246.0,
+        "p50_us": 4263.0,
+        "p90_us": 8495.0,
+        "p95_us": 8639.0,
+        "p99_us": 8639.0,
+        "p99_9_us": 8639.0,
+        "max_us": 8639.0,
+        "mean_us": 5133.571428571428,
+        "stddev_us": 2198.0020055328728,
+        "sample_count": 14
+      },
+      "range_latency": {
+        "min_us": 655872.0,
+        "p50_us": 793599.0,
+        "p90_us": 851455.0,
+        "p95_us": 862719.0,
+        "p99_us": 1026047.0,
+        "p99_9_us": 1192959.0,
+        "max_us": 1192959.0,
+        "mean_us": 796556.9924812027,
+        "stddev_us": 64389.02290308091,
+        "sample_count": 532
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12335.949248120301,
+      "sstable_count": 2
+    },
+    {
+      "run_config": {
+        "addr": "127.0.0.1:4321",
+        "run_id": 35,
+        "workload": "Tail",
+        "concurrency": 16,
+        "duration_secs": 30,
+        "batch_size": 512,
+        "channel_capacity": 8192,
+        "sources": 4,
+        "keys": 4,
+        "value_size": 128,
+        "range_fraction": 0.5,
+        "range_window": 60
+      },
+      "inserts_completed": 5588,
+      "range_queries_completed": 592,
+      "records_scanned": 7275793,
+      "insert_ops_per_sec": 186.26666666666668,
+      "range_ops_per_sec": 19.733333333333334,
+      "insert_latency": {
+        "min_us": 2100.0,
+        "p50_us": 4911.0,
+        "p90_us": 8711.0,
+        "p95_us": 11167.0,
+        "p99_us": 11167.0,
+        "p99_9_us": 11167.0,
+        "max_us": 11167.0,
+        "mean_us": 5658.0625,
+        "stddev_us": 2498.757202809779,
+        "sample_count": 16
+      },
+      "range_latency": {
+        "min_us": 684544.0,
+        "p50_us": 825343.0,
+        "p90_us": 861695.0,
+        "p95_us": 866815.0,
+        "p99_us": 892415.0,
+        "p99_9_us": 897023.0,
+        "max_us": 897023.0,
+        "mean_us": 822674.162162162,
+        "stddev_us": 29798.22669267011,
+        "sample_count": 592
+      },
+      "failed_inserts": 0,
+      "failed_ranges": 0,
+      "avg_records_per_range": 12290.190878378378,
+      "sstable_count": 2
+    }
+  ],
+  "metrics": null,
+  "saturations": [
+    {
+      "workload": "Write",
+      "by_concurrency": [
+        [
+          1,
+          122606.93333333333
+        ],
+        [
+          2,
+          91733.33333333333
+        ],
+        [
+          4,
+          82705.06666666667
+        ],
+        [
+          6,
+          74308.26666666666
+        ],
+        [
+          8,
+          68181.33333333333
+        ],
+        [
+          10,
+          69290.66666666667
+        ],
+        [
+          12,
+          69614.93333333333
+        ],
+        [
+          14,
+          68881.06666666667
+        ],
+        [
+          16,
+          63232.0
+        ]
+      ],
+      "max_throughput": 122606.93333333333,
+      "max_concurrency": 1,
+      "saturation_detected": true,
+      "saturation_points": [
+        {
+          "from_concurrency": 1,
+          "to_concurrency": 2,
+          "from_throughput": 122606.93333333333,
+          "to_throughput": 91733.33333333333
+        },
+        {
+          "from_concurrency": 2,
+          "to_concurrency": 4,
+          "from_throughput": 91733.33333333333,
+          "to_throughput": 82705.06666666667
+        },
+        {
+          "from_concurrency": 4,
+          "to_concurrency": 6,
+          "from_throughput": 82705.06666666667,
+          "to_throughput": 74308.26666666666
+        },
+        {
+          "from_concurrency": 6,
+          "to_concurrency": 8,
+          "from_throughput": 74308.26666666666,
+          "to_throughput": 68181.33333333333
+        },
+        {
+          "from_concurrency": 14,
+          "to_concurrency": 16,
+          "from_throughput": 68881.06666666667,
+          "to_throughput": 63232.0
+        }
+      ]
+    },
+    {
+      "workload": "Read",
+      "by_concurrency": [
+        [
+          1,
+          0.0
+        ],
+        [
+          2,
+          0.0
+        ],
+        [
+          4,
+          0.0
+        ],
+        [
+          6,
+          0.0
+        ],
+        [
+          8,
+          0.0
+        ],
+        [
+          10,
+          0.0
+        ],
+        [
+          12,
+          0.0
+        ],
+        [
+          14,
+          0.0
+        ],
+        [
+          16,
+          0.0
+        ]
+      ],
+      "max_throughput": 0.0,
+      "max_concurrency": 0,
+      "saturation_detected": false,
+      "saturation_points": []
+    },
+    {
+      "workload": "Mixed",
+      "by_concurrency": [
+        [
+          1,
+          1.8333333333333333
+        ],
+        [
+          2,
+          3.3666666666666667
+        ],
+        [
+          4,
+          5.533333333333333
+        ],
+        [
+          6,
+          10.533333333333333
+        ],
+        [
+          8,
+          17.1
+        ],
+        [
+          10,
+          18.933333333333334
+        ],
+        [
+          12,
+          20.5
+        ],
+        [
+          14,
+          20.066666666666666
+        ],
+        [
+          16,
+          19.966666666666665
+        ]
+      ],
+      "max_throughput": 20.5,
+      "max_concurrency": 12,
+      "saturation_detected": false,
+      "saturation_points": []
+    },
+    {
+      "workload": "Tail",
+      "by_concurrency": [
+        [
+          1,
+          41.93333333333333
+        ],
+        [
+          2,
+          68.83333333333333
+        ],
+        [
+          4,
+          117.63333333333334
+        ],
+        [
+          6,
+          151.23333333333332
+        ],
+        [
+          8,
+          173.83333333333334
+        ],
+        [
+          10,
+          190.4
+        ],
+        [
+          12,
+          178.36666666666667
+        ],
+        [
+          14,
+          162.66666666666666
+        ],
+        [
+          16,
+          186.26666666666668
+        ]
+      ],
+      "max_throughput": 190.4,
+      "max_concurrency": 10,
+      "saturation_detected": true,
+      "saturation_points": [
+        {
+          "from_concurrency": 10,
+          "to_concurrency": 12,
+          "from_throughput": 190.4,
+          "to_throughput": 178.36666666666667
+        },
+        {
+          "from_concurrency": 12,
+          "to_concurrency": 14,
+          "from_throughput": 178.36666666666667,
+          "to_throughput": 162.66666666666666
+        }
+      ]
+    }
+  ],
+  "mem": null
+}

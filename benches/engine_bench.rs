@@ -1,20 +1,16 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use logregator::storage::Engine;
+use logregator::storage::{Engine, SSTableMeta};
 use tempfile::tempdir;
-use tokio::sync::mpsc;
 
 fn bench_engine_insert(c: &mut Criterion) {
     let dir = tempdir().unwrap();
-    let (cmd_tx, _) = mpsc::channel(1);
-
-    let mut engine =
-        Engine::open(dir.path().to_path_buf(), 64 * 1024 * 1024, cmd_tx).unwrap();
+    let (mut engine, _) = Engine::open(dir.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
     let mut i = 0;
 
     c.bench_function("engine_insert", |b| {
         b.iter(|| {
             engine
-                .insert(
+                .insert_record(
                     std::hint::black_box(67),
                     std::hint::black_box(i),
                     std::hint::black_box("sx_svn"),
@@ -28,21 +24,14 @@ fn bench_engine_insert(c: &mut Criterion) {
 
 fn bench_engine_range_memtable(c: &mut Criterion) {
     let dir = tempdir().unwrap();
-    let (cmd_tx, _) = mpsc::channel(1);
-
-    let mut engine = Engine::open(
-        dir.path().to_path_buf(),
-        64 * 1024 * 1024, // big memtable so we dont flush
-        cmd_tx,
-    )
-    .unwrap();
+    let (mut engine, _) = Engine::open(dir.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
     let source_id = 64;
     let key = "key";
     let value = "six: 6, seve: 7";
     let max_ts = 2048;
     for i in 0..max_ts {
         engine
-            .insert(source_id, i, key, value)
+            .insert_record(source_id, i, key, value)
             .expect("failed to setup engine before bench");
     }
 
@@ -63,22 +52,27 @@ fn bench_engine_range_memtable(c: &mut Criterion) {
 
 fn bench_engine_range_sstable(c: &mut Criterion) {
     let dir = tempdir().unwrap();
-    let (cmd_tx, _) = mpsc::channel(1);
-
-    let mut engine = Engine::open(
-        dir.path().to_path_buf(),
-        256, // frequent flushes -> many sstables -> MergeIter might be slower
-        cmd_tx,
-    )
-    .unwrap();
+    let (mut engine, _) = Engine::open(dir.path().to_path_buf(), 0).unwrap();
     let source_id = 64;
     let key = "key";
     let value = "six: 6, seve: 7";
     let max_ts = 2048;
     for i in 0..max_ts {
         engine
-            .insert(source_id, i, key, value)
+            .insert_record(source_id, i, key, value)
             .expect("failed to setup engine before bench");
+        if i > 0 && i % 32 == 0 {
+            let (frozen, sst_id) = engine.prepare_flush();
+            let meta = SSTableMeta::write_to_file(
+                engine.clone_base_dir(),
+                sst_id,
+                frozen.iter(),
+                frozen.len(),
+            )
+            .unwrap();
+            engine.remove_frozen_memtable(sst_id);
+            engine.insert_meta(meta);
+        }
     }
 
     c.bench_function("engine_range_sstable", |b| {

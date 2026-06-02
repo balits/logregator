@@ -8,21 +8,16 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use logregator::bench::{self, BenchmarkResult, LatencyStats, RunResult, WorkloadKind};
 use logregator::mem_profile::{self, MemProfiler, MemSample};
-use logregator::metrics::{self, Metrics};
+use logregator::metrics;
 use logregator::{
     client::Client,
     proto,
-    server::Server,
-    storage::{
-        Engine,
-        compaction::{self, CompactionCommand, CompactionResult},
-    },
 };
 use owo_colors::OwoColorize;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::Serialize;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 #[derive(Parser)]
 #[command(name = "benchmark")]
@@ -74,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// human-readable summary
+#[allow(unused_must_use)]
 fn write_summary<W: io::Write>(mut w: W, b: &BenchmarkResult, verbose: bool) {
     let args = &b.args;
     let runs = &b.runs;
@@ -232,82 +228,83 @@ fn write_summary<W: io::Write>(mut w: W, b: &BenchmarkResult, verbose: bool) {
     }
 
     writeln!(w);
-    writeln!(w, "{}", "--- SERVER METRICS ---".cyan());
-    let m = &b.metrics;
-    let eng = &m.engine;
-    let wal = &m.wal;
-    let svr = &m.server;
-    writeln!(
-        w,
-        "  {:>12}  accepted={}  active={}  frames={}",
-        "CONNECTIONS:", svr.connections_accepted, svr.connections_active, svr.frames_read
-    );
-    writeln!(
-        w,
-        "  {:>12}  {} writes ({}), {} syncs (p50={})",
-        "WAL:",
-        bench::fmt_count(wal.write_count),
-        bench::fmt_bytes(wal.write_bytes),
-        wal.sync_count,
-        wal.sync_latency
-            .as_ref()
-            .map_or("N/A".into(), |s| bench::fmt_latency(s.p50 as f64))
-    );
-    writeln!(
-        w,
-        "  {:>12}  {} records ({} cmds), {} flushes, {} compactions, {} SSTs",
-        "ENGINE:",
-        bench::fmt_count(eng.records_inserted),
-        eng.batch_insert_count,
-        eng.flush_count,
-        eng.compaction_count,
-        eng.sstable_count
-    );
-    writeln!(
-        w,
-        "  {:>12}  {} / {}",
-        "MEMTABLE:",
-        bench::fmt_bytes(eng.memtable_bytes as u64),
-        bench::fmt_bytes(eng.memtable_limit as u64)
-    );
+    if let Some(ref m) = b.metrics {
+        writeln!(w, "{}", "--- SERVER METRICS ---".cyan());
+        let eng = &m.engine;
+        let wal = &m.wal;
+        let svr = &m.server;
+        writeln!(
+            w,
+            "  {:>12}  accepted={}  active={}  frames={}",
+            "CONNECTIONS:", svr.connections_accepted, svr.connections_active, svr.frames_read
+        );
+        writeln!(
+            w,
+            "  {:>12}  {} writes ({}), {} syncs (p50={})",
+            "WAL:",
+            bench::fmt_count(wal.write_count),
+            bench::fmt_bytes(wal.write_bytes),
+            wal.sync_count,
+            wal.sync_latency
+                .as_ref()
+                .map_or("N/A".into(), |s| bench::fmt_latency(s.p50 as f64))
+        );
+        writeln!(
+            w,
+            "  {:>12}  {} records ({} cmds), {} flushes, {} compactions, {} SSTs",
+            "ENGINE:",
+            bench::fmt_count(eng.records_inserted),
+            eng.batch_insert_count,
+            eng.flush_count,
+            eng.compaction_count,
+            eng.sstable_count
+        );
+        writeln!(
+            w,
+            "  {:>12}  {} / {}",
+            "MEMTABLE:",
+            bench::fmt_bytes(eng.memtable_bytes as u64),
+            bench::fmt_bytes(eng.memtable_limit as u64)
+        );
 
-    if verbose {
-        if let Some(ref sl) = wal.sync_latency {
-            writeln!(w,);
-            writeln!(
-                w,
-                "  WAL SYNC LAT (MS):  {}",
-                bench::fmt_latency_line(&LatencyStats {
-                    min_us: sl.min as f64,
-                    p50_us: sl.p50 as f64,
-                    p90_us: sl.p90 as f64,
-                    p95_us: sl.p95 as f64,
-                    p99_us: sl.p99 as f64,
-                    p99_9_us: sl.p99_9 as f64,
-                    max_us: sl.max as f64,
-                    mean_us: sl.mean as f64,
-                    stddev_us: 0.0,
-                    sample_count: sl.count as usize,
-                })
-            );
-        }
-        if let Some(ref bl) = eng.batch_insert_latency {
-            writeln!(
-                w,
-                "  BATCH INSERT LAT (MS):  {}",
-                bench::fmt_latency_line(&LatencyStats {
-                    min_us: bl.min as f64,
-                    p50_us: bl.p50 as f64,
-                    p90_us: bl.p90 as f64,
-                    p95_us: bl.p95 as f64,
-                    p99_us: bl.p99 as f64,
-                    p99_9_us: bl.p99_9 as f64,
-                    max_us: bl.max as f64,
-                    mean_us: bl.mean as f64,
-                    stddev_us: 0.0,
-                    sample_count: bl.count as usize,
-                })
-            );
+        if verbose {
+            if let Some(ref sl) = wal.sync_latency {
+                writeln!(w,);
+                writeln!(
+                    w,
+                    "  WAL SYNC LAT (MS):  {}",
+                    bench::fmt_latency_line(&LatencyStats {
+                        min_us: sl.min as f64,
+                        p50_us: sl.p50 as f64,
+                        p90_us: sl.p90 as f64,
+                        p95_us: sl.p95 as f64,
+                        p99_us: sl.p99 as f64,
+                        p99_9_us: sl.p99_9 as f64,
+                        max_us: sl.max as f64,
+                        mean_us: sl.mean as f64,
+                        stddev_us: 0.0,
+                        sample_count: sl.count as usize,
+                    })
+                );
+            }
+            if let Some(ref bl) = eng.batch_insert_latency {
+                writeln!(
+                    w,
+                    "  BATCH INSERT LAT (MS):  {}",
+                    bench::fmt_latency_line(&LatencyStats {
+                        min_us: bl.min as f64,
+                        p50_us: bl.p50 as f64,
+                        p90_us: bl.p90 as f64,
+                        p95_us: bl.p95 as f64,
+                        p99_us: bl.p99 as f64,
+                        p99_9_us: bl.p99_9 as f64,
+                        max_us: bl.max as f64,
+                        mean_us: bl.mean as f64,
+                        stddev_us: 0.0,
+                        sample_count: bl.count as usize,
+                    })
+                );
+            }
         }
     }
 
@@ -332,7 +329,7 @@ fn write_summary<W: io::Write>(mut w: W, b: &BenchmarkResult, verbose: bool) {
 }
 
 mod loadgen {
-    use logregator::storage::Backend;
+    use logregator::runtime::RuntimeBuilder;
 
     use super::*;
 
@@ -340,29 +337,40 @@ mod loadgen {
         let args = args.inner;
         let verbose = args.verbose;
 
-        let profiler = if args.profile_mem > 0 {
+        let external_server = args.external_server.unwrap_or(false);
+
+        let profiler = if args.profile_mem > 0 && !external_server {
             Some(MemProfiler::start(Duration::from_millis(args.profile_mem)))
         } else {
             None
         };
 
-        let (metrics, data_dir, server_start, mut stats_rx) =
-            run_server(&args).await.expect("failed to start server");
+        let (mut rt, data_dir, server_start) = if external_server {
+            tracing::info!("connecting to external server at {}", args.addr);
+            (None, None, Instant::now())
+        } else {
+            let (rt, data_dir, server_start) =
+                run_server(&args).await.expect("failed to start server");
+            (Some(rt), Some(data_dir), server_start)
+        };
         let configs = build_run_configs(&args, server_start);
         let mut results = Vec::with_capacity(configs.len());
-        let storage_dir = data_dir.join("storage");
+
+        let metrics = rt.as_ref().map(|rt| rt.metrics.clone());
 
         let (em_tx, em_rx) = std::sync::mpsc::channel();
-        if let Some(mut rx) = stats_rx.take() {
-            tokio::spawn(async move {
-                let start = Instant::now();
-                while let Some((mt, sst)) = rx.recv().await {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    if em_tx.send((elapsed, mt, sst)).is_err() {
-                        break;
+        if let Some(ref mut rt) = rt {
+            if let Some(mut rx) = rt.stats_rx.take() {
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    while let Some((mt, sst)) = rx.recv().await {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if em_tx.send((elapsed, mt, sst)).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
         }
 
         let total = configs.len();
@@ -382,24 +390,36 @@ mod loadgen {
             let mut result = run_single(config).await?;
             let elapsed = t0.elapsed();
 
-            if storage_dir.exists() {
-                result.sstable_count = fs::read_dir(&storage_dir)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext == "sst")
-                            .unwrap_or(false)
-                    })
-                    .count();
+            if let Some(ref m) = metrics {
+                result.sstable_count = m.snapshot().engine.sstable_count as usize;
+            } else if let Some(ref dir) = data_dir {
+                let storage_dir = dir.join("storage");
+                if storage_dir.exists() {
+                    result.sstable_count = fs::read_dir(&storage_dir)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .filter(|e| {
+                            e.path()
+                                .extension()
+                                .map(|ext| ext == "sst")
+                                .unwrap_or(false)
+                        })
+                        .count();
+                }
+            } else {
+                let mut client = Client::connect(&args.addr).await.unwrap();
+                if let Ok(json) = client.get_metrics().await {
+                    if let Ok(snap) = serde_json::from_str::<metrics::MetricsSnapshot>(&json) {
+                        result.sstable_count = snap.engine.sstable_count as usize;
+                    }
+                }
             }
 
             let ins = bench::fmt_count(result.inserts_completed);
             let rng = bench::fmt_count(result.range_queries_completed);
             eprintln!(
-                "  ✓ {} inserts, {} ranges ({:.1}s)",
+                "  {} inserts\n  {} ranges ({:.1}s)\n",
                 ins,
                 rng,
                 elapsed.as_secs_f64()
@@ -409,7 +429,7 @@ mod loadgen {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
-        let metrics_snapshot = metrics.snapshot();
+        let metrics_snapshot = rt.as_ref().map(|rt| rt.metrics.snapshot());
 
         let mem_samples: Vec<MemSample> = if let Some(p) = profiler {
             p.stop().await
@@ -468,47 +488,28 @@ mod loadgen {
     async fn run_server(
         args: &bench::BenchmarkArgs,
     ) -> anyhow::Result<(
-        Arc<Metrics>,
+        logregator::runtime::Runtime,
         PathBuf,
         Instant,
-        Option<mpsc::UnboundedReceiver<(usize, usize)>>,
     )> {
         let server_start = Instant::now();
-        let metrics = Arc::new(Metrics::default());
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
         let data_dir = PathBuf::from("load_tests").join(ts.to_string());
+        let storage_dir = data_dir.join("storage");
 
-        let (cmd_sender, cmd_recv) = mpsc::channel::<proto::Command>(args.channel_capacity);
-        let (comp_cmd_sender, comp_cmd_recv) = mpsc::channel::<CompactionCommand>(1);
-        let (comp_result_sender, comp_result_recv) = mpsc::channel::<CompactionResult>(1);
-        let memtable_limit = args.memtable_mb as usize * 1024 * 1024;
-        let mut engine = Engine::open(data_dir.join("storage"), memtable_limit, comp_cmd_sender.clone())?;
+        let rt = RuntimeBuilder::new()
+            .data_dir(storage_dir)
+            .server_addr(&args.addr)
+            .channel_capacity(args.channel_capacity)
+            .memtable_limit_bytes((args.memtable_mb as usize) * 1024 * 1024)
+            .profile_mem(args.profile_mem as usize)
+            .spawn()
+            .await?;
 
-        let stats_rx = if args.profile_mem > 0 {
-            let (stats_tx, stats_rx) = mpsc::unbounded_channel();
-            engine.set_stats_tx(stats_tx);
-            Some(stats_rx)
-        } else {
-            None
-        };
-        let mut backend = Backend::new(engine, comp_cmd_sender, comp_result_recv);
-        tokio::spawn(async move {
-            backend.engine_loop(cmd_recv).await
-        });
-
-        let comp_metrics = metrics.clone();
-        tokio::spawn(async move {
-            compaction::compaction_loop(comp_cmd_recv, comp_result_sender, Some(comp_metrics)).await
-        });
-        let server = Server::new(Some(args.addr.parse().unwrap()))
-            .await
-            .context("failed to start server")?;
-        let svr_metrics = metrics.clone();
-        tokio::spawn(async move { server.run_main_loop(cmd_sender, svr_metrics).await });
-        Ok((metrics, data_dir, server_start, stats_rx))
+        Ok((rt, data_dir, server_start))
     }
 
     fn needs_prefill(workload: WorkloadKind) -> bool {
@@ -713,8 +714,6 @@ mod loadgen {
         Ok(())
     }
 }
-
-// ── cmp subcommand ──────────────────────────────────────────────────────
 
 mod cmp {
     use super::*;
@@ -1097,7 +1096,10 @@ mod cmp {
         }
     }
 
-    fn cmp_metrics(b: &metrics::MetricsSnapshot, t: &metrics::MetricsSnapshot) -> Vec<FieldCmp> {
+    fn cmp_metrics(b: &Option<metrics::MetricsSnapshot>, t: &Option<metrics::MetricsSnapshot>) -> Vec<FieldCmp> {
+        let (Some(ref b), Some(ref t)) = (b.as_ref(), t.as_ref()) else {
+            return vec![];
+        };
         use ChangeDirection::*;
         let mut fields = vec![];
 

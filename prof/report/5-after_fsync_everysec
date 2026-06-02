@@ -1,0 +1,81 @@
+# cargo run --release --bin benchmark -- cmp -b prof/json/1780392036397_write__longer_dur_smaller_memtable.json -t prof/json/1780394719704_write_longer_dur_smaller_memtbale_fsync_everysec.json
+#    Finished `release` profile [optimized + debuginfo] target(s) in 2.35s
+#     Running `target/release/benchmark cmp -b prof/json/1780392036397_write__longer_dur_smaller_memtable.json -t prof/json/1780394719704_write_longer_dur_smaller_memtbale_fsync_everysec.json`
+=> cmp: prof/json/1780392036397_write__longer_dur_smaller_memtable.json vs 1 target(s) <=
+--- write | 1 client ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     71.6K        69.5K        -2.0K      -2.9%
+  insert_latency min           2.13ms       2.39ms     +0.258ms     +12.1%
+  insert_latency p50           6.27ms       6.93ms     +0.660ms     +10.5%
+  insert_latency p90          10.26ms       9.59ms     -0.664ms      -6.5%
+  insert_latency p99          21.42ms      19.28ms      -2.14ms     -10.0%
+  insert_latency max         351.23ms      46.08ms    -305.15ms     -86.9%
+--- write | 2 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     61.3K        53.7K        -7.6K     -12.4%
+  insert_latency min           5.65ms       5.95ms     +0.300ms      +5.3%
+  insert_latency p50          15.85ms      17.36ms      +1.51ms      +9.5%
+  insert_latency p90          22.96ms      26.40ms      +3.44ms     +15.0%
+  insert_latency p99          37.28ms      44.77ms      +7.49ms     +20.1%
+  insert_latency max          59.30ms     330.75ms    +271.46ms    +457.8%
+--- write | 4 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     53.6K        47.7K        -5.8K     -10.9%
+  insert_latency min          14.55ms      24.34ms      +9.78ms     +67.2%
+  insert_latency p50          37.31ms      38.88ms      +1.57ms      +4.2%
+  insert_latency p90          49.89ms      58.37ms      +8.48ms     +17.0%
+  insert_latency p99          70.40ms      83.14ms     +12.74ms     +18.1%
+  insert_latency max         105.15ms     134.40ms     +29.25ms     +27.8%
+--- write | 6 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     48.1K        36.3K       -11.8K     -24.5%
+  insert_latency min          14.81ms      51.17ms     +36.36ms    +245.5%
+  insert_latency p50          59.71ms      77.38ms     +17.66ms     +29.6%
+  insert_latency p90          77.06ms     113.09ms     +36.03ms     +46.8%
+  insert_latency p99         178.81ms     188.80ms      +9.98ms      +5.6%
+  insert_latency max         274.69ms     255.36ms     -19.33ms      -7.0%
+--- write | 8 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     46.2K        41.3K        -4.9K     -10.6%
+  insert_latency min          19.95ms      28.46ms      +8.51ms     +42.7%
+  insert_latency p50          85.12ms      96.83ms     +11.71ms     +13.8%
+  insert_latency p90         109.25ms     116.09ms      +6.85ms      +6.3%
+  insert_latency p99         146.05ms     150.40ms      +4.35ms      +3.0%
+  insert_latency max         194.69ms     198.66ms      +3.97ms      +2.0%
+--- write | 10 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     33.3K        44.3K       +10.9K     +32.8%
+  insert_latency min          12.69ms      37.38ms     +24.69ms    +194.6%
+  insert_latency p50         141.18ms     112.96ms     -28.22ms     -20.0%
+  insert_latency p90         209.79ms     137.09ms     -72.70ms     -34.7%
+  insert_latency p99         357.12ms     166.01ms    -191.10ms     -53.5%
+  insert_latency max         486.65ms     194.81ms    -291.84ms     -60.0%
+--- write | 12 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     27.8K        43.3K       +15.6K     +56.2%
+  insert_latency min          35.74ms      28.22ms      -7.52ms     -21.0%
+  insert_latency p50         171.78ms     139.01ms     -32.77ms     -19.1%
+  insert_latency p90         413.95ms     164.48ms    -249.47ms     -60.3%
+  insert_latency p99         758.27ms     208.38ms    -549.89ms     -72.5%
+  insert_latency max        1055.74ms     228.35ms    -827.39ms     -78.4%
+--- write | 14 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     29.1K        38.9K        +9.8K     +33.8%
+  insert_latency min          14.14ms      31.50ms     +17.36ms    +122.7%
+  insert_latency p50         195.46ms     181.12ms     -14.34ms      -7.3%
+  insert_latency p90         413.18ms     212.74ms    -200.45ms     -48.5%
+  insert_latency p99         996.86ms     250.62ms    -746.24ms     -74.9%
+  insert_latency max        2019.33ms     350.21ms   -1669.12ms     -82.7%
+--- write | 16 clients ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  inserts/s                     39.6K        39.2K      -392.53      -1.0%
+  insert_latency min          31.86ms     115.65ms     +83.79ms    +263.0%
+  insert_latency p50         195.97ms     200.70ms      +4.74ms      +2.4%
+  insert_latency p90         245.89ms     248.19ms      +2.30ms      +0.9%
+  insert_latency p99         437.76ms     366.59ms     -71.17ms     -16.3%
+  insert_latency max         567.29ms     486.14ms     -81.15ms     -14.3%
+
+--- Saturations ---
+                             BASELINE       TARGET        DELTA  DELTA_PCT
+  sat_write_throughput          71.6K        69.5K        -2.0K      -2.9%
+  sat_write_conc_peak               1            1         0.00       0.0%

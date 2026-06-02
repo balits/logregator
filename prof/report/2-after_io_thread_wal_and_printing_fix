@@ -1,0 +1,216 @@
+
+--- BENCHMARK ---
+  WORKLOADS:   write, read, mixed, tail  |  DURATION:    10s  |  CONCURRENCY: 1..16 (step 2)
+  BATCH:       512  |  KEYS:        4  |  SOURCES:     4  |  VALUE:       128B  |  CHANNEL:     8.2K
+
+--- RUN 00 | WRITE | 1 CLIENT ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          221K      22.1K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=4.78ms  P50=20.02ms  P90=42.81ms  P99=61.18ms  MAX=81.47ms
+--- RUN 01 | WRITE | 2 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          501K      50.1K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=7.69ms  P50=18.85ms  P90=28.91ms  P99=40.93ms  MAX=53.98ms
+--- RUN 02 | WRITE | 4 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          850K      85.0K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=13.62ms  P50=22.46ms  P90=31.17ms  P99=49.15ms  MAX=65.50ms
+--- RUN 03 | WRITE | 6 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          837K      83.7K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=20.69ms  P50=31.82ms  P90=51.26ms  P99=107.33ms  MAX=360.45ms
+--- RUN 04 | WRITE | 8 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          786K      78.6K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=29.18ms  P50=43.26ms  P90=65.28ms  P99=282.88ms  MAX=444.42ms
+--- RUN 05 | WRITE | 10 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          695K      69.5K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=39.42ms  P50=57.31ms  P90=85.31ms  P99=382.46ms  MAX=712.19ms
+--- RUN 06 | WRITE | 12 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          522K      52.2K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=44.00ms  P50=69.38ms  P90=286.72ms  P99=677.89ms  MAX=1095.68ms
+--- RUN 07 | WRITE | 14 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          225K      22.5K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=70.72ms  P50=172.80ms  P90=733.70ms  P99=898.56ms  MAX=936.45ms
+--- RUN 08 | WRITE | 16 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          298K      29.8K/s            0          0/s        0        0      512
+  INSERT LAT (MS):  MIN=42.78ms  P50=275.97ms  P90=438.53ms  P99=480.25ms  MAX=483.33ms
+--- RUN 09 | READ | 1 CLIENT ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s            1          0/s        0        0      512
+  RANGE LAT (MS):  MIN=13.03s  P50=13.03s  P90=13.03s  P99=13.03s  MAX=13.03s
+    REC/RANGE:  147624.0
+--- RUN 10 | READ | 2 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s            4          0/s        0        0      512
+  RANGE LAT (MS):  MIN=6082.56ms  P50=6111.23ms  P90=8912.90ms  P99=8912.90ms  MAX=8912.90ms
+    REC/RANGE:  171931.0
+--- RUN 11 | READ | 4 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s            8          1/s        0        0      512
+  RANGE LAT (MS):  MIN=5279.74ms  P50=5332.99ms  P90=6381.57ms  P99=6381.57ms  MAX=6381.57ms
+    REC/RANGE:  150898.5
+--- RUN 12 | READ | 6 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s           18          2/s        0        0      512
+  RANGE LAT (MS):  MIN=3571.71ms  P50=4112.38ms  P90=5341.18ms  P99=5386.24ms  MAX=5386.24ms
+    REC/RANGE:  102585.8
+--- RUN 13 | READ | 8 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s           32          3/s        0        0      512
+  RANGE LAT (MS):  MIN=2392.06ms  P50=2697.22ms  P90=3459.07ms  P99=3506.18ms  MAX=3506.18ms
+    REC/RANGE:  62786.0
+--- RUN 14 | READ | 10 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s           50          5/s        0        0      512
+  RANGE LAT (MS):  MIN=1940.48ms  P50=2088.96ms  P90=2420.74ms  P99=2482.18ms  MAX=2482.18ms
+    REC/RANGE:  43664.4
+--- RUN 15 | READ | 12 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s           72          7/s        0        0      512
+  RANGE LAT (MS):  MIN=1708.03ms  P50=1858.56ms  P90=1979.39ms  P99=2026.49ms  MAX=2026.49ms
+    REC/RANGE:  33310.7
+--- RUN 16 | READ | 14 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s           84          8/s        0        0      512
+  RANGE LAT (MS):  MIN=1571.84ms  P50=1724.41ms  P90=1961.98ms  P99=2066.43ms  MAX=2066.43ms
+    REC/RANGE:  27239.1
+--- RUN 17 | READ | 16 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+             0          0/s          112         11/s        0        0      512
+  RANGE LAT (MS):  MIN=1445.89ms  P50=1552.38ms  P90=1782.78ms  P99=1972.22ms  MAX=2025.47ms
+    REC/RANGE:  21828.6
+--- RUN 18 | MIXED | 1 CLIENT ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+            39          4/s           36          4/s        0        0      512
+  INSERT LAT (MS):  MIN=0.795ms  P50=0.795ms  P90=0.795ms  P99=0.795ms  MAX=0.795ms
+  RANGE LAT (MS):  MIN=200.19ms  P50=267.26ms  P90=401.92ms  P99=429.06ms  MAX=429.06ms
+    REC/RANGE:  16816.0
+--- RUN 19 | MIXED | 2 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+            95         10/s           93          9/s        0        0      512
+  INSERT LAT (MS):  MIN=0.639ms  P50=0.639ms  P90=0.705ms  P99=0.705ms  MAX=0.705ms
+  RANGE LAT (MS):  MIN=148.22ms  P50=208.00ms  P90=263.17ms  P99=329.47ms  MAX=329.47ms
+    REC/RANGE:  10849.2
+--- RUN 20 | MIXED | 4 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+           287         29/s          292         29/s        0        0      512
+  INSERT LAT (MS):  MIN=1.04ms  P50=3.25ms  P90=6.81ms  P99=6.81ms  MAX=6.81ms
+  RANGE LAT (MS):  MIN=88.64ms  P50=126.66ms  P90=185.60ms  P99=255.36ms  MAX=265.73ms
+    REC/RANGE:  5006.2
+--- RUN 21 | MIXED | 6 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+           841         84/s          848         85/s        0        0      512
+  INSERT LAT (MS):  MIN=2.04ms  P50=4.60ms  P90=8.57ms  P99=8.57ms  MAX=8.57ms
+  RANGE LAT (MS):  MIN=49.44ms  P50=66.81ms  P90=91.07ms  P99=114.56ms  MAX=170.37ms
+    REC/RANGE:  2035.6
+--- RUN 22 | MIXED | 8 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          2.3K        229/s         2.2K        219/s        0        0      512
+  INSERT LAT (MS):  MIN=14.02ms  P50=20.14ms  P90=33.53ms  P99=33.53ms  MAX=33.53ms
+  RANGE LAT (MS):  MIN=23.71ms  P50=34.11ms  P90=51.74ms  P99=64.35ms  MAX=97.02ms
+    REC/RANGE:  339.9
+--- RUN 23 | MIXED | 10 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          3.0K        303/s         2.8K        284/s        0        0      512
+  INSERT LAT (MS):  MIN=12.18ms  P50=16.91ms  P90=22.27ms  P99=24.40ms  MAX=24.40ms
+  RANGE LAT (MS):  MIN=18.93ms  P50=34.85ms  P90=39.17ms  P99=44.41ms  MAX=62.91ms
+    REC/RANGE:  283.4
+--- RUN 24 | MIXED | 12 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          2.6K        262/s         2.5K        254/s        0        0      512
+  INSERT LAT (MS):  MIN=11.64ms  P50=33.44ms  P90=40.80ms  P99=41.53ms  MAX=41.53ms
+  RANGE LAT (MS):  MIN=33.76ms  P50=45.22ms  P90=57.98ms  P99=71.42ms  MAX=112.70ms
+    REC/RANGE:  459.6
+--- RUN 25 | MIXED | 14 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          2.3K        234/s         2.2K        223/s        0        0      512
+  INSERT LAT (MS):  MIN=12.24ms  P50=20.02ms  P90=40.29ms  P99=43.10ms  MAX=43.10ms
+  RANGE LAT (MS):  MIN=40.13ms  P50=61.70ms  P90=72.19ms  P99=79.81ms  MAX=112.19ms
+    REC/RANGE:  586.0
+--- RUN 26 | MIXED | 16 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          2.3K        234/s         2.3K        226/s        0        0      512
+  INSERT LAT (MS):  MIN=10.60ms  P50=26.64ms  P90=47.77ms  P99=48.38ms  MAX=48.38ms
+  RANGE LAT (MS):  MIN=36.48ms  P50=70.27ms  P90=81.22ms  P99=96.13ms  MAX=136.57ms
+    REC/RANGE:  634.8
+--- RUN 27 | TAIL | 1 CLIENT ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          5.3K        530/s          557         56/s        0        0      512
+  INSERT LAT (MS):  MIN=1.33ms  P50=2.81ms  P90=3.08ms  P99=3.12ms  MAX=3.12ms
+  RANGE LAT (MS):  MIN=12.94ms  P50=16.99ms  P90=20.11ms  P99=46.21ms  MAX=101.69ms
+    REC/RANGE:  715.4
+--- RUN 28 | TAIL | 2 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          8.2K        819/s          847         85/s        0        0      512
+  INSERT LAT (MS):  MIN=2.69ms  P50=3.12ms  P90=3.77ms  P99=4.22ms  MAX=4.22ms
+  RANGE LAT (MS):  MIN=17.98ms  P50=22.51ms  P90=26.91ms  P99=44.77ms  MAX=98.62ms
+    REC/RANGE:  940.7
+--- RUN 29 | TAIL | 4 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          9.0K        904/s         1.0K        100/s        0        0      512
+  INSERT LAT (MS):  MIN=0.625ms  P50=3.90ms  P90=4.82ms  P99=8.13ms  MAX=8.13ms
+  RANGE LAT (MS):  MIN=33.57ms  P50=38.21ms  P90=46.40ms  P99=54.43ms  MAX=85.82ms
+    REC/RANGE:  1330.5
+--- RUN 30 | TAIL | 6 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          8.1K        807/s          905         90/s        0        0      512
+  INSERT LAT (MS):  MIN=2.23ms  P50=4.96ms  P90=11.13ms  P99=13.65ms  MAX=13.65ms
+  RANGE LAT (MS):  MIN=51.55ms  P50=62.02ms  P90=74.69ms  P99=117.31ms  MAX=399.87ms
+    REC/RANGE:  1708.6
+--- RUN 31 | TAIL | 8 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          4.2K        423/s          458         46/s        0        0      512
+  INSERT LAT (MS):  MIN=1.75ms  P50=81.09ms  P90=120.25ms  P99=147.58ms  MAX=147.58ms
+  RANGE LAT (MS):  MIN=132.22ms  P50=164.99ms  P90=194.43ms  P99=487.17ms  MAX=583.68ms
+    REC/RANGE:  1871.7
+--- RUN 32 | TAIL | 10 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          8.9K        889/s          998        100/s        0        0      512
+  INSERT LAT (MS):  MIN=4.65ms  P50=17.57ms  P90=49.34ms  P99=54.81ms  MAX=54.81ms
+  RANGE LAT (MS):  MIN=80.64ms  P50=96.32ms  P90=113.47ms  P99=157.69ms  MAX=213.63ms
+    REC/RANGE:  1848.2
+--- RUN 33 | TAIL | 12 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          8.6K        862/s          958         96/s        0        0      512
+  INSERT LAT (MS):  MIN=2.39ms  P50=44.32ms  P90=93.31ms  P99=107.71ms  MAX=107.71ms
+  RANGE LAT (MS):  MIN=80.06ms  P50=124.16ms  P90=143.49ms  P99=156.54ms  MAX=206.72ms
+    REC/RANGE:  1803.7
+--- RUN 34 | TAIL | 14 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          9.3K        935/s         1.0K        103/s        0        0      512
+  INSERT LAT (MS):  MIN=2.87ms  P50=83.33ms  P90=149.76ms  P99=175.36ms  MAX=175.36ms
+  RANGE LAT (MS):  MIN=77.18ms  P50=133.50ms  P90=154.88ms  P99=171.78ms  MAX=216.32ms
+    REC/RANGE:  1766.3
+--- RUN 35 | TAIL | 16 CLIENTS ---
+       INSERTS    INSERTS/S       RANGES     RANGES/S   ERRORS     SSTS    BATCH
+          9.0K        895/s          959         96/s        0        0      512
+  INSERT LAT (MS):  MIN=0.826ms  P50=89.47ms  P90=171.26ms  P99=175.36ms  MAX=175.36ms
+  RANGE LAT (MS):  MIN=84.35ms  P50=164.48ms  P90=184.32ms  P99=225.41ms  MAX=272.38ms
+    REC/RANGE:  1906.0
+
+--- SATURATION (Write) ---
+  PEAK THRPUT:  85.0K/s at 4 clients
+         DROP:  83.7K/s -> 78.6K/s from 6 -> 8 clients
+         DROP:  78.6K/s -> 69.5K/s from 8 -> 10 clients
+         DROP:  69.5K/s -> 52.2K/s from 10 -> 12 clients
+         DROP:  52.2K/s -> 22.5K/s from 12 -> 14 clients
+
+--- SATURATION (Read) ---
+  PEAK THRPUT:  0/s at 0 clients
+         NONE:  1..16 clients
+
+--- SATURATION (Mixed) ---
+  PEAK THRPUT:  303/s at 10 clients
+         DROP:  303/s -> 262/s from 10 -> 12 clients
+         DROP:  262/s -> 234/s from 12 -> 14 clients
+
+--- SATURATION (Tail) ---
+  PEAK THRPUT:  935/s at 14 clients
+         DROP:  904/s -> 807/s from 4 -> 6 clients
+         DROP:  807/s -> 423/s from 6 -> 8 clients
+

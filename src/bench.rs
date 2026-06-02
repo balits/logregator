@@ -88,6 +88,9 @@ pub struct BenchmarkArgs {
 
     #[arg(long)]
     pub tag: Option<String>,
+
+    #[arg(long)]
+    pub external_server: Option<bool>,
 }
 
 // for `Instant` fields: uses the current time.
@@ -231,6 +234,7 @@ impl ClientResult {
             failed_inserts: self.inserts_failed,
             failed_ranges: self.ranges_failed,
             avg_records_per_range: avg_rec,
+            // populated post-construction by the benchmark runner from engine metrics or disk count
             sstable_count: 0,
         }
     }
@@ -241,7 +245,8 @@ impl ClientResult {
 pub struct BenchmarkResult {
     pub args: BenchmarkArgs,
     pub runs: Vec<RunResult>,
-    pub metrics: metrics::MetricsSnapshot,
+    #[serde(default)]
+    pub metrics: Option<metrics::MetricsSnapshot>,
     #[serde(default)]
     pub saturations: Vec<Saturation>,
     pub mem: Option<mem_profile::MemReport>,

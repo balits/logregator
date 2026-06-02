@@ -55,12 +55,10 @@ impl Server {
             let metrics = metrics.clone();
             metrics.server.connections_accepted.inc(1);
             metrics.server.connections_active.add(1);
-            let span = tracing::info_span!("conn", %addr);
+            let span = tracing::trace_span!("conn", %addr);
             tokio::spawn(
                 async move {
-                    if let Err(e) =
-                        Self::handle_conn(conn, addr, cmd_tx, batch_size, metrics)
-                            .await
+                    if let Err(e) = Self::handle_conn(conn, addr, cmd_tx, batch_size, metrics).await
                     {
                         tracing::error!(error = %e, "connection handler failed");
                     }
@@ -79,7 +77,7 @@ impl Server {
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<()> {
         metrics.server.connections_active.add(1);
-        tracing::info!("server.handle_conn: handling {addr}");
+        tracing::trace!("server.handle_conn: handling {addr}");
         let _ = conn.set_nodelay(true);
         let mut framed = Framed::new(conn, proto::ServerCodec);
 
@@ -180,10 +178,25 @@ impl Server {
                         .await
                         .context("server.handle_conn(cmd=RANGE): failed to reply to connection with end/error")?;
                 }
+                proto::ClientMessage::Metrics => {
+                    let (tx, rx) = oneshot::channel();
+                    cmd_tx.send(proto::Command::Metrics(tx)).await.context(
+                        "server.handle_conn(cmd=METRICS): failed to send metrics cmd to engine",
+                    )?;
+                    let json = rx
+                        .await
+                        .context("server.handle_conn(cmd=METRICS): failed to await cmd result")?
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+                    metrics.server.frames_written.inc(1);
+                    framed
+                        .send(ServerMessage::Metrics(json))
+                        .await
+                        .context("server.handle_conn(cmd=METRICS): failed to reply to connection")?;
+                }
             };
         }
 
-        tracing::info!("server.handle_conn: {addr} disconnected");
+        tracing::trace!("server.handle_conn: {addr} disconnected");
         metrics.server.connections_active.add(-1);
         Ok(())
     }
@@ -191,21 +204,17 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        tracing::info!("server.main_loop: closing server");
+        tracing::trace!("server.main_loop: closing server");
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
-    use tempfile::tempdir;
-    use tokio::sync::mpsc;
+    use std::time::Duration;
 
     use crate::client::Client;
     use crate::proto;
-    use crate::storage::{Backend, Engine};
-    use crate::storage::compaction::{CompactionCommand, CompactionResult};
-
-    use super::Server;
+    use crate::runtime::RuntimeBuilder;
 
     fn make_insert(source_id: i64, ts: i64, key: &str, value: &str) -> proto::Insert {
         proto::Insert {
@@ -216,32 +225,22 @@ mod integration_tests {
         }
     }
 
-    async fn setup() -> (crate::client::Client, tempfile::TempDir) {
-        let dir = tempdir().unwrap();
-        let batch_size = 64;
-        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let m1 = metrics.clone();
-        let (cmd_sender, cmd_reciever) = mpsc::channel::<proto::Command>(batch_size);
-        let (compaction_cmd_sender, compaction_cmd_recv) = mpsc::channel::<CompactionCommand>(1);
-        let (compaction_result_sender, compaction_result_recv) = mpsc::channel::<CompactionResult>(1);
+    async fn setup() -> (Client, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
 
-        let mut engine =
-            Engine::open(dir.path().join("data"), 1024, compaction_cmd_sender.clone()).unwrap();
-        engine.set_metrics(&metrics);
-        let mut backend = Backend::new(engine, compaction_cmd_sender.clone(), compaction_result_recv);
-        tokio::spawn(async move { backend.engine_loop(cmd_reciever).await });
-        tokio::spawn(async move {
-            crate::storage::compaction::compaction_loop(compaction_cmd_recv, compaction_result_sender, Some(metrics))
-                .await
-        });
-
-        let server = Server::new(Some("127.0.0.1:0".parse().unwrap()))
+        let rt = RuntimeBuilder::new()
+            .data_dir(data_dir)
+            .server_addr("127.0.0.1:0")
+            .channel_capacity(64)
+            .spawn()
             .await
             .unwrap();
-        let addr = server.addr();
-        tokio::spawn(async move { server.run_main_loop(cmd_sender, m1).await });
 
-        let client = Client::connect(&addr.to_string()).await.unwrap();
+        let addr = rt.server_addr.to_string();
+        drop(rt);
+
+        let client = Client::connect(&addr).await.unwrap();
         (client, dir)
     }
 
@@ -312,39 +311,36 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_insert_flush_then_range() {
-        let dir = tempdir().unwrap();
-        let batch_size = 64;
-        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let (cmd_tx, cmd_rx) = mpsc::channel::<proto::Command>(batch_size);
-        let (compaction_tx, compaction_rx) = mpsc::channel::<CompactionCommand>(1);
-        let (result_tx, result_rx) = mpsc::channel::<CompactionResult>(1);
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
 
-        let mut engine = Engine::open(dir.path().join("data"), 80, compaction_tx.clone()).unwrap();
-        engine.set_metrics(&metrics);
-        let mut backend = Backend::new(engine, compaction_tx, result_rx);
-        let m1 = metrics.clone();
-        tokio::spawn(async move { backend.engine_loop(cmd_rx).await });
-        tokio::spawn(async move {
-            crate::storage::compaction::compaction_loop(compaction_rx, result_tx, Some(metrics))
-                .await
-        });
-
-        let server = Server::new(Some("127.0.0.1:0".parse().unwrap()))
+        let rt = RuntimeBuilder::new()
+            .data_dir(data_dir)
+            .server_addr("127.0.0.1:0")
+            .channel_capacity(64)
+            .memtable_limit_bytes(80)
+            .spawn()
             .await
             .unwrap();
-        let addr = server.addr();
-        tokio::spawn(async move { server.run_main_loop(cmd_tx, m1).await });
 
-        let mut client = Client::connect(&addr.to_string()).await.unwrap();
+        let addr = rt.server_addr.to_string();
+        drop(rt);
 
+        let mut client = Client::connect(&addr).await.unwrap();
+
+        // Insert a small record, then a large one that pushes us over the
+        // 80-byte memtable limit and triggers a flush.
         client
             .insert(make_insert(1, 10, "sys", "small"))
             .await
             .unwrap();
         client
-            .insert(make_insert(1, 20, "sys", "massive_payload_to_force_flush"))
+            .insert(make_insert(1, 20, "sys", "large_payload_to_force_flush"))
             .await
             .unwrap();
+
+        // Give the flush a moment to complete.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let results = client
             .range(proto::Range {

@@ -104,9 +104,7 @@ async fn run_main() -> anyhow::Result<()> {
                 Err(e) => {
                     tracing::error!("failed to insert record: {e}")
                 }
-                Ok(_) => {
-                    tracing::info!("insert succesful")
-                }
+                Ok(_) => {}
             }
         }
         Command::Range {
@@ -129,13 +127,7 @@ async fn run_main() -> anyhow::Result<()> {
                 Err(e) => {
                     tracing::error!("failed to range over record: {e}")
                 }
-                Ok(records) => {
-                    let len = records.len();
-                    tracing::info!("range succesful, retrieved {len} logs:");
-                    for rec in records {
-                        tracing::info!("{rec}")
-                    }
-                }
+                Ok(_) => {}
             }
         }
         _ => unimplemented!(),

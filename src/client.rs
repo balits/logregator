@@ -56,6 +56,23 @@ impl Client {
         }
     }
 
+    pub async fn get_metrics(&mut self) -> anyhow::Result<String> {
+        self.framed
+            .send(ClientMessage::Metrics)
+            .await
+            .context("client.get_metrics: failed to send metrics request")?;
+        match self.framed.next().await {
+            Some(Ok(ServerMessage::Metrics(json))) => Ok(json),
+            Some(Ok(ServerMessage::Error(e))) => Err(format_err!(e)),
+            Some(Ok(resp)) => Err(format_err!(
+                "client.get_metrics: unexpected response: {:?}",
+                resp
+            )),
+            Some(Err(e)) => Err(format_err!(e)),
+            None => Err(format_err!("client.get_metrics: connection closed")),
+        }
+    }
+
     pub async fn range(&mut self, range: proto::Range) -> anyhow::Result<Vec<proto::Record>> {
         let mut v = Vec::with_capacity(64);
         let msg = ClientMessage::Range(range);

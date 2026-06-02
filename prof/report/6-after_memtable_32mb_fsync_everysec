@@ -1,0 +1,62 @@
+# 6 — 32 MB memtable + timer fsync (every 1s) — write breakthrough
+
+## Server
+```
+cargo run --release --bin server -- \
+  --addr 127.0.0.1:4321 --profile none --log-level error \
+  --memtable-mb 32 --fsync-interval 1000
+```
+
+## Benchmark command
+```
+cargo run --bin benchmark --release -- loadgen \
+  --workloads write,read,mixed,tail \
+  --concurrency-min 1 --concurrency-max 16 --concurrency-step 2 \
+  --duration-secs 30 --profile-mem 1000 \
+  --tag latest --external-server true --addr 127.0.0.1:4321
+```
+
+## Results (significantly improved writes)
+
+### Write throughput
+
+| Clients | Inserts/s | P50(ms) | P90(ms) | P99(ms) | Max(ms) | SSTs |
+|--------:|----------:|--------:|--------:|--------:|--------:|-----:|
+| 1 | 122.6K | 3.67 | 5.49 | 8.29 | 114.50 | 9 |
+| 2 | 91.7K | 10.52 | 13.20 | 21.60 | 92.86 | 13 |
+| 4 | 82.7K | 23.50 | 28.41 | 57.15 | 138.37 | 14 |
+| 6 | 74.3K | 39.10 | 48.45 | 85.89 | 189.69 | 17 |
+| 8 | 68.2K | 54.30 | 68.80 | 214.91 | 447.23 | 17 |
+| 10 | 69.3K | 71.49 | 80.06 | 147.97 | 255.10 | 20 |
+| 12 | 69.6K | 85.82 | 97.09 | 147.97 | 257.28 | 20 |
+| 14 | 68.9K | 101.57 | 115.58 | 156.67 | 213.76 | 21 |
+| 16 | 63.2K | 121.66 | 147.58 | 260.48 | 492.80 | 21 |
+
+### Read phase
+Single-client range: ~10.6s for 226 K records. Throttles up to 8/s at 16 clients with ~1.9–2.0s P50 latency.
+
+### Mixed phase
+~20 ops/s peak (inserts + ranges). Reads still dominate, stalling inserts.
+
+### Tail phase
+~211 ops/s peak at 10 clients (190 inserts/s + 21 ranges/s).
+
+## Flamegraph (write-heavy workload)
+- **Compaction**: ~26 % CPU (down from 66.7 % in earlier runs)
+- **Blocking pool**: ~76 % (idle/parked most of the time, compaction when active)
+- **Tokio runtime**: ~13 % (server I/O + insert path)
+- **Record sorting**: ~5 %
+- **Allocation**: ~5 %
+- **fsync**: <1 % (once per second → negligible)
+
+## Key improvements over previous runs
+1. Write throughput **+47 %** peak (83.3K → 122.6K)
+2. P50 latency **−38 %** (5.97ms → 3.67ms)  
+3. P99 latency **−46 %** (15.37ms → 8.29ms)
+4. Compaction CPU **−61 %** (66.7 % → 26 %)
+
+## Takeaways
+- Timer-based fsync almost eliminates sync overhead
+- 32 MB memtable keeps flush rate low → stable SST count (9–21)
+- Compaction no longer the dominant bottleneck
+- **Reads are now the main performance problem** (range scans merge across many SSTs)

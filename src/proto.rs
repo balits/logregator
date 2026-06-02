@@ -10,6 +10,8 @@
 //! | 0x81      | InsertOk (server)    | *no payload* |
 //! | 0x82      | RangeRecord (server) | [[source_id: i64 BE]][[ts: i64 BE]][[seq: u64 BE]][[key_len: u32 BE]][[key: key_len bytes]][[value_len: u32 BE]][[value: value_len bytes]] |
 //! | 0x83      | RangeEnd (server)    | *no payload* |
+//! | 0x04      | Metrics (client)     | *no payload* |
+//! | 0x84      | Metrics (server)     | [[json_len: u32 BE]][[json: json_len bytes]] |
 //! | 0xFF      | Error (server)       | [[err_len: u32 BE]][[err: err_len bytes]] |
 
 use std::{fmt::Display, io};
@@ -54,6 +56,7 @@ pub enum ClientMessage {
     Insert(Insert),
     Range(Range),
     BatchInsert(BatchInsert),
+    Metrics,
 }
 
 #[derive(Debug)]
@@ -94,6 +97,7 @@ pub enum ServerMessage {
     InsertOk,
     RangeRecord(Record),
     RangeEnd,
+    Metrics(String),
     Error(String),
 }
 
@@ -112,6 +116,7 @@ pub enum Command {
         oneshot::Sender<anyhow::Result<()>>,
         mpsc::Sender<Vec<Record>>,
     ),
+    Metrics(oneshot::Sender<anyhow::Result<String>>),
 }
 
 // Server codec is used to decode client messages and encode server messages
@@ -147,6 +152,7 @@ impl Decoder for ServerCodec {
             0x03 => decode_batch_insert(frame.as_ref())
                 .map(|b| Some(ClientMessage::BatchInsert(b)))
                 .map_err(io::Error::other),
+            0x04 => Ok(Some(ClientMessage::Metrics)),
             t => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("server_codec.decode: unknown message type: {t:#04x}"),
@@ -171,6 +177,11 @@ impl Encoder<ServerMessage> for ServerCodec {
             }
             ServerMessage::RangeEnd => {
                 dst.put_u8(0x83);
+            }
+            ServerMessage::Metrics(json) => {
+                dst.put_u8(0x84);
+                dst.put_u32(json.len() as u32);
+                dst.put_slice(json.as_bytes());
             }
             ServerMessage::Error(err) => {
                 dst.put_u8(0xFF);
@@ -338,6 +349,9 @@ impl Encoder<ClientMessage> for ClientCodec {
                     dst.put_slice(i.value.as_bytes());
                 }
             }
+            ClientMessage::Metrics => {
+                dst.put_u8(0x04);
+            }
         }
         let frame_len = dst.len() - start - LENGTH_SZ;
         dst[start..start + LENGTH_SZ].copy_from_slice(&(frame_len as u32).to_be_bytes());
@@ -371,6 +385,9 @@ impl Decoder for ClientCodec {
                 .map(Some)
                 .map_err(io::Error::other),
             0x83 => Ok(Some(ServerMessage::RangeEnd)),
+            0x84 => decode_metrics(frame.as_ref())
+                .map(Some)
+                .map_err(io::Error::other),
             0xFF => decode_server_error(frame.as_ref())
                 .map(|e| Some(ServerMessage::Error(e)))
                 .map_err(io::Error::other),
@@ -417,4 +434,13 @@ fn decode_server_error(buf: &[u8]) -> anyhow::Result<String> {
         array4(buf, 0).context("decode_server_error: failed to read error message length")?,
     ) as usize;
     from_utf8(&buf[4..4 + msg_len]).context("decode_server_error: failed to decode error message")
+}
+
+fn decode_metrics(buf: &[u8]) -> anyhow::Result<ServerMessage> {
+    let json_len = u32::from_be_bytes(
+        array4(buf, 0).context("decode_metrics: failed to read json length")?,
+    ) as usize;
+    let json = from_utf8(&buf[4..4 + json_len])
+        .context("decode_metrics: failed to decode metrics json")?;
+    Ok(ServerMessage::Metrics(json))
 }

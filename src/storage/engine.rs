@@ -1,58 +1,79 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self},
     io::{self, Read, Seek, SeekFrom},
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
+    path::{Path, PathBuf},
+    sync::Arc
 };
 
 use anyhow::{Context, bail};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::instrument;
 
-use crate::metrics::Metrics;
-use crate::proto;
 use crate::storage::{
     BloomFilter, IndexBlock, SSTableMeta,
-    compaction::{self, CompactionCommand},
-    iter::{MemTableIterOwned, MergeIter, RecordIter, SSTableIter},
+    iter::{MergeIter, RecordIter, SSTableIterFiltered},
+    memtable::IntoIterFiltered,
     record::Record,
 };
 use crate::storage::{MemTable, Wal};
+use crate::{metrics::Metrics, proto};
 
 pub struct Engine {
-    pub(crate) dir: PathBuf,
-    pub(crate) wal: Wal,
-    pub(crate) compaction_tx: mpsc::Sender<CompactionCommand>,
+    /// path of the base storage directory
+    base_dir: PathBuf,
 
-    pub(crate) memtable: MemTable,
-    pub(crate) sstable_map: BTreeMap<u64, SSTableMeta>,
-    pub(crate) sst_counter: u64,
-    pub(crate) seq_counter: u64,
-    pub(crate) stats_tx: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize)>>,
-    pub(crate) metrics: Option<Arc<Metrics>>,
+    /// Write ahead log file for durability. Using group commit,
+    /// after N commands an fsync message is passed to the backgroud
+    /// IoWorker, which syncs the file asynchronously, after the client
+    /// got the result.
+    wal: Wal,
+
+    /// Main memtable used to hold records. When full, its moved
+    /// to a frozen memtable and cleared
+    memtable: MemTable,
+
+    /// A map of frozen, inmutable memtables who are waiting to be flushed in the background.
+    /// They are still readable until the flush completes and are removed from the map.
+    /// They are shared with the IoWorker which does the actual flushing:
+    /// both operations are read-only, so an Arc without mutexes is fine.
+    frozen_memtables: BTreeMap<u64, Arc<MemTable>>,
+
+    /// ordered collection of SSTableMetas by their file_ids
+    sstable_map: BTreeMap<u64, SSTableMeta>,
+
+    /// set of SSTable IDs currently being compacted (in-flight).
+    /// Prevents duplicate compaction commands for the same files.
+    compacting: BTreeSet<u64>,
+
+    /// counter of sstable file ids
+    sst_counter: u64,
+    /// counter of log record sequnce numbers
+    seq_counter: u64,
+    /// optional channel to send information about
+    /// engine internals (needs refinement)
+    stats_tx: Option<UnboundedSender<(usize, usize)>>,
+
+    /// memtable capacity in bytes, used as a compaction trigger threshold
+    memtable_limit_bytes: usize,
 }
 
 impl Engine {
-    #[instrument(skip(compaction_tx), fields(dir = %dir.display()))]
-    pub fn open(
-        dir: PathBuf,
-        memtable_limit: usize,
-        compaction_tx: mpsc::Sender<CompactionCommand>,
-    ) -> anyhow::Result<Self> {
-        if !dir.exists() {
-            fs::create_dir_all(&dir).context("engine.open: directory does not exist")?;
+    #[instrument(fields(base_dir = %base_dir.display()))]
+    pub fn open(base_dir: PathBuf, memtable_limit: usize) -> anyhow::Result<(Self, bool)> {
+        if !base_dir.exists() {
+            fs::create_dir_all(&base_dir).context("engine.open: failed to create base directory")?;
         }
+        fs::create_dir_all(base_dir.join(Wal::WAL_DIR)).context("engine.open: failed to create WAL directory")?;
 
-        let wal_path = dir.join(Wal::WAL_PATH_FMT);
-        let mut memtable = MemTable::new(memtable_limit);
-        let mut wal = Wal::new(&wal_path).context("engine.open: failed to create wal")?;
+        let wal = Wal::open_active(&base_dir).context("engine.open: failed to create wal")?;
 
-        let recovered = wal.recover().context("engine.open: failed recover WAL")?;
         let mut max_seq_num = 0u64;
         let mut needs_flush = false;
+        let mut memtable = MemTable::new(memtable_limit);
 
+        let recovered =
+            Wal::recover_all(&base_dir).context("engine.open: failed to recover all WAL files")?;
         for rec in recovered {
             if let Ok(seq) = rec.extract_seq_num() {
                 max_seq_num = max_seq_num.max(seq);
@@ -60,7 +81,7 @@ impl Engine {
             needs_flush = memtable.insert(rec);
         }
 
-        let mut sstables: Vec<PathBuf> = std::fs::read_dir(&dir)
+        let mut sstables: Vec<PathBuf> = std::fs::read_dir(&base_dir)
             .context("engine.open: failed to read sstable directory contents")?
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -72,7 +93,7 @@ impl Engine {
         let mut sstable_map = BTreeMap::new();
 
         // scan existing sstables for max seq_num
-        for path in &sstables {
+        for path in sstables.into_iter() {
             let file_id = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -83,8 +104,13 @@ impl Engine {
 
             let f = std::fs::OpenOptions::new()
                 .read(true)
-                .open(path)
-                .context("engine.open: failed to open sstable for seq scan")?;
+                .open(&path)
+                .with_context(|| {
+                    format!(
+                        "engine.open: failed to open {} for seq scan",
+                        path.as_path().display()
+                    )
+                })?;
 
             let mut r = io::BufReader::new(f);
             let mut num_records = 0usize;
@@ -133,39 +159,24 @@ impl Engine {
             sstable_map.insert(file_id, meta);
         }
 
-        let mut e = Self {
-            dir,
+        let e = Self {
+            base_dir,
             wal,
             memtable,
+            frozen_memtables: BTreeMap::new(),
             sstable_map,
+            compacting: BTreeSet::new(),
             sst_counter: max_sst_id + 1,
             seq_counter: max_seq_num + 1,
-            compaction_tx,
             stats_tx: None,
-            metrics: None,
+            memtable_limit_bytes: memtable_limit,
         };
 
-        if needs_flush {
-            e.flush_inner()
-                .context("engine.open: failed to flush to SSTable after recovering logs")?;
-        }
-
-        Ok(e)
-    }
-
-    pub fn set_stats_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<(usize, usize)>) {
-        self.stats_tx = Some(tx);
-    }
-
-    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
-        let m = metrics.clone();
-        m.engine.memtable_limit.set(self.memtable.capacity() as i64);
-        self.metrics = Some(m.clone());
-        self.wal.set_metrics(&m);
+        Ok((e, needs_flush))
     }
 
     #[instrument(skip(self, value), fields(source_id, ts, key))]
-    pub fn insert(
+    pub fn insert_record(
         &mut self,
         source_id: i64,
         ts: i64,
@@ -185,7 +196,7 @@ impl Engine {
     }
 
     #[instrument(skip(self, inserts))]
-    pub fn batch_insert(&mut self, inserts: Vec<proto::Insert>) -> anyhow::Result<bool> {
+    pub fn batch_insert_records(&mut self, inserts: Vec<proto::Insert>) -> anyhow::Result<bool> {
         let count = inserts.len();
         let mut records: Vec<Record> = Vec::with_capacity(count);
 
@@ -213,145 +224,6 @@ impl Engine {
         Ok(needs_flush)
     }
 
-    #[instrument(skip(self))]
-    fn flush_inner(&mut self) -> anyhow::Result<()> {
-        let _t0 = Instant::now();
-        let file_id = self.sst_counter;
-        let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
-        self.memtable.clear();
-
-        if memtable_records.is_empty() {
-            return Ok(());
-        }
-
-        let path = SSTableMeta::format_file_path(&self.dir, file_id);
-        let records_len = memtable_records.len();
-        let new_meta =
-            SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
-                .context("engine.flush: failed to write sstable file")?;
-
-        self.sstable_map.insert(file_id, new_meta);
-        self.sst_counter += 1;
-        let need_compaction = self.sstable_map.len() >= 4;
-
-        self.wal
-            .sync()
-            .context("engine.flush: failed to sync WAL before clear")?;
-        self.wal
-            .clear()
-            .context("engine.flush: failed to clear WAL")?;
-
-        if let Some(ref m) = self.metrics {
-            m.engine.flush_count.inc(1);
-            m.engine.flush_duration.record_instant(_t0);
-        }
-
-        if need_compaction {
-            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
-
-            let new_file_id = self.sst_counter;
-            let new_file_path = self.dir.join(format!("{:010}.sst", new_file_id));
-            let cmd = compaction::CompactionCommand {
-                new_file_id,
-                new_file_path,
-                tables,
-            };
-
-            if let Err(e) = self.compaction_tx.try_send(cmd) {
-                tracing::warn!(error = %e, "failed to issue compaction, compactor queue is full")
-            }
-        }
-
-        Ok(())
-    }
-
-
-    pub fn handle_compaction(&mut self, new_meta: SSTableMeta, ids_to_remove: Vec<u64>) {
-        let _t0 = Instant::now();
-        for file_id in ids_to_remove {
-            self.sstable_map.remove(&file_id);
-            let file_path = SSTableMeta::format_file_path(&self.dir, file_id);
-            if let Err(e) = fs::remove_file(&file_path) {
-                tracing::error!(error = %e, "engine.loop: failed to remove file {}", file_path.display())
-            }
-        }
-        self.sstable_map.insert(new_meta.id, new_meta);
-
-        if self.sstable_map.len() >= 4 {
-            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
-            let new_file_id = self.sst_counter;
-            let new_file_path = SSTableMeta::format_file_path(&self.dir, new_file_id);
-            let cmd = compaction::CompactionCommand {
-                new_file_id,
-                new_file_path,
-                tables,
-            };
-            if let Err(e) = self.compaction_tx.try_send(cmd) {
-                tracing::warn!(error = %e, "engine.loop: re-trigger compaction failed")
-            }
-        }
-
-        if let Some(ref m) = self.metrics {
-            m.engine.compaction_count.inc(1);
-            m.engine.compaction_duration.record_instant(_t0);
-        }
-    }
-
-    #[instrument(skip(self))]
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
-        let _t0 = Instant::now();
-        let file_id = self.sst_counter;
-        let memtable_records: Vec<Record> = self.memtable.iter().cloned().collect();
-        self.memtable.clear();
-
-        if memtable_records.is_empty() {
-            return Ok(());
-        }
-
-        // Clear WAL synchronously (fast) before spawning SSTable I/O.
-        // New inserts during the spawn_blocking will append to the fresh WAL.
-        self.wal
-            .clear()
-            .context("engine.flush: failed to clear WAL")?;
-
-        let path = SSTableMeta::format_file_path(&self.dir, file_id);
-        let records_len = memtable_records.len();
-
-        let new_meta = tokio::task::spawn_blocking(move || {
-            SSTableMeta::write_to_file(path, file_id, memtable_records.into_iter(), records_len)
-                .context("engine.flush: failed to write sstable file (on bg task)")
-        })
-        .await
-        .context("engine.flush: spawn_blocking join failed (on bg task)")?
-        .context("engine.flush: I/O failed (on bg task)")?;
-
-        self.sstable_map.insert(file_id, new_meta);
-        self.sst_counter += 1;
-        let need_compaction = self.sstable_map.len() >= 4;
-
-        if let Some(ref m) = self.metrics {
-            m.engine.flush_count.inc(1);
-            m.engine.flush_duration.record_instant(_t0);
-        }
-
-        if need_compaction {
-            let tables: Vec<SSTableMeta> = self.sstable_map.values().cloned().collect();
-            let new_file_id = self.sst_counter;
-            let new_file_path = SSTableMeta::format_file_path(self.dir.as_path(), new_file_id);
-            let cmd = compaction::CompactionCommand {
-                new_file_id,
-                new_file_path,
-                tables,
-            };
-
-            if let Err(e) = self.compaction_tx.try_send(cmd) {
-                tracing::warn!(error = %e, "failed to issue compaction, compactor queue is full")
-            }
-        }
-
-        Ok(())
-    }
-
     #[instrument(skip(self, filter), fields(source_id, key, start_ts, end_ts))]
     pub fn range(
         &self,
@@ -368,16 +240,34 @@ impl Engine {
             bail!("engine.range: start_ts cannot be negative")
         }
 
-        let memtable_records: Vec<Record> = self.memtable.range_cloned(source_id, start_ts, end_ts);
-
-        let memtable_iter = MemTableIterOwned::filtered(
-            memtable_records,
-            source_id,
-            key.as_bytes(),
-            start_ts,
-            end_ts,
-            filter,
-        );
+        let memtable_iter = if self.frozen_memtables.is_empty() {
+            IntoIterFiltered::new(
+                self.memtable.clone_range(source_id, start_ts, end_ts),
+                source_id,
+                key.as_bytes(),
+                start_ts,
+                end_ts,
+                filter,
+            )
+        } else {
+            let mut all_mem_records = BTreeSet::new();
+            for rec in self.memtable.clone_range(source_id, start_ts, end_ts) {
+                all_mem_records.insert(rec);
+            }
+            for (_, frozen) in self.frozen_memtables.iter() {
+                for rec in frozen.clone_range(source_id, start_ts, end_ts) {
+                    all_mem_records.insert(rec);
+                }
+            }
+            IntoIterFiltered::new(
+                all_mem_records.into_iter().collect(),
+                source_id,
+                key.as_bytes(),
+                start_ts,
+                end_ts,
+                filter,
+            )
+        };
         let sstable_iters: Vec<RecordIter> = self.sstable_map
             .values()
             .filter_map(|meta| {
@@ -385,20 +275,123 @@ impl Engine {
                     return None
                 }
 
-                let iter = SSTableIter::new(meta, source_id, key, start_ts, end_ts, filter)
+                let iter = SSTableIterFiltered::new(meta, source_id, key, start_ts, end_ts, filter)
                     .inspect_err(|e| {
                         tracing::error!(error = %e, "engine.range: failed to turn sstable path to iterator");
                     })
                     .ok()?;
-                let records: Vec<Record> = iter.collect();
-                if records.is_empty() {
-                    return None;
-                }
-                Some(RecordIter::Mem(records.into_iter()))
+                Some(RecordIter::Filtered(iter))
             })
             .collect();
 
         Ok(MergeIter::new(Some(memtable_iter), sstable_iters))
+    }
+
+    /// prepares all resources that the IoWorker would need for issuing
+    /// a flush command.
+    #[instrument(skip_all)]
+    pub fn prepare_flush(&mut self) -> (Arc<MemTable>, u64) {
+        let new_sst_id = self.sst_counter;
+        self.sst_counter += 1;
+
+        let shared = Arc::new(self.memtable.freeze());
+        self.frozen_memtables.insert(new_sst_id, shared.clone());
+
+        return (shared, new_sst_id);
+    }
+
+    pub fn remove_frozen_memtable(&mut self, id: u64) {
+        self.frozen_memtables.remove(&id);
+    }
+
+    pub fn insert_meta(&mut self, meta: SSTableMeta) {
+        self.sstable_map.insert(meta.id, meta);
+    }
+
+    pub fn remove_meta(&mut self, id: &u64) {
+        self.sstable_map.remove(id);
+    }
+
+    pub fn sstable_count(&self) -> usize {
+        self.sstable_map.len()
+    }
+
+    pub fn total_sstable_size(&self) -> u64 {
+        self.sstable_map.values().map(|m| m.file_size).sum()
+    }
+
+    pub fn memtable_capacity(&self) -> usize {
+        self.memtable_limit_bytes
+    }
+
+    pub fn set_stats_tx(&mut self, tx: UnboundedSender<(usize, usize)>) {
+        self.stats_tx = Some(tx);
+    }
+
+    pub fn set_metrics(&mut self, metrics: &Arc<Metrics>) {
+        let m = metrics.clone();
+        m.engine.memtable_limit.set(self.memtable.capacity() as i64);
+        self.wal.set_metrics(&m);
+    }
+
+    pub fn clone_base_dir(&self) -> PathBuf {
+        self.base_dir.clone()
+    }
+
+    pub fn is_memtable_empty(&self) -> bool {
+        self.memtable.is_empty()
+    }
+
+    pub fn memtable_size(&self) -> usize {
+        self.memtable.current_size()
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    pub fn send_stats(&self) {
+        if let Some(ref tx) = self.stats_tx {
+            let _ = tx.send((self.memtable.current_size(), self.sstable_map.len()));
+        }
+    }
+
+    #[instrument(skip_all, err)]
+    pub fn flush_wal_buffer(&mut self) -> anyhow::Result<()> {
+        self.wal.flush_buffer()
+    }
+
+    #[instrument(skip_all, err)]
+    pub fn rotate_wal(&mut self, sst_id: u64) -> anyhow::Result<PathBuf> {
+        let stale_path = self.wal.rotate(&self.base_dir, sst_id)?;
+        Ok(stale_path)
+    }
+
+    pub fn mark_compacting(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.compacting.insert(*id);
+        }
+    }
+
+    pub fn unmark_compacting(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.compacting.remove(id);
+        }
+    }
+
+    pub fn get_oldest_metas(&self, n: usize) -> Vec<SSTableMeta> {
+        self.sstable_map
+            .values()
+            .filter(|meta| !self.compacting.contains(&meta.id))
+            .take(n)
+            .cloned()
+            .collect()
+    }
+
+    pub fn allocate_sstable_id(&mut self) -> u64 {
+        let id = self.sst_counter;
+        self.sst_counter += 1;
+        id
     }
 }
 
@@ -408,8 +401,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_engine(dir: PathBuf, limit: usize) -> Engine {
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<CompactionCommand>(1);
-        Engine::open(dir, limit, cmd_tx).unwrap()
+        Engine::open(dir, limit).unwrap().0
     }
 
     #[test]
@@ -424,7 +416,10 @@ mod tests {
             "engine should create the data directory"
         );
         assert!(
-            engine_dir.join(Wal::WAL_PATH_FMT).exists(),
+            engine_dir
+                .join(Wal::WAL_DIR)
+                .join(Wal::ACTIVE_WAL_NAME)
+                .exists(),
             "engine should create the WAL file"
         );
 
@@ -445,7 +440,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
 
         assert!(
             engine
@@ -475,9 +470,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high").unwrap();
-        engine.insert(1, 30, "sys", "disk full").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "sys", "mem high").unwrap();
+        engine.insert_record(1, 30, "sys", "disk full").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 15, 35, "").unwrap().collect();
         assert_eq!(result.len(), 2);
@@ -494,8 +489,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "sys", "mem high").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 10, 20, "").unwrap().collect();
         assert_eq!(result.len(), 1);
@@ -510,11 +505,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "db", "query slow").unwrap();
-        engine.insert(1, 30, "sys", "flush_trigger_01").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "db", "query slow").unwrap();
+        engine
+            .insert_record(1, 30, "sys", "flush_trigger_01")
+            .unwrap();
 
-        engine.insert(1, 40, "db", "connection lost").unwrap();
+        engine
+            .insert_record(1, 40, "db", "connection lost")
+            .unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 2);
@@ -530,12 +529,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high").unwrap();
-        engine.insert(1, 30, "sys", "flush_trigger_01").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "sys", "mem high").unwrap();
+        engine
+            .insert_record(1, 30, "sys", "flush_trigger_01")
+            .unwrap();
 
-        engine.insert(1, 40, "sys", "disk full").unwrap();
-        engine.insert(1, 50, "sys", "all good").unwrap();
+        engine.insert_record(1, 40, "sys", "disk full").unwrap();
+        engine.insert_record(1, 50, "sys", "all good").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 20, 45, "").unwrap().collect();
         assert_eq!(result.len(), 3);
@@ -549,11 +550,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        engine.insert(1, 15, "sys", "first flush").unwrap();
-        engine.insert(1, 25, "sys", "flush_trigger_01").unwrap();
+        engine.insert_record(1, 15, "sys", "first flush").unwrap();
+        engine
+            .insert_record(1, 25, "sys", "flush_trigger_01")
+            .unwrap();
 
-        engine.insert(1, 20, "sys", "second flush entry").unwrap();
-        engine.insert(1, 45, "sys", "flush_trigger_02").unwrap();
+        engine
+            .insert_record(1, 20, "sys", "second flush entry")
+            .unwrap();
+        engine
+            .insert_record(1, 45, "sys", "flush_trigger_02")
+            .unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 20, 30, "").unwrap().collect();
         assert_eq!(result.len(), 2);
@@ -570,10 +577,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        engine.insert(1, 10, "sys", "flushed").unwrap();
-        engine.insert(1, 20, "sys", "flush_trigger_01").unwrap();
+        engine.insert_record(1, 10, "sys", "flushed").unwrap();
+        engine
+            .insert_record(1, 20, "sys", "flush_trigger_01")
+            .unwrap();
 
-        engine.insert(1, 30, "sys", "in memtable").unwrap();
+        engine.insert_record(1, 30, "sys", "in memtable").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 5, 35, "").unwrap().collect();
         assert_eq!(result.len(), 3);
@@ -591,28 +600,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        let sst_file_path = dir.path().join("0000000001.sst");
-
-        engine.insert(1, 1, "k1", "small").unwrap();
-        assert!(!sst_file_path.exists());
+        engine.insert_record(1, 1, "k1", "small").unwrap();
 
         let needs_flush = engine
-            .insert(1, 2, "k2", "this_is_a_massive_payload_to_force_a_flush")
+            .insert_record(1, 2, "k2", "this_is_a_massive_payload_to_force_a_flush")
             .unwrap();
         assert!(needs_flush, "insert should indicate flush is needed");
-        engine.flush_inner().unwrap();
-
-        assert!(
-            sst_file_path.exists(),
-            "Engine should have created 0000000001.sst"
-        );
-
-        assert_eq!(engine.memtable.size_hint(), 0);
-
-        let wal_metadata = std::fs::metadata(dir.path().join(Wal::WAL_PATH_FMT)).unwrap();
-        assert_eq!(wal_metadata.len(), 0);
-
-        assert_eq!(engine.sst_counter, 2);
     }
 
     fn make_insert(source_id: i64, ts: i64, key: &str, value: &str) -> proto::Insert {
@@ -635,7 +628,7 @@ mod tests {
             make_insert(1, 30, "sys", "disk full"),
         ];
 
-        engine.batch_insert(batch).unwrap();
+        engine.batch_insert_records(batch).unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 3);
@@ -658,7 +651,7 @@ mod tests {
             make_insert(1, 30, "sys", "c"),
         ];
 
-        engine.batch_insert(batch).unwrap();
+        engine.batch_insert_records(batch).unwrap();
 
         assert_eq!(engine.seq_counter, start_seq + 3);
 
@@ -679,18 +672,7 @@ mod tests {
             make_insert(1, 2, "sys", "this_is_a_massive_payload_to_force_a_flush"),
         ];
 
-        assert!(engine.batch_insert(batch).unwrap());
-
-        engine.flush_inner().unwrap();
-
-        // should have flushed to SSTable
-        let sst_file_path = dir.path().join("0000000001.sst");
-        assert!(sst_file_path.exists(), "batch insert should trigger flush");
-
-        assert_eq!(engine.memtable.size_hint(), 0);
-
-        let wal_metadata = std::fs::metadata(dir.path().join(Wal::WAL_PATH_FMT)).unwrap();
-        assert_eq!(wal_metadata.len(), 0);
+        assert!(engine.batch_insert_records(batch).unwrap());
     }
 
     #[test]
@@ -702,10 +684,10 @@ mod tests {
             make_insert(1, 5, "sys", "first"),
             make_insert(1, 10, "sys", "second"),
         ];
-        engine.batch_insert(batch).unwrap();
+        engine.batch_insert_records(batch).unwrap();
 
         // standalone insert after batch
-        engine.insert(1, 15, "sys", "third").unwrap();
+        engine.insert_record(1, 15, "sys", "third").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 20, "").unwrap().collect();
         assert_eq!(result.len(), 3);
@@ -723,13 +705,13 @@ mod tests {
             make_insert(1, 10, "sys", "batch1_a"),
             make_insert(1, 20, "sys", "batch1_b"),
         ];
-        engine.batch_insert(batch1).unwrap();
+        engine.batch_insert_records(batch1).unwrap();
 
         let batch2 = vec![
             make_insert(1, 30, "sys", "batch2_a"),
             make_insert(1, 40, "sys", "batch2_b"),
         ];
-        engine.batch_insert(batch2).unwrap();
+        engine.batch_insert_records(batch2).unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 4);
@@ -750,9 +732,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high").unwrap();
-        engine.insert(1, 30, "sys", "disk full").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "sys", "mem high").unwrap();
+        engine.insert_record(1, 30, "sys", "disk full").unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
         assert_eq!(result.len(), 3);
@@ -763,10 +745,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high pressure").unwrap();
-        engine.insert(1, 30, "sys", "disk full").unwrap();
-        engine.insert(1, 40, "sys", "memory leak detected").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine
+            .insert_record(1, 20, "sys", "mem high pressure")
+            .unwrap();
+        engine.insert_record(1, 30, "sys", "disk full").unwrap();
+        engine
+            .insert_record(1, 40, "sys", "memory leak detected")
+            .unwrap();
 
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "mem").unwrap().collect();
         assert_eq!(result.len(), 2);
@@ -781,8 +767,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 1024);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "mem high").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine.insert_record(1, 20, "sys", "mem high").unwrap();
 
         let result: Vec<_> = engine
             .range(1, "sys", 0, 100, "nonexistent")
@@ -796,9 +782,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = open_engine(dir.path().to_path_buf(), 50);
 
-        engine.insert(1, 10, "sys", "cpu normal").unwrap();
-        engine.insert(1, 20, "sys", "first flush trigger").unwrap();
-        engine.insert(1, 30, "sys", "disk full").unwrap();
+        engine.insert_record(1, 10, "sys", "cpu normal").unwrap();
+        engine
+            .insert_record(1, 20, "sys", "first flush trigger")
+            .unwrap();
+        engine.insert_record(1, 30, "sys", "disk full").unwrap();
 
         // all records flushed to SSTables, empty filter yields all
         let result: Vec<_> = engine.range(1, "sys", 0, 100, "").unwrap().collect();
