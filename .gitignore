@@ -1,5 +1,7 @@
-/target
-# data directory for load testing benchmarks
-/load_tests
+target/
+# data directory for load testing benchmarks (old)
+load_tests/
+# data directory for load testing benchmarks (new)
+bench/
 # data directory for regular server runs
-/server_data
+server_data/
