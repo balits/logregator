@@ -4,12 +4,13 @@
 # edition = "2024"
 
 [workspace]
-members = ["logregator-core", "logregatord", "logregator-tools", "xtask"]
+members = ["logregator-core", "logregatord", "logregator-tsdb", "logregator-tools", "xtask"]
 resolver = "3"
 
 [workspace.dependencies]
 logregator-core = { path = "logregator-core" }
 logregator-tools = { path = "logregator-tools" }
+logregator-tsdb = { path = "logregator-tsdb" }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }

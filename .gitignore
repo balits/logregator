@@ -5,3 +5,5 @@ load_tests/
 bench/
 # data directory for regular server runs
 server_data/
+# mini-lsm course (separate workspace + git repo)
+lsm/

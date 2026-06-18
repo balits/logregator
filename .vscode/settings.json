@@ -1,0 +1,4 @@
+{
+    // "rust-analyzer.cargo.features": ["bytes-buffer"],
+    // "rust-analyzer.cargo.noDefaultFeatures": false
+}
