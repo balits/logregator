@@ -28,7 +28,7 @@ impl Memtable {
         if self.size_bytes >= self.limit {
             return true;
         }
-        self.size_bytes += Key::sizeof() + value.sizeof();
+        self.size_bytes += std::mem::size_of::<Key>() + value.sizeof();
         self.map.insert(key, value);
         self.size_bytes >= self.limit
     }
@@ -181,14 +181,14 @@ mod test {
     #[test]
     fn lifecylce() {
         let v = Value::default();
-        let kv_size = Key::sizeof() + v.sizeof();
+        let kv_size = std::mem::size_of::<Key>() + v.sizeof();
         let max_count = 4;
         let max_size = max_count * kv_size;
 
         let mut m = Memtable::new(max_size);
         for i in 0..(max_count - 1) {
             let k = Key {
-                source_id: i as u32,
+                source_id: i as u64,
                 ..Default::default()
             };
             assert_eq!(false, m.append(k, v.clone()));
@@ -199,7 +199,7 @@ mod test {
             true,
             m.append(
                 Key {
-                    source_id: (max_count - 1) as u32,
+                    source_id: (max_count - 1) as u64,
                     ..Default::default()
                 },
                 v.clone()
@@ -214,13 +214,13 @@ mod test {
             .range(
                 Bound::Included(&Key::default()),
                 Bound::Excluded(&Key {
-                    source_id: u32::MAX,
+                    source_id: u64::MAX,
                     ..Default::default()
                 }),
             )
             .enumerate()
         {
-            assert_eq!(i as u32, k.source_id);
+            assert_eq!(i as u64, k.source_id);
         }
 
         let f = m.freeze();
@@ -233,13 +233,13 @@ mod test {
             .range(
                 Bound::Included(&Key::default()),
                 Bound::Excluded(&Key {
-                    source_id: u32::MAX,
+                    source_id: u64::MAX,
                     ..Default::default()
                 }),
             )
             .enumerate()
         {
-            assert_eq!(i as u32, k.source_id);
+            assert_eq!(i as u64, k.source_id);
         }
     }
 }
