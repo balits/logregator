@@ -3,7 +3,7 @@ use std::{collections::VecDeque, sync::Arc};
 use crate::{memtable::{FrozenMemtable, Memtable}, record::{Key, Value}};
 
 pub struct Lsm {
-    state: LsmState
+    _state: LsmState
 }
 
 pub struct LsmState {

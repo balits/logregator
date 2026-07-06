@@ -1,40 +1,42 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeSet, BinaryHeap},
     ops::Bound,
     sync::Arc,
 };
 
-use crate::record::{Key, Value};
+use crate::record::{Key, Record};
 
 #[derive(Debug)]
 pub struct Memtable {
-    map: BTreeMap<Key, Value>,
+    set: BTreeSet<Record>,
     limit: usize,
     size_bytes: usize,
 }
 
 impl Memtable {
     pub fn new(limit: usize) -> Self {
-        let map = BTreeMap::new();
+        let set = BTreeSet::new();
         Self {
-            map,
+            set,
             limit,
             size_bytes: 0,
         }
     }
 
-    pub fn append(&mut self, key: Key, value: Value) -> bool {
+    pub fn append(&mut self, r: Record) -> bool {
         if self.size_bytes >= self.limit {
+            dbg!(self.size_bytes, self.limit);
             return true;
         }
-        self.size_bytes += std::mem::size_of::<Key>() + value.sizeof();
-        self.map.insert(key, value);
+        dbg!(self.size_bytes, self.limit, r.sizeof());
+        self.size_bytes += r.sizeof();
+        self.set.insert(r);
         self.size_bytes >= self.limit
     }
 
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_> {
-        self.map.range((start, end))
+    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
+        self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
     }
 
     pub fn freeze(&mut self) -> Arc<FrozenMemtable> {
@@ -44,7 +46,7 @@ impl Memtable {
 
     #[inline]
     pub fn count(&self) -> usize {
-        self.map.len()
+        self.set.len()
     }
 
     #[inline]
@@ -58,10 +60,11 @@ impl Memtable {
     }
 }
 
+#[derive(Debug)]
 pub struct FrozenMemtable(Memtable);
 
 impl FrozenMemtable {
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_> {
+    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
         self.0.range(start, end)
     }
 
@@ -81,11 +84,12 @@ impl FrozenMemtable {
     }
 }
 
-pub type Range<'a> = std::collections::btree_map::Range<'a, Key, Value>;
+pub type BTreeSetRange<'a> = std::collections::btree_set::Range<'a, Record>;
 
 pub struct MergeIter<'a> {
-    // TODO: use tinyvec / stack based vec to avoid heap allocations on (frequent) ranging?
-    ranges: Vec<Range<'a>>,
+    // TODO: use tinyvec / stack based vec to avoid heap allocations on
+    // (frequent) ranging + small amounts of btrees??
+    ranges: Vec<BTreeSetRange<'a>>,
     minheap: BinaryHeap<Reverse<HeapItem<'a>>>,
 }
 
@@ -107,50 +111,44 @@ impl<'a> MergeIter<'a> {
     }
 
     fn fill_from_all(&mut self) {
-        for (i, r) in self.ranges.iter_mut().enumerate() {
-            if let Some((key, value)) = r.next() {
-                self.minheap.push(Reverse(HeapItem {
-                    source_idx: i,
-                    key,
-                    value,
-                }));
-            }
+        for i in 0..self.ranges.len() {
+            self.fill_from_single(i);
         }
     }
 
-    fn fill_from_source(&mut self, source_id: usize) {
-        if let Some((key, value)) = self.ranges[source_id].next() {
+    fn fill_from_single(&mut self, iter_idx: usize) {
+        if let Some(rec) = self.ranges[iter_idx].next() {
             self.minheap.push(Reverse(HeapItem {
-                source_idx: source_id,
-                key,
-                value,
+                inner: rec,
+                iter_idx,
             }));
         }
     }
 }
 
 impl<'a> Iterator for MergeIter<'a> {
-    type Item = (&'a Key, &'a Value);
+    type Item = &'a Record;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.minheap
             .pop()
             .inspect(|item| {
-                self.fill_from_source(item.0.source_idx);
+                self.fill_from_single(item.0.iter_idx);
             })
-            .map(|item| (item.0.key, item.0.value))
+            .map(|item| item.0.inner)
     }
 }
 
 struct HeapItem<'a> {
-    source_idx: usize,
-    key: &'a Key,
-    value: &'a Value,
+    /// actual record
+    inner: &'a Record,
+    /// which iterator this item came from
+    iter_idx: usize,
 }
 
 impl<'a> PartialEq for HeapItem<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.key.eq(&other.key)
+        self.inner.eq(&other.inner)
     }
 }
 
@@ -158,13 +156,13 @@ impl<'a> Eq for HeapItem<'a> {}
 
 impl<'a> PartialOrd for HeapItem<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.key.partial_cmp(&other.key)
+        self.inner.partial_cmp(&other.inner)
     }
 }
 
 impl<'a> Ord for HeapItem<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
+        self.inner.cmp(&other.inner)
     }
 }
 
@@ -174,16 +172,18 @@ mod test {
 
     use crate::{
         memtable::Memtable,
-        record::{Key, Value},
+        record::{Key, Record},
     };
     use pretty_assertions::assert_eq;
 
     #[test]
     fn lifecylce() {
-        let v = Value::default();
-        let kv_size = std::mem::size_of::<Key>() + v.sizeof();
+        let rec = Record {
+            key: Key::new(1, 2, 3, 4),
+            payload: vec![0x01, 0x02, 0x03, 0x04],
+        };
         let max_count = 4;
-        let max_size = max_count * kv_size;
+        let max_size = max_count * rec.sizeof();
 
         let mut m = Memtable::new(max_size);
         for i in 0..(max_count - 1) {
@@ -191,26 +191,31 @@ mod test {
                 source_id: i as u64,
                 ..Default::default()
             };
-            assert_eq!(false, m.append(k, v.clone()));
-            assert_eq!(m.size_bytes, kv_size * (i + 1))
+            let mut r2 = Record { key: k, payload: rec.payload.clone() };
+            r2.key.source_id = i as u64;
+            let r2sz = r2.sizeof();
+            assert_eq!(false, m.append(r2));
+            assert_eq!(m.size_bytes, r2sz * (i + 1))
         }
 
         assert_eq!(
             true,
-            m.append(
-                Key {
+            m.append(Record {
+                key: Key {
                     source_id: (max_count - 1) as u64,
                     ..Default::default()
                 },
-                v.clone()
-            )
+                payload: rec.payload.clone(),
+            })
         );
         assert_eq!(max_count, m.count());
         assert_eq!(max_size, m.size_bytes());
+        // shouldnt be inserted
+        assert_eq!(true, m.append(rec.clone()));
+        dbg!(max_count, m.count());
+        dbg!(max_size, m.size_bytes());
 
-        assert_eq!(true, m.append(Key::default(), v.clone()));
-
-        for (i, (k, _)) in m
+        for (i, rec) in m
             .range(
                 Bound::Included(&Key::default()),
                 Bound::Excluded(&Key {
@@ -220,7 +225,7 @@ mod test {
             )
             .enumerate()
         {
-            assert_eq!(i as u64, k.source_id);
+            assert_eq!(i as u64, rec.key.source_id);
         }
 
         let f = m.freeze();
@@ -229,7 +234,7 @@ mod test {
         assert_eq!(0, m.size_bytes());
         assert_eq!(0, m.count());
 
-        for (i, (k, _)) in f
+        for (i, rec) in f
             .range(
                 Bound::Included(&Key::default()),
                 Bound::Excluded(&Key {
@@ -239,7 +244,11 @@ mod test {
             )
             .enumerate()
         {
-            assert_eq!(i as u64, k.source_id);
+            assert_eq!(i as u64, rec.key.source_id);
         }
+
+
+        dbg!(m);
+        dbg!(f);
     }
 }

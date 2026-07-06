@@ -3,4 +3,4 @@ pub mod codec;
 pub mod memtable;
 pub mod wal;
 
-pub mod lsm;
+// pub mod lsm;
