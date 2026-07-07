@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use tracing::trace;
+
 use crate::record::{Key, Record};
 
 #[derive(Debug)]
@@ -25,8 +27,8 @@ impl Memtable {
     }
 
     pub fn append(&mut self, r: Record) -> bool {
-        if self.size_bytes >= self.limit {
-            dbg!(self.size_bytes, self.limit);
+        if self.size_bytes + r.sizeof() >= self.limit {
+            trace!("append: memtable cant hold another record");
             return true;
         }
         dbg!(self.size_bytes, self.limit, r.sizeof());
@@ -37,6 +39,15 @@ impl Memtable {
 
     pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
         self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
+    }
+
+    pub fn full_range(&self) -> BTreeSetRange<'_> {
+        let start = Key::default();
+        let end = Key::new(u64::MAX, u64::MAX,u64::MAX,u64::MAX);
+        self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((
+            Bound::Included(&start), 
+            Bound::Included(&end), 
+        ))
     }
 
     pub fn freeze(&mut self) -> Arc<FrozenMemtable> {

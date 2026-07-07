@@ -107,6 +107,16 @@ pub struct FramedWriter<W: Write, C: Codec> {
     codec: C,
 }
 
+impl<W: Write + Debug, C: Codec> Debug for FramedWriter<W, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedWriter")
+            .field("inner", &format_args!("{:?}", &self.inner))
+            .field("buf", &format_args!("[0..{}]", self.buf.len()))
+            .field("codec", &self.codec)
+            .finish()
+    }
+}
+
 impl<W: Write, C: Codec> FramedWriter<W, C> {
     pub fn new(w: W, c: C) -> Self {
         Self {

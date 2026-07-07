@@ -1,4 +1,4 @@
-pub type Label = (String, String);
+pub struct Label(String, String);
 pub type LabelSet = HashSet<Label>;
 pub struct Stream {
     id: usize,
