@@ -35,7 +35,7 @@ pub const MAX_BLOCK_SIZE: usize = u16::MAX as usize;
 /// the block  (as u16) , then number of records in the block  (as u16), and finally a u32 checksum.
 ///
 /// In shot, the block layout is:
-/// ```
+/// ```no_rust
 /// [ data: &[u8] ][ offsets: [u16; num_of_records] ][ num_of_records: u16 ][ checksum: u32]
 /// ```
 #[derive(PartialEq, Eq)]

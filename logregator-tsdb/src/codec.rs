@@ -143,7 +143,7 @@ impl Codec for BytesCodec {
     }
 }
 
-const BUFSIZE: usize = 2 * 1024;
+pub(super) const BUFSIZE: usize = 2 * 1024;
 
 pub struct FramedWriter<W: Write, C: Codec> {
     inner: BufWriter<W>,
@@ -285,7 +285,7 @@ impl<R: Read, C: Codec> Iterator for FramedReader<R, C> {
 
 #[cfg(test)]
 mod testing {
-    use crate::record::{Key, Record};
+    use crate::record::{Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, Record};
     use proptest::prelude::*;
 
     pub fn arb_record() -> impl Strategy<Value = Record> {
@@ -294,7 +294,7 @@ mod testing {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
-            proptest::collection::vec(any::<u8>(), 0..4096),
+            proptest::collection::vec(any::<u8>(), MIN_PAYLOAD_LENGTH..MAX_PAYLOAD_LENGTH),
         )
             .prop_map(
                 |(source_id, timestamp, sequence_num, stream_id, payload)| Record {

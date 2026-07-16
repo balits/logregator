@@ -13,7 +13,7 @@ impl Debug for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Record")
             .field("key", &self.key)
-            .field("payload", &format_args!("[0..{}]", self.payload.len()))
+            .field("payload", &format_args!("[..{}]", self.payload.len()))
             .finish()
     }
 }
@@ -87,7 +87,7 @@ impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         self.source_id == other.source_id
             && self.timestamp == other.timestamp
-            && self.sequence_num == other.timestamp
+            && self.sequence_num == other.sequence_num
     }
 }
 
