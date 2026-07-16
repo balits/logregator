@@ -1,63 +1,102 @@
 use std::{
-    error::Error, fmt::Debug, io::{self, BufReader, BufWriter, Read, Write},
+    error::Error,
+    fmt::Debug,
+    io::{self, BufReader, BufWriter, IntoInnerError, Read, Write},
 };
 
 use tracing::trace;
 
-use crate::record::{KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record};
+use crate::record::{
+    KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
+};
 
-#[derive(Debug, thiserror::Error)]
-pub enum BytesCodecError {
-    #[error("bytes_codec: io error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("bytes_codec: maximum payload size exceeded (limit: {limit}, got: {got})")]
-    MaxPayloadExceeded { limit: usize, got: usize },
-
-    #[error("bytes_codec: unexpected error: {msg}")]
-    Unexpected { msg: String },
-
-    #[error("bytes_codec: output buffer size is insufficient (need: {need}, got: {got}")]
-    NeedMoreBuf { need: usize, got: usize },
-}
-
-// fn torn(msg: &str) -> BytesCodecError {
-//     BytesCodecError::Torn { msg: msg.into() }
-// }
-
-fn unexpected(msg: &str) -> BytesCodecError {
-    BytesCodecError::Unexpected { msg: msg.into() }
-}
-
-fn need_more_buf(need: usize, got: usize) -> BytesCodecError {
-    BytesCodecError::NeedMoreBuf { need, got }
-}
-
+// TODO: migrate to decode = decode_key + decode_payload and
+// encode = encode_key + encode_payload
 pub trait Codec: Clone + Copy + Debug {
     type Error: From<io::Error> + Error + Send + Sync + 'static;
 
     fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, Self::Error>;
-    fn decode(&self, dst: &[u8]) -> Result<Option<(Record, usize)>, Self::Error>;
+    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, Self::Error>;
+
+    fn decode_key(&self, src: &[u8]) -> Result<Key, Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct BytesCodec;
 
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("unexpected_size: not enough bytes: got {got}, want: {want}")]
+pub struct UnexpectedSize {
+    pub got: usize,
+    pub want: usize,
+}
+
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("invalid payload size: min: {min}, max: {max}, got: {got}")]
+pub struct InvalidPayloadSize {
+    pub min: usize,
+    pub max: usize,
+    pub got: usize,
+}
+
+impl InvalidPayloadSize {
+    pub fn new(got: usize) -> Self {
+        let min = MIN_PAYLOAD_LENGTH;
+        let max = MAX_PAYLOAD_LENGTH;
+        Self { min, max, got }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CodecError {
+    #[error("bytes_codec: io error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("bytes_codec: unexpected error: {msg}")]
+    Unexpected { msg: String },
+
+    #[error("bytes_codec: {0}")]
+    UnexpectedSize(UnexpectedSize),
+
+    #[error("bytes_codec: {0}")]
+    InvalidPayloadSize(InvalidPayloadSize),
+}
+
+fn not_enough_bytes(got: usize, want: usize) -> CodecError {
+    CodecError::UnexpectedSize(UnexpectedSize { got, want })
+}
+
+fn unexpected(msg: &str) -> CodecError {
+    CodecError::Unexpected { msg: msg.into() }
+}
+
+fn invalid_payload_sz(got: usize) -> CodecError {
+    CodecError::InvalidPayloadSize(InvalidPayloadSize::new(got))
+}
+
 impl Codec for BytesCodec {
-    type Error = BytesCodecError;
+    type Error = CodecError;
 
     fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, Self::Error> {
         if dst.len() < rec.wire_len() {
-            trace!("not enough bytes to encode into (has: {}, need: {})", dst.len(), rec.wire_len());
-            return Err(need_more_buf(rec.wire_len(), dst.len()));
+            trace!(
+                "not enough bytes to encode into (has: {}, need: {})",
+                dst.len(),
+                rec.wire_len()
+            );
+            return Err(not_enough_bytes(dst.len(), rec.wire_len()));
         }
 
         let mut key_bytes = [0u8; KEY_SIZE];
         rec.key.to_be_bytes(&mut key_bytes);
         dst[0..KEY_SIZE].copy_from_slice(&key_bytes);
 
+        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
+            return Err(invalid_payload_sz(rec.payload.len()));
+        }
+
         let payload_len = (rec.payload.len() as u32).to_be_bytes();
-        dst[KEY_SIZE..KEY_SIZE+PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
+        dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
         dst[KEY_SIZE + PAYLOAD_LEN_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
             .copy_from_slice(&rec.payload);
 
@@ -66,11 +105,15 @@ impl Codec for BytesCodec {
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, Self::Error> {
         if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
-            trace!("not enough bytes to decode from (key + payload len)");
+            trace!(
+                "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
+                src.len(),
+                KEY_SIZE + PAYLOAD_LEN_SIZE
+            );
             return Ok(None);
         }
 
-        let key = Key::from_be_bytes(&src[..KEY_SIZE]).ok_or_else(|| unexpected("failed to decode key"))?;
+        let key = self.decode_key(src)?;
 
         let payload_len = u32::from_be_bytes([
             src[KEY_SIZE],
@@ -79,23 +122,24 @@ impl Codec for BytesCodec {
             src[KEY_SIZE + 3],
         ]) as usize;
 
-        if payload_len > MAX_PAYLOAD_LENGTH {
-            trace!("max payload size exceeded");
-            return Err(BytesCodecError::MaxPayloadExceeded {
-                limit: MAX_PAYLOAD_LENGTH,
-                got: payload_len,
-            });
+        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
+            return Err(invalid_payload_sz(payload_len));
         }
-        let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len ;
+        let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len;
         if src.len() < total {
             trace!("not enoguh bytes to decode from (payload)");
             return Ok(None);
         }
 
-        let payload =
-            src[KEY_SIZE + PAYLOAD_LEN_SIZE..total].to_vec();
+        let payload = src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]
+            .to_vec()
+            .into_boxed_slice();
 
         Ok(Some((Record { key, payload }, total)))
+    }
+
+    fn decode_key(&self, src: &[u8]) -> Result<Key, Self::Error> {
+        Key::from_be_bytes(&src[..KEY_SIZE])
     }
 }
 
@@ -110,7 +154,10 @@ pub struct FramedWriter<W: Write, C: Codec> {
 impl<W: Write + Debug, C: Codec> Debug for FramedWriter<W, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FramedWriter")
-            .field("inner", &format_args!("{:?}", &self.inner))
+            .field(
+                "inner",
+                &format_args!("{:?}", std::any::type_name_of_val(&self.inner)),
+            )
             .field("buf", &format_args!("[0..{}]", self.buf.len()))
             .field("codec", &self.codec)
             .finish()
@@ -131,15 +178,21 @@ impl<W: Write, C: Codec> FramedWriter<W, C> {
         self.buf.resize(rec.wire_len(), 0);
 
         self.codec.encode(rec, &mut self.buf)?;
-        self.inner
-            .write_all(&mut self.buf)
-            .map_err(C::Error::from)?;
+        self.inner.write_all(&self.buf).map_err(C::Error::from)?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()?;
         Ok(())
+    }
+
+    pub fn buf_writer(&mut self) -> &mut BufWriter<W> {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> Result<W, IntoInnerError<BufWriter<W>>> {
+        self.inner.into_inner()
     }
 }
 
@@ -154,16 +207,16 @@ pub struct FramedReader<R: Read, C: Codec> {
 impl<R, C> Debug for FramedReader<R, C>
 where
     R: Read + Debug,
-    C: Codec + Debug
- {
+    C: Codec + Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-       f.debug_struct("FramedReader<R, C>") 
-        .field("inner", &format_args!("{:?}", &self.inner))
-        .field("buf", &format_args!("[0..{}]", &self.buf.len()))
-        .field("start", &self.start)
-        .field("end", &self.end)
-        .field("codec", &self.codec)
-        .finish()
+        f.debug_struct("FramedReader<R, C>")
+            .field("inner", &format_args!("{:?}", self.inner))
+            .field("buf", &format_args!("[0..{}]", self.buf.len()))
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("codec", &self.codec)
+            .finish()
     }
 }
 
@@ -197,8 +250,12 @@ impl<R: Read, C: Codec> FramedReader<R, C> {
                 self.end += n;
                 Ok(false)
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
+    }
+
+    pub fn buf_reader(&mut self) -> &mut BufReader<R> {
+        &mut self.inner
     }
 }
 
@@ -207,11 +264,11 @@ impl<R: Read, C: Codec> Iterator for FramedReader<R, C> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.codec.decode(&mut self.buf[self.start..self.end]) {
+            match self.codec.decode(&self.buf[self.start..self.end]) {
                 Ok(Some((rec, n))) => {
                     self.start += n;
                     return Some(Ok(rec));
-                },
+                }
                 Ok(None) => match self.fill() {
                     Ok(false) => continue,
                     Ok(true) => return None,
@@ -228,18 +285,23 @@ impl<R: Read, C: Codec> Iterator for FramedReader<R, C> {
 
 #[cfg(test)]
 mod testing {
-    use proptest::prelude::*;
     use crate::record::{Key, Record};
+    use proptest::prelude::*;
 
     pub fn arb_record() -> impl Strategy<Value = Record> {
         (
-            any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
             proptest::collection::vec(any::<u8>(), 0..4096),
         )
-            .prop_map(|(source_id, timestamp, sequence_num, stream_id, payload)| Record {
-                key: Key::new(source_id, timestamp, sequence_num, stream_id),
-                payload,
-            })
+            .prop_map(
+                |(source_id, timestamp, sequence_num, stream_id, payload)| Record {
+                    key: Key::new(source_id, timestamp, sequence_num, stream_id),
+                    payload: payload.into_boxed_slice(),
+                },
+            )
     }
 }
 
@@ -247,7 +309,7 @@ mod testing {
 mod test {
     use super::testing::arb_record;
     use super::*;
-    use crate::record::{KEY_SIZE, PAYLOAD_LEN_SIZE, MAX_PAYLOAD_LENGTH};
+    use crate::record::{KEY_SIZE, MAX_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE};
     use proptest::prelude::*;
     use std::io::Cursor;
 
@@ -261,7 +323,7 @@ mod test {
             let written = codec.encode(&rec, &mut buf).unwrap();
             prop_assert_eq!(written, rec.wire_len());
 
-            let (decoded, consumed) = codec.decode(&mut buf).unwrap().expect("should decode");
+            let (decoded, consumed) = codec.decode(&buf).unwrap().expect("should decode");
             prop_assert_eq!(consumed, rec.wire_len());
             prop_assert_eq!(decoded, rec);
         }
@@ -279,7 +341,7 @@ mod test {
             codec.encode(&rec, &mut buf).unwrap();
             buf.extend_from_slice(&trailing);
 
-            let (decoded, consumed) = codec.decode(&mut buf).unwrap().expect("should decode");
+            let (decoded, consumed) = codec.decode(&buf).unwrap().expect("should decode");
             prop_assert_eq!(consumed, rec.wire_len());
             prop_assert_eq!(decoded, rec);
         }
@@ -291,7 +353,7 @@ mod test {
         ) {
             let codec = BytesCodec;
             let mut buf = bytes;
-            let result = codec.decode(&mut buf).unwrap();
+            let result = codec.decode(&buf).unwrap();
             prop_assert!(result.is_none());
         }
 
@@ -305,9 +367,9 @@ mod test {
             let mut full = vec![0u8; rec.wire_len()];
             codec.encode(&rec, &mut full).unwrap();
             let cut = full.len().saturating_sub(missing.min(rec.payload.len()));
-            let mut truncated = full[..cut.max(KEY_SIZE + PAYLOAD_LEN_SIZE)].to_vec();
+            let truncated = full[..cut.max(KEY_SIZE + PAYLOAD_LEN_SIZE)].to_vec();
 
-            let result = codec.decode(&mut truncated).unwrap();
+            let result = codec.decode(&truncated).unwrap();
             prop_assert!(result.is_none());
         }
 
@@ -321,8 +383,8 @@ mod test {
             buf[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE]
                 .copy_from_slice(&bogus_len.to_be_bytes());
 
-            let err = codec.decode(&mut buf).unwrap_err();
-            let m = matches!(err, BytesCodecError::MaxPayloadExceeded { .. }); 
+            let err = codec.decode(&buf).unwrap_err();
+            let m = matches!(err, CodecError::InvalidPayloadSize { .. });
             prop_assert!(m);
         }
 
@@ -330,8 +392,8 @@ mod test {
         #[test]
         fn prop_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
             let codec = BytesCodec;
-            let mut buf = bytes;
-            let _ = codec.decode(&mut buf); // Ok or Err both fine, panic is not
+            let buf = bytes;
+            let _ = codec.decode(&buf); // Ok or Err both fine, panic is not
         }
 
         /// Writing N records then reading them back through
@@ -359,31 +421,31 @@ mod test {
 
     #[test]
     fn framed_reader_grows_buffer_even_after_prior_compaction() {
-    let small = Record {
-        key: crate::record::Key::new(1, 1, 1, 1),
-        payload: vec![0xAA; 4],
-    };
-    let big_payload_len = MAX_PAYLOAD_LENGTH - KEY_SIZE - PAYLOAD_LEN_SIZE; // several buffer-doublings' worth
-    let big = Record {
-        key: crate::record::Key::new(2, 2, 2, 2),
-        payload: vec![0xBB; big_payload_len],
-    };
+        let small = Record {
+            key: crate::record::Key::new(1, 1, 1, 1),
+            payload: vec![0xAA; 4].into_boxed_slice(),
+        };
+        let big_payload_len = MAX_PAYLOAD_LENGTH - KEY_SIZE - PAYLOAD_LEN_SIZE; // several buffer-doublings' worth
+        let big = Record {
+            key: crate::record::Key::new(2, 2, 2, 2),
+            payload: vec![0xBB; big_payload_len].into_boxed_slice(),
+        };
 
-    let mut writer = FramedWriter::new(Cursor::new(Vec::new()), BytesCodec);
-    writer.write(&small).unwrap();
-    writer.write(&big).unwrap();
-    writer.flush().unwrap();
-    let bytes = writer.inner.into_inner().unwrap().into_inner();
+        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), BytesCodec);
+        writer.write(&small).unwrap();
+        writer.write(&big).unwrap();
+        writer.flush().unwrap();
+        let bytes = writer.inner.into_inner().unwrap().into_inner();
 
-    let mut reader = FramedReader::new(Cursor::new(bytes), BytesCodec);
-    let mut decoded = vec![];
-    while let Some(r) = reader.next() {
-        let r = r.unwrap();
-        decoded.push(r);
+        let reader = FramedReader::new(Cursor::new(bytes), BytesCodec);
+        let mut decoded = vec![];
+        for r in reader {
+            let r = r.unwrap();
+            decoded.push(r);
+        }
+
+        assert_eq!(decoded, vec![small, big]);
     }
-
-    assert_eq!(decoded, vec![small, big]);
-}
 
     /// Deterministic (non-property) test: forces a record to straddle the
     /// BUFSIZE fill boundary exactly, to reliably catch the fill()
@@ -393,11 +455,11 @@ mod test {
         let leading_payload_len = BUFSIZE - KEY_SIZE - PAYLOAD_LEN_SIZE - 10;
         let straddling = Record {
             key: crate::record::Key::new(1, 2, 3, 4),
-            payload: vec![0xAB; leading_payload_len],
+            payload: vec![0xAB; leading_payload_len].into_boxed_slice(),
         };
         let second = Record {
             key: crate::record::Key::new(5, 6, 7, 8),
-            payload: vec![0xCD; 500],
+            payload: vec![0xCD; 500].into_boxed_slice(),
         };
 
         let mut writer = FramedWriter::new(Cursor::new(Vec::new()), BytesCodec);
@@ -420,11 +482,11 @@ mod test {
     fn framed_reader_stops_cleanly_on_torn_trailing_record() {
         let good = Record {
             key: crate::record::Key::new(1, 1, 1, 1),
-            payload: vec![1, 2, 3],
+            payload: vec![1, 2, 3].into_boxed_slice(),
         };
         let torn = Record {
             key: crate::record::Key::new(2, 2, 2, 2),
-            payload: vec![9; 100],
+            payload: vec![9; 100].into_boxed_slice(),
         };
 
         let mut writer = FramedWriter::new(Cursor::new(Vec::new()), BytesCodec);

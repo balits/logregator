@@ -27,26 +27,32 @@ impl Memtable {
     }
 
     pub fn append(&mut self, r: Record) -> bool {
-        if self.size_bytes + r.sizeof() >= self.limit {
-            trace!("append: memtable cant hold another record");
+        if self.size_bytes + r.size_of() > self.limit {
+            trace!("append: memtable full");
             return true;
         }
-        dbg!(self.size_bytes, self.limit, r.sizeof());
-        self.size_bytes += r.sizeof();
+        trace!(
+            "current_size: {}, limit: {}, new_record_size: {}",
+            self.size_bytes,
+            self.limit,
+            r.size_of()
+        );
+        self.size_bytes += r.size_of();
         self.set.insert(r);
         self.size_bytes >= self.limit
     }
 
     pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
-        self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
+        self.set
+            .range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
     }
 
     pub fn full_range(&self) -> BTreeSetRange<'_> {
         let start = Key::default();
-        let end = Key::new(u64::MAX, u64::MAX,u64::MAX,u64::MAX);
+        let end = Key::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
         self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((
-            Bound::Included(&start), 
-            Bound::Included(&end), 
+            Bound::Included(&start),
+            Bound::Included(&end),
         ))
     }
 
@@ -159,7 +165,7 @@ struct HeapItem<'a> {
 
 impl<'a> PartialEq for HeapItem<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.inner.eq(&other.inner)
+        self.inner.eq(other.inner)
     }
 }
 
@@ -167,13 +173,13 @@ impl<'a> Eq for HeapItem<'a> {}
 
 impl<'a> PartialOrd for HeapItem<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.inner.partial_cmp(&other.inner)
+        Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for HeapItem<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.inner.cmp(&other.inner)
+        self.inner.cmp(other.inner)
     }
 }
 
@@ -189,12 +195,12 @@ mod test {
 
     #[test]
     fn lifecylce() {
-        let rec = Record {
+        let base = Record {
             key: Key::new(1, 2, 3, 4),
-            payload: vec![0x01, 0x02, 0x03, 0x04],
+            payload: vec![0x01, 0x02, 0x03, 0x04].into_boxed_slice(),
         };
         let max_count = 4;
-        let max_size = max_count * rec.sizeof();
+        let max_size = max_count * base.size_of();
 
         let mut m = Memtable::new(max_size);
         for i in 0..(max_count - 1) {
@@ -202,13 +208,18 @@ mod test {
                 source_id: i as u64,
                 ..Default::default()
             };
-            let mut r2 = Record { key: k, payload: rec.payload.clone() };
-            r2.key.source_id = i as u64;
-            let r2sz = r2.sizeof();
-            assert_eq!(false, m.append(r2));
-            assert_eq!(m.size_bytes, r2sz * (i + 1))
+            let mut rec = Record {
+                key: k,
+                payload: base.payload.clone(),
+            };
+            rec.key.source_id = i as u64;
+            let rec_sz = rec.size_of();
+
+            assert_eq!(false, m.append(rec));
+            assert_eq!(m.size_bytes, rec_sz * (i + 1))
         }
 
+        // memtable just filled up
         assert_eq!(
             true,
             m.append(Record {
@@ -216,13 +227,14 @@ mod test {
                     source_id: (max_count - 1) as u64,
                     ..Default::default()
                 },
-                payload: rec.payload.clone(),
+                payload: base.payload.clone(),
             })
         );
         assert_eq!(max_count, m.count());
         assert_eq!(max_size, m.size_bytes());
-        // shouldnt be inserted
-        assert_eq!(true, m.append(rec.clone()));
+
+        // memtable cant hold more records
+        assert_eq!(true, m.append(base.clone()));
         dbg!(max_count, m.count());
         dbg!(max_size, m.size_bytes());
 
@@ -242,6 +254,7 @@ mod test {
         let f = m.freeze();
         assert_eq!(max_size, f.size_bytes());
         assert_eq!(max_count, f.count());
+        // .freeze leaves behind an empty memtable
         assert_eq!(0, m.size_bytes());
         assert_eq!(0, m.count());
 
@@ -257,7 +270,6 @@ mod test {
         {
             assert_eq!(i as u64, rec.key.source_id);
         }
-
 
         dbg!(m);
         dbg!(f);

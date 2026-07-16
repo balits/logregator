@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::{fs::File, io};
 
-use tracing::{instrument};
+use tracing::instrument;
 
 use crate::codec::{BytesCodec, Codec, FramedReader, FramedWriter};
 use crate::record::Record;
@@ -60,7 +60,7 @@ mod test {
         wal::Wal,
     };
 
-    const PAYLOAD: &'static [u8] = b"du bist gut genug";
+    const PAYLOAD: &[u8] = b"du bist gut genug";
 
     #[test]
     fn wal_lifecycle() {
@@ -72,7 +72,7 @@ mod test {
         for i in 0..100u64 {
             let rec = Record {
                 key: Key::new(1, 2, i, 4),
-                payload: PAYLOAD.to_vec(),
+                payload: PAYLOAD.to_vec().into_boxed_slice(),
             };
             w.append(&rec).expect("wal append failed");
         }
@@ -90,7 +90,7 @@ mod test {
         let written: Vec<Record> = (0..record_num)
             .map(|seq| Record {
                 key: Key::new(1, 2, seq, 67),
-                payload: PAYLOAD.to_vec(),
+                payload: PAYLOAD.to_vec().into_boxed_slice(),
             })
             .collect();
 
@@ -110,7 +110,7 @@ mod test {
                     "recover: sequence_num mismatch"
                 );
                 assert_eq!(67, rec.key.stream_id, "recover: stream_id mismatch");
-                assert_eq!(PAYLOAD, rec.payload.as_slice(), "recover: payload mismatch");
+                assert_eq!(PAYLOAD, &*rec.payload, "recover: payload mismatch");
                 rec
             })
             .collect();
@@ -140,7 +140,7 @@ mod test {
         let first_batch: Vec<Record> = (0..10u64)
             .map(|seq| Record {
                 key: Key::new(1, 1, seq, 1),
-                payload: PAYLOAD.to_vec(),
+                payload: PAYLOAD.to_vec().into_boxed_slice(),
             })
             .collect();
         for rec in &first_batch {
@@ -158,7 +158,7 @@ mod test {
         let second_batch: Vec<Record> = (10..20u64)
             .map(|seq| Record {
                 key: Key::new(1, 1, seq, 1),
-                payload: PAYLOAD.to_vec(),
+                payload: PAYLOAD.to_vec().into_boxed_slice(),
             })
             .collect();
         for rec in &second_batch {
