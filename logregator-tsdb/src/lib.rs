@@ -1,6 +1,3 @@
-// #![feature(read_array)]
-#![feature(iter_map_windows)]
-
 pub mod block;
 pub mod codec;
 pub mod memtable;

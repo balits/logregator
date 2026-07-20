@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pretty_assertions::assert_eq;
 
-use super::{Block, BlockCursor, BlockWriter, MAX_BLOCK_SIZE, SZ_U16, SZ_U32, WriteResult};
+use super::{Block, BlockCursor, BlockWriter, MAX_BLOCK_SIZE, SZ_U16, SZ_U32, WriteOutput};
 use crate::codec::BytesCodec;
 use crate::record::{Key, Record};
 
@@ -43,7 +43,7 @@ fn build_block(n: usize, payload_len: usize) -> (Arc<Block>, Vec<Record>) {
     let mut bw = BlockWriter::new(codec(), None).unwrap();
     for r in &records {
         assert!(
-            matches!(bw.write(r).unwrap(), WriteResult::Written),
+            matches!(bw.write(r).unwrap(), WriteOutput::Written),
             "build_block: record {r:?} was rejected (shrink the payload length)"
         );
     }
@@ -97,7 +97,7 @@ fn block_writer() {
     let tight = r0.wire_len() + SZ_U16 + SZ_U16; // just enough for one record
     let mut bw = BlockWriter::new(codec(), Some(tight)).unwrap();
     assert!(
-        matches!(bw.write(&r0).unwrap(), WriteResult::Written),
+        matches!(bw.write(&r0).unwrap(), WriteOutput::Written),
         "first record must always be Written"
     );
 
@@ -105,7 +105,7 @@ fn block_writer() {
 
     // The second record must be rejected when the block is at capacity.
     assert!(
-        matches!(bw.write(&record(1, 1, 1, 32)).unwrap(), WriteResult::Full),
+        matches!(bw.write(&record(1, 1, 1, 32)).unwrap(), WriteOutput::Full),
         "second record must be Full when limit is exhausted"
     );
 
@@ -127,14 +127,14 @@ fn block_writer() {
     let mut bw = BlockWriter::new(codec(), Some(two_limit)).unwrap();
     assert!(matches!(
         bw.write(&record(1, 0, 0, 64)).unwrap(),
-        WriteResult::Written
+        WriteOutput::Written
     ));
     assert!(matches!(
         bw.write(&record(1, 1, 1, 64)).unwrap(),
-        WriteResult::Written
+        WriteOutput::Written
     ));
     assert!(
-        matches!(bw.write(&record(1, 2, 2, 64)).unwrap(), WriteResult::Full),
+        matches!(bw.write(&record(1, 2, 2, 64)).unwrap(), WriteOutput::Full),
         "third record must be Full"
     );
     assert_eq!(bw.finish().unwrap().num_of_records(), 2);

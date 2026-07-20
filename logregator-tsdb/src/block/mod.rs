@@ -5,8 +5,8 @@ mod writer;
 // i dont want AI generated code here
 // but i just couldnt bother to refactor
 // the test cases, so FIXME
-// #[cfg(test)]
-// mod test;
+#[cfg(test)]
+mod test;
 
 pub use cursor::BlockCursor;
 pub use error::*;
@@ -75,7 +75,6 @@ impl Block {
     #[instrument(err, skip(self))]
     pub fn encode(&self) -> Result<Vec<u8>, BlockCodecError> {
         if self.offsets.len() > (u16::MAX as usize) {
-            // invalid_block_size
             return Err(too_many_records(self.offsets.len()));
         }
         let offset_segment_len = self.offset_segment_len();
@@ -100,7 +99,9 @@ impl Block {
         // ..64KB-37 is still a safe size for creating offsets
         if self.data.len() > (u16::MAX as usize) - MIN_RECORD_WIRE_LENGTH {
             // otherwise the last offset could possibly overflow
-            todo!()
+            todo!(
+                "should we check for block.data.len() > u16::MAX - MIN_RECORD_WIRE_LENGTH for offsetting?"
+            )
         }
 
         let mut data = self.data.clone();
@@ -124,7 +125,7 @@ impl Block {
                 return Err(invalid_offsets(start, end));
             }
 
-            // converting back and forth usize <-> u16 is safe
+            // safe since start: u16 -> usize -> u16
             data.extend((start as u16).to_be_bytes());
         }
 

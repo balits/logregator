@@ -1,10 +1,10 @@
 use std::io;
 
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 use crate::{
     block::{Block, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE},
-    codec::{Codec, FramedWriter},
+    codec::Codec,
     record::{MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH, Record},
 };
 
@@ -19,13 +19,14 @@ use crate::{
 /// instead of its in-memory counterpart [Record::size_of]
 #[derive(Debug)]
 pub struct BlockWriter<C: Codec> {
-    framed: FramedWriter<Vec<u8>, C>,
+    buffer: Vec<u8>,
+    codec: C,
     offsets: Vec<u16>,
     size: usize,
     limit: usize,
 }
 
-pub enum WriteResult {
+pub enum WriteOutput {
     Written,
     Full,
 }
@@ -36,7 +37,7 @@ pub struct InvalidBlockWriterLimit(usize);
 
 impl<C: Codec> BlockWriter<C> {
     #[instrument(err)]
-    pub fn new(c: C, limit: Option<usize>) -> Result<Self, InvalidBlockWriterLimit> {
+    pub fn new(codec: C, limit: Option<usize>) -> Result<Self, InvalidBlockWriterLimit> {
         let limit = match limit {
             Some(l) => {
                 if l > MAX_BLOCK_SIZE {
@@ -48,13 +49,13 @@ impl<C: Codec> BlockWriter<C> {
         };
 
         let size = 0;
-        let w = Vec::with_capacity(limit);
-        let framed = FramedWriter::new(w, c);
+        let buffer = Vec::with_capacity(limit);
         let offsets =
             Vec::with_capacity(limit / (MAX_RECORD_WIRE_LENGTH + MIN_RECORD_WIRE_LENGTH / 2));
         let this = Self {
+            buffer,
             size,
-            framed,
+            codec,
             limit,
             offsets,
         };
@@ -64,37 +65,36 @@ impl<C: Codec> BlockWriter<C> {
     /// Encodes record into the block, returning Ok(true) if successful.
     /// If the block is full, Ok(false) is returned,
     /// if any other error is encounder Err(..) is returned
-    pub fn write(&mut self, rec: &Record) -> Result<WriteResult, C::Error> {
+    #[instrument(level = "trace", err)]
+    pub fn write(&mut self, rec: &Record) -> Result<WriteOutput, C::Error> {
         let est_total_size = self.size
             + rec.wire_len()
             + (self.offsets.len() + 1) * size_of::<u16>()
             + size_of::<u16>();
 
         if !self.offsets.is_empty() && est_total_size > self.limit {
-            return Ok(WriteResult::Full);
+            return Ok(WriteOutput::Full);
         }
 
         if est_total_size > MAX_BLOCK_SIZE {
-            return Ok(WriteResult::Full);
+            return Ok(WriteOutput::Full);
         }
 
-        self.framed.write(rec)?;
+        let orig_len = self.buffer.len();
+        self.buffer.resize(orig_len + rec.wire_len(), 0);
+        self.codec
+            .encode(rec, &mut self.buffer[orig_len..orig_len + rec.wire_len()])?;
+
         self.offsets.push(self.size as u16);
         self.size += rec.wire_len();
-        Ok(WriteResult::Written)
+        Ok(WriteOutput::Written)
     }
 
     /// flush the internal buffer, appends the offset footer and
     /// the [num_of_records] to W.
     /// The offsets are written and [num_of_records] as u16.
     pub fn finish(self) -> io::Result<Block> {
-        let data = self.framed.into_inner().inspect_err(|e| {
-            trace!(
-                "failed to unwrap FramedWriter<W, C>'s inner W (out from its BufWriter<W>): {:?}",
-                e
-            )
-        })?;
-
+        let data = self.buffer;
         let block = Block {
             data,
             offsets: self.offsets,
