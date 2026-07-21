@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use pretty_assertions::assert_eq;
 
@@ -35,7 +35,7 @@ fn record(source_id: u64, ts: u64, seq: u64, payload_len: usize) -> Record {
 
 /// Build a valid block from `n` records with the given payload size.
 /// Panics if any write is rejected, callers should size payloads to fit.
-fn build_block(n: usize, payload_len: usize) -> (Arc<Block>, Vec<Record>) {
+fn build_block(n: usize, payload_len: usize) -> (Rc<Block>, Vec<Record>) {
     let records: Vec<Record> = (0..n as u64)
         .map(|i| record(1, i, i, payload_len))
         .collect();
@@ -47,7 +47,8 @@ fn build_block(n: usize, payload_len: usize) -> (Arc<Block>, Vec<Record>) {
             "build_block: record {r:?} was rejected (shrink the payload length)"
         );
     }
-    (Arc::new(bw.finish().unwrap()), records)
+    let (b, _, _) = bw.into_block();
+    (Rc::new(b), records)
 }
 
 #[test]
@@ -67,10 +68,7 @@ fn block_writer() {
     // --- Empty finish ---------------------------------------------------------
 
     // A writer that never had write() called still produces a valid (0-record) block.
-    let empty_block = BlockWriter::new(codec(), Some(4096))
-        .unwrap()
-        .finish()
-        .unwrap();
+    let (empty_block, _, _) = BlockWriter::new(codec(), Some(4096)).unwrap().into_block();
     assert_eq!(empty_block.num_of_records(), 0);
 
     // --- Size accounting ------------------------------------------------------
@@ -84,6 +82,16 @@ fn block_writer() {
         bw.size(),
         wire,
         "size must equal wire_len after first write"
+    );
+    assert_eq!(
+        bw.first_key(),
+        Some(&r0.key),
+        "fist_key should match the single inserted records key"
+    );
+    assert_eq!(
+        bw.last_key(),
+        Some(&r0.key),
+        "last_key should match first_key"
     );
 
     // After a second write with the same payload, size doubles.
@@ -109,9 +117,9 @@ fn block_writer() {
         "second record must be Full when limit is exhausted"
     );
 
-    // After a Full result the writer is still usable: finish() produces a block
+    // After a Full result the writer is still usable: into_block() produces a block
     // that contains only the records that were actually Written.
-    let block = bw.finish().unwrap();
+    let (block, _, _) = bw.into_block();
     assert_eq!(
         block.num_of_records(),
         1,
@@ -137,7 +145,7 @@ fn block_writer() {
         matches!(bw.write(&record(1, 2, 2, 64)).unwrap(), WriteOutput::Full),
         "third record must be Full"
     );
-    assert_eq!(bw.finish().unwrap().num_of_records(), 2);
+    assert_eq!(bw.into_block().0.num_of_records(), 2);
 }
 
 #[test]
@@ -167,7 +175,7 @@ fn block_encode() {
     // --- Encoded byte length --------------------------------------------------
 
     // Layout: [ data ][ offsets: n*u16 ][ num_of_records: u16 ][ checksum: u32 ]
-    let encoded = block.encode().unwrap();
+    let encoded = block.encode_block().unwrap();
     let expected_len = block.offset_segment_start() + n * SZ_U16 + SZ_U16 + SZ_U32;
     assert_eq!(
         encoded.len(),
@@ -178,21 +186,21 @@ fn block_encode() {
     // --- Determinism ----------------------------------------------------------
 
     // Encoding the same block twice must produce identical bytes.
-    let a = block.encode().unwrap();
-    let b = block.encode().unwrap();
+    let a = block.encode_block().unwrap();
+    let b = block.encode_block().unwrap();
     assert_eq!(a, b, "encode must be deterministic");
 
     // --- Single-record block --------------------------------------------------
 
     let (single, _) = build_block(1, 32);
-    single.encode().unwrap(); // must not panic or error
+    single.encode_block().unwrap(); // must not panic or error
 
     // --- Empty block is rejected ----------------------------------------------
 
     // An empty block (0 offsets) has no meaningful on-disk representation.
-    let empty = BlockWriter::new(codec(), None).unwrap().finish().unwrap();
+    let (empty, _, _) = BlockWriter::new(codec(), None).unwrap().into_block();
     assert!(
-        empty.encode().is_err(),
+        empty.encode_block().is_err(),
         "encode on an empty block must return Err"
     );
 }
@@ -204,15 +212,15 @@ fn block_decode() {
     // --- Happy path: single record -------------------------------------------
 
     let (block, _) = build_block(1, 32);
-    let encoded = block.encode().unwrap();
-    let decoded = Block::decode(&encoded).unwrap();
+    let encoded = block.encode_block().unwrap();
+    let decoded = Block::decode_block(&encoded).unwrap();
     assert_eq!(*block, decoded, "single-record roundtrip must be identity");
 
     // --- Happy path: multiple records ----------------------------------------
 
     let (block, _) = build_block(8, 32);
-    let encoded = block.encode().unwrap();
-    let decoded = Block::decode(&encoded).unwrap();
+    let encoded = block.encode_block().unwrap();
+    let decoded = Block::decode_block(&encoded).unwrap();
     assert_eq!(*block, decoded, "multi-record roundtrip must be identity");
 
     // All derived properties must survive the roundtrip unchanged.
@@ -223,10 +231,16 @@ fn block_decode() {
 
     // --- Malformed input: too short to hold a checksum -----------------------
 
-    assert!(Block::decode(&[]).is_err(), "empty slice must be rejected");
-    assert!(Block::decode(&[0u8; 1]).is_err(), "1 byte must be rejected");
     assert!(
-        Block::decode(&[0u8; SZ_U32 - 1]).is_err(),
+        Block::decode_block(&[]).is_err(),
+        "empty slice must be rejected"
+    );
+    assert!(
+        Block::decode_block(&[0u8; 1]).is_err(),
+        "1 byte must be rejected"
+    );
+    assert!(
+        Block::decode_block(&[0u8; SZ_U32 - 1]).is_err(),
         "fewer than SZ_U32 bytes must be rejected"
     );
 
@@ -237,16 +251,16 @@ fn block_decode() {
     // won't be present.
     let (block, _) = build_block(3, 16);
     assert!(
-        Block::decode(&block.data).is_err(),
+        Block::decode_block(&block.data).is_err(),
         "raw data without offset footer must be rejected"
     );
 
     // --- Malformed input: truncated by one byte ------------------------------
 
-    let encoded = block.encode().unwrap();
+    let encoded = block.encode_block().unwrap();
     let truncated = &encoded[..encoded.len() - 1];
     assert!(
-        Block::decode(truncated).is_err(),
+        Block::decode_block(truncated).is_err(),
         "truncated buffer must be rejected"
     );
 
@@ -255,7 +269,7 @@ fn block_decode() {
     let mut corrupted = encoded.clone();
     corrupted[0] ^= 0x01; // flip one bit anywhere in the data region
     assert!(
-        Block::decode(&corrupted).is_err(),
+        Block::decode_block(&corrupted).is_err(),
         "bit-flipped buffer must fail checksum verification"
     );
 
@@ -266,7 +280,7 @@ fn block_decode() {
     // The checksum covers everything before it, so this must be rejected.
     let doubled = [encoded.clone(), encoded.clone()].concat();
     assert!(
-        Block::decode(&doubled).is_err(),
+        Block::decode_block(&doubled).is_err(),
         "doubled buffer must be rejected by checksum"
     );
 
@@ -276,7 +290,7 @@ fn block_decode() {
     let tail = zero_cksum.len();
     zero_cksum[tail - 4..].fill(0x00);
     assert!(
-        Block::decode(&zero_cksum).is_err(),
+        Block::decode_block(&zero_cksum).is_err(),
         "zeroed checksum must be rejected"
     );
 
@@ -291,7 +305,7 @@ fn block_decode() {
     bad_count[tail - 6] = 0xFF;
     bad_count[tail - 5] = 0xFF;
     assert!(
-        Block::decode(&bad_count).is_err(),
+        Block::decode_block(&bad_count).is_err(),
         "corrupted num_of_records must be caught"
     );
 }
@@ -456,8 +470,8 @@ fn block_cursor() {
 
     // Encode → decode and verify seek finds the same records on the
     // reconstructed block as on the original.
-    let encoded = block.encode().unwrap();
-    let decoded_block = Arc::new(Block::decode(&encoded).unwrap());
+    let encoded = block.encode_block().unwrap();
+    let decoded_block = Rc::new(Block::decode_block(&encoded).unwrap());
     let mut dc = BlockCursor::new(decoded_block, codec());
     for r in &records {
         dc.seek(r.key.clone());

@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fmt::Debug,
     io::{self, BufReader, BufWriter, IntoInnerError, Read, Write},
 };
@@ -12,13 +11,14 @@ use crate::record::{
 
 // TODO: migrate to decode = decode_key + decode_payload and
 // encode = encode_key + encode_payload
-pub trait Codec: Clone + Copy + Debug {
-    type Error: From<io::Error> + Error + Send + Sync + 'static;
+//
+// TODO: add methods that take an &mut Vec<u8>/io::Write as out params
+pub trait Codec: Clone + Debug {
+    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError>;
+    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError>;
 
-    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, Self::Error>;
-    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, Self::Error>;
-
-    fn decode_key(&self, src: &[u8]) -> Result<Key, Self::Error>;
+    fn encode_key(&self, key: &Key) -> Result<[u8; KEY_SIZE], CodecError>;
+    fn decode_key(&self, src: &[u8]) -> Result<Key, CodecError>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,17 +49,20 @@ impl InvalidPayloadSize {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    #[error("bytes_codec: io error: {0}")]
+    #[error("codec error: io error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("bytes_codec: unexpected error: {msg}")]
+    #[error("codec error: unexpected error: {msg}")]
     Unexpected { msg: String },
 
-    #[error("bytes_codec: {0}")]
+    #[error("codec error: {0}")]
     UnexpectedSize(UnexpectedSize),
 
-    #[error("bytes_codec: {0}")]
+    #[error("codec error: {0}")]
     InvalidPayloadSize(InvalidPayloadSize),
+
+    #[error("codec error: some other error occured {0}")]
+    Other(String),
 }
 
 fn not_enough_bytes(got: usize, want: usize) -> CodecError {
@@ -75,9 +78,7 @@ fn invalid_payload_sz(got: usize) -> CodecError {
 }
 
 impl Codec for BytesCodec {
-    type Error = CodecError;
-
-    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, Self::Error> {
+    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
         if dst.len() < rec.wire_len() {
             trace!(
                 "not enough bytes to encode into (has: {}, need: {})",
@@ -87,9 +88,7 @@ impl Codec for BytesCodec {
             return Err(not_enough_bytes(dst.len(), rec.wire_len()));
         }
 
-        let mut key_bytes = [0u8; KEY_SIZE];
-        rec.key.to_be_bytes(&mut key_bytes);
-        dst[0..KEY_SIZE].copy_from_slice(&key_bytes);
+        dst[0..KEY_SIZE].copy_from_slice(&self.encode_key(&rec.key)?);
 
         if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
             return Err(invalid_payload_sz(rec.payload.len()));
@@ -103,7 +102,7 @@ impl Codec for BytesCodec {
         Ok(rec.wire_len())
     }
 
-    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, Self::Error> {
+    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
         if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
             trace!(
                 "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
@@ -138,7 +137,13 @@ impl Codec for BytesCodec {
         Ok(Some((Record { key, payload }, total)))
     }
 
-    fn decode_key(&self, src: &[u8]) -> Result<Key, Self::Error> {
+    fn encode_key(&self, key: &Key) -> Result<[u8; KEY_SIZE], CodecError> {
+        let mut bytes = [0u8; KEY_SIZE];
+        key.to_be_bytes(&mut bytes);
+        Ok(bytes)
+    }
+
+    fn decode_key(&self, src: &[u8]) -> Result<Key, CodecError> {
         Key::from_be_bytes(&src[..KEY_SIZE])
     }
 }
@@ -173,12 +178,12 @@ impl<W: Write, C: Codec> FramedWriter<W, C> {
         }
     }
 
-    pub fn write(&mut self, rec: &Record) -> Result<(), C::Error> {
+    pub fn write(&mut self, rec: &Record) -> Result<(), CodecError> {
         self.buf.clear();
         self.buf.resize(rec.wire_len(), 0);
 
         self.codec.encode(rec, &mut self.buf)?;
-        self.inner.write_all(&self.buf).map_err(C::Error::from)?;
+        self.inner.write_all(&self.buf).map_err(CodecError::from)?;
         Ok(())
     }
 
@@ -260,7 +265,7 @@ impl<R: Read, C: Codec> FramedReader<R, C> {
 }
 
 impl<R: Read, C: Codec> Iterator for FramedReader<R, C> {
-    type Item = Result<Record, C::Error>;
+    type Item = Result<Record, CodecError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

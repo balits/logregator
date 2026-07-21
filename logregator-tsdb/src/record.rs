@@ -41,7 +41,7 @@ impl Record {
     /// This should equal [key: 4 * 8 bytes] [payload_len: 4 bytes] [1 byte * payload_len].
     #[inline]
     pub const fn wire_len(&self) -> usize {
-        size_of::<Key>() + size_of_val(&(self.payload.len() as u32)) + self.payload.len()
+        KEY_SIZE + size_of::<u32>() + self.payload.len()
     }
 }
 

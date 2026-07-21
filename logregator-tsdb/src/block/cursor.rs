@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use tracing::trace;
 
 use crate::{
     block::Block,
-    codec::Codec,
+    codec::{Codec, CodecError},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -13,15 +13,16 @@ use crate::{
 /// with [seek_to_first()]. From this point on, one can use next() or seek()
 /// to update the cursors internal item, [in_valid()] will return false if this
 // fails. It also fails after [next()] results in going past the offset array.
+#[derive(Debug)]
 pub struct BlockCursor<C: Codec> {
-    block: Arc<Block>,
+    block: Rc<Block>,
     curr_offset_idx: usize,
-    record: Result<Option<Record>, C::Error>,
+    record: Result<Option<Record>, CodecError>,
     codec: C,
 }
 
 impl<C: Codec> BlockCursor<C> {
-    pub fn new(block: Arc<Block>, c: C) -> Self {
+    pub fn new(block: Rc<Block>, c: C) -> Self {
         Self {
             block,
             curr_offset_idx: 0,
@@ -41,7 +42,7 @@ impl<C: Codec> BlockCursor<C> {
     }
 
     #[inline]
-    pub fn get_err(&self) -> Option<&C::Error> {
+    pub fn get_error(&self) -> Option<&CodecError> {
         self.record.as_ref().err()
     }
 
@@ -113,16 +114,22 @@ impl<C: Codec> BlockCursor<C> {
         }
     }
 
-    pub fn peek_key(&mut self) -> Option<&Key> {
+    #[inline]
+    pub fn peek(&mut self) -> Option<&Record> {
         match self.record.as_ref() {
-            Ok(s) => s.as_ref().map(|r| &r.key),
+            Ok(s) => s.as_ref(),
             Err(_) => None,
         }
     }
 
+    #[inline]
+    pub fn peek_key(&mut self) -> Option<&Key> {
+        self.peek().map(|r| &r.key)
+    }
+
     fn update_current(&mut self) {
         if self.curr_offset_idx >= self.block.offsets.len() {
-            trace!("update_current: offset idx walked the length of the array");
+            trace!("BlockCursor::update_current: offset idx is out of bounds");
             self.record = Ok(None);
             return;
         }

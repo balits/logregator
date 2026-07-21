@@ -4,7 +4,7 @@ use std::{fs::File, io};
 
 use tracing::instrument;
 
-use crate::codec::{BytesCodec, Codec, FramedReader, FramedWriter};
+use crate::codec::{BytesCodec, Codec, CodecError, FramedReader, FramedWriter};
 use crate::record::Record;
 
 pub struct Wal<C: Codec = BytesCodec> {
@@ -17,7 +17,7 @@ impl<C: Codec> Wal<C> {
     pub fn new(path: &Path, codec: C) -> io::Result<Self> {
         let f = open_read_append(path)?;
         let path = path.to_path_buf();
-        let framed = FramedWriter::new(f, codec);
+        let framed = FramedWriter::new(f, codec.clone());
         Ok(Self {
             path,
             framed,
@@ -26,7 +26,7 @@ impl<C: Codec> Wal<C> {
     }
 
     #[instrument(level = "trace", skip(self))]
-    pub fn append(&mut self, rec: &Record) -> Result<(), C::Error> {
+    pub fn append(&mut self, rec: &Record) -> Result<(), CodecError> {
         self.framed.write(rec)?;
         Ok(())
     }
@@ -40,7 +40,7 @@ impl<C: Codec> Wal<C> {
     #[instrument(level = "trace", skip(self))]
     pub fn try_recovery(&self) -> io::Result<FramedReader<File, C>> {
         let f = open_read_append(&self.path)?;
-        Ok(FramedReader::new(f, self.codec))
+        Ok(FramedReader::new(f, self.codec.clone()))
     }
 }
 

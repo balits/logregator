@@ -72,8 +72,8 @@ impl Debug for Block {
 }
 
 impl Block {
-    #[instrument(err, skip(self))]
-    pub fn encode(&self) -> Result<Vec<u8>, BlockCodecError> {
+    #[instrument(skip(self), err)]
+    pub fn encode_block(&self) -> Result<Vec<u8>, BlockCodecError> {
         if self.offsets.len() > (u16::MAX as usize) {
             return Err(too_many_records(self.offsets.len()));
         }
@@ -141,7 +141,7 @@ impl Block {
     /// this method indexed heavily into [src]
     /// so the caller should make sure [src] is long enough and well formed
     #[instrument(skip(src), err)]
-    pub fn decode(src: &[u8]) -> Result<Self, BlockCodecError> {
+    pub fn decode_block(src: &[u8]) -> Result<Self, BlockCodecError> {
         if src.len() < SZ_U32 {
             return Err(unexpected_size(src.len(), SZ_U32));
         }
