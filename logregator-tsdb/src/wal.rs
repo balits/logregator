@@ -37,10 +37,9 @@ impl<C: Codec> Wal<C> {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(self))]
-    pub fn try_recovery(&self) -> io::Result<FramedReader<File, C>> {
-        let f = open_read_append(&self.path)?;
-        Ok(FramedReader::new(f, self.codec.clone()))
+    fn try_recovery(path: &Path, codec: C) -> io::Result<FramedReader<File, C>> {
+        let f = open_read_append(path)?;
+        Ok(FramedReader::new(f, codec))
     }
 }
 
@@ -83,8 +82,9 @@ mod test {
     fn wal_recover() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), BytesCodec).expect("wal::new");
+        let codec = BytesCodec;
+        let tempf = NamedTempFile::new().expect("tempfile");
+        let mut w = Wal::new(tempf.path(), codec.clone()).expect("wal::new");
 
         let record_num = 100u64;
         let written: Vec<Record> = (0..record_num)
@@ -99,8 +99,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = w
-            .try_recovery()
+        let recovered: Vec<Record> = Wal::try_recovery(tempf.path(), codec.clone())
             .expect("failed to open wal for recovery")
             .enumerate()
             .map(|(i, res)| {
@@ -134,8 +133,9 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
+        let codec = BytesCodec;
         let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), BytesCodec).expect("wal::new");
+        let mut w = Wal::new(f.path(), codec.clone()).expect("wal::new");
 
         let first_batch: Vec<Record> = (0..10u64)
             .map(|seq| Record {
@@ -150,8 +150,7 @@ mod test {
 
         // Recover once — this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = w
-            .try_recovery()
+        let _ = Wal::try_recovery(f.path(), codec.clone())
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
@@ -166,8 +165,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = w
-            .try_recovery()
+        let recovered: Vec<Record> = Wal::try_recovery(f.path(), codec.clone())
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();
