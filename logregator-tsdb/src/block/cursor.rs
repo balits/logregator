@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug)]
 pub struct BlockCursor<C: Codec> {
     block: Rc<Block>,
-    curr_offset_idx: usize,
+    offset_idx: usize,
     record: Result<Option<Record>, CodecError>,
     codec: C,
 }
@@ -25,7 +25,7 @@ impl<C: Codec> BlockCursor<C> {
     pub fn new(block: Rc<Block>, c: C) -> Self {
         Self {
             block,
-            curr_offset_idx: 0,
+            offset_idx: 0,
             record: Ok(None),
             codec: c,
         }
@@ -69,22 +69,22 @@ impl<C: Codec> BlockCursor<C> {
 
     #[inline]
     pub fn next(&mut self) {
-        self.curr_offset_idx += 1;
+        self.offset_idx += 1;
         self.update_current();
     }
 
     #[inline]
     pub fn seek_to_first(&mut self) {
-        self.curr_offset_idx = 0;
+        self.offset_idx = 0;
         self.update_current();
     }
 
-    pub fn seek(&mut self, seek_key: Key) {
+    pub fn seek(&mut self, seek_key: &Key) {
         let mut seek_key_bs = [0u8; KEY_SIZE];
         seek_key.to_be_bytes(&mut seek_key_bs);
 
         let mut search_err = None;
-        //
+
         // TODO: instead of turning the bytes into Key and then comparing
         // we could just compare the bytes themselves (disregarding Key::stream_id: u64, the last 8 bytes)
         let res = self.block.offsets.binary_search_by(|o| {
@@ -106,7 +106,7 @@ impl<C: Codec> BlockCursor<C> {
         if let Some(e) = search_err {
             self.record = Err(e);
         } else {
-            self.curr_offset_idx = match res {
+            self.offset_idx = match res {
                 Ok(i) => i,  // exact match
                 Err(i) => i, // first elem > target
             };
@@ -128,15 +128,15 @@ impl<C: Codec> BlockCursor<C> {
     }
 
     fn update_current(&mut self) {
-        if self.curr_offset_idx >= self.block.offsets.len() {
+        if self.offset_idx >= self.block.offsets.len() {
             trace!("BlockCursor::update_current: offset idx is out of bounds");
             self.record = Ok(None);
             return;
         }
 
-        let start_offset = self.block.offsets[self.curr_offset_idx] as usize;
-        let end_offset = if self.curr_offset_idx + 1 < self.block.offsets.len() {
-            self.block.offsets[self.curr_offset_idx + 1] as usize
+        let start_offset = self.block.offsets[self.offset_idx] as usize;
+        let end_offset = if self.offset_idx + 1 < self.block.offsets.len() {
+            self.block.offsets[self.offset_idx + 1] as usize
         } else {
             self.block.offset_segment_start()
         };

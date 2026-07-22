@@ -259,6 +259,9 @@ pub enum SstReadError {
 
     #[error("sst read error: {0}")]
     CodecError(#[from] CodecError),
+
+    #[error("sst read error: corrupted not-sorted block")]
+    CorruptedBlockNotSorted,
 }
 
 impl SstHandle {
@@ -281,11 +284,6 @@ impl SstHandle {
             })?
             .offset as usize;
 
-        trace!(
-            "block_idx = {}, meta_len = {}",
-            block_idx,
-            self.block_meta().len()
-        );
         let block_end = if block_idx == self.block_meta().len() - 1 {
             self.meta.block_meta_offset
         } else {
@@ -317,6 +315,7 @@ pub struct SstMeta {
     last_key: Key,
 }
 
+#[derive(Debug)]
 pub struct SstCursor<C: Codec> {
     sst: Rc<SstHandle>,
     block_cursor: Result<BlockCursor<C>, SstReadError>,
@@ -338,11 +337,6 @@ impl<C: Codec> SstCursor<C> {
             block_idx: 0,
             codec,
         })
-    }
-
-    pub fn seek_to_fist(&mut self) {
-        self.block_idx = 0;
-        self.update_current();
     }
 
     #[inline]
@@ -390,8 +384,10 @@ impl<C: Codec> SstCursor<C> {
     #[instrument(skip(self), fields(block_idx = self.block_idx, block_count = self.sst.block_meta().len()))]
     pub fn next(&mut self) {
         if let Ok(c) = self.block_cursor.as_mut() {
+            trace!("advancing inner cursor");
             c.next();
             if c.is_record() {
+                trace!("after advance: inner cursor no longer yields records");
                 return;
             }
         }
@@ -407,6 +403,48 @@ impl<C: Codec> SstCursor<C> {
         self.block_idx = 0;
         // internally it calls new_cursor.seek_to_first()
         self.update_current();
+    }
+
+    #[instrument(skip(self))]
+    pub fn seek(&mut self, seek_key: &Key) {
+        use std::cmp::Ordering::*;
+        let mut bin_search_error = None;
+
+        // ...copied from BlockCursor::seek():
+        // TODO: instead of turning the bytes into Key and then comparing
+        // we could just compare the bytes themselves (disregarding Key::stream_id: u64, the last 8 bytes)
+        let res = self.sst.block_meta().binary_search_by(|block| {
+            match (
+                seek_key.cmp(&block.first_key),
+                seek_key.cmp(&block.last_key),
+            ) {
+                (Less, Greater)=> {
+                    trace!("binary search: block is not sorted: seek key is both less than block.first_key but also greater than block.last_key");
+                    bin_search_error = Some(SstReadError::CorruptedBlockNotSorted);
+                    Equal // doesnt matter
+                },
+                (Equal, _) => Equal,
+                (_, Equal) => Equal,
+                (Greater, Less) => Equal,
+                (Less, _) => Less,
+                (_, Greater) => Greater,
+            }
+        });
+
+        if let Some(e) = bin_search_error {
+            self.block_cursor = Err(e);
+            return;
+        }
+
+        trace!("binary search result = {:?}", res);
+        self.block_idx = match res {
+            Ok(i) => i,  // exact match
+            Err(i) => i, // first elem > target
+        };
+        self.update_current();
+        if let Ok(c) = self.block_cursor.as_mut() {
+            c.seek(seek_key);
+        }
     }
 
     #[instrument(skip(self), fields(block_idx = self.block_idx, block_count = self.sst.block_meta().len()))]
@@ -706,15 +744,16 @@ mod test {
         let codec = BytesCodec;
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
         let num_records = 10;
-        for i in 0..num_records {
-            sw.write(&record(i as u64, 512)).unwrap();
+        let records: Vec<Record> = (0..num_records).map(|i| record(i as u64, 512)).collect();
+        for r in &records {
+            sw.write(r).unwrap();
         }
         dbg!(&sw);
         let sst = Rc::new(sw.finalize_file().unwrap());
         assert_eq!(sst.meta.record_count, num_records);
 
         let mut c = sst.cursor(codec).unwrap();
-        println!("\n\n=> CURSOR <=\n\n");
+        println!("\n\n=> CURSOR: iterating using .next() <=\n\n");
         println!(
             "Before iterating the cursor: sst has {} block(s) and {} record(s) in total",
             sst.block_meta().len(),
@@ -750,5 +789,49 @@ mod test {
             i, num_records,
             "cursor shouldve seen all elements inside the sstable"
         );
+
+        // c.seek_to_first();
+        println!("\n\n=> CURSOR: seeking (in order)<=");
+        for (i, r) in records.iter().enumerate() {
+            c.seek(&r.key);
+
+            if let Some(joint_err) = c.get_error() {
+                match joint_err {
+                    Ok(se) => panic!("{i}/{num_records}: cursor stopped from sst read error: {se}"),
+                    Err(ce) => panic!("{i}/{num_records}:cursor stopped from codec error: {ce}"),
+                }
+            }
+
+            println!("{i}/{num_records}: {:?}", c.current());
+            assert_eq!(
+                Some(r),
+                c.current(),
+                "{i}/{num_records}: c.current() returned None"
+            );
+        }
+
+        println!("\n\n=> CURSOR: seeking (in order)<=");
+        let mut random_records: Vec<(usize, Record)> =
+            records.iter().cloned().enumerate().collect();
+        use rand::seq::SliceRandom;
+        random_records.shuffle(&mut rand::rng());
+
+        for (i, r) in random_records {
+            c.seek(&r.key);
+
+            if let Some(joint_err) = c.get_error() {
+                match joint_err {
+                    Ok(se) => panic!("{i}/{num_records}: cursor stopped from sst read error: {se}"),
+                    Err(ce) => panic!("{i}/{num_records}:cursor stopped from codec error: {ce}"),
+                }
+            }
+
+            println!("{i}/{num_records}: {:?}", c.current());
+            assert_eq!(
+                Some(&r),
+                c.current(),
+                "{i}/{num_records}: c.current() returned None"
+            );
+        }
     }
 }

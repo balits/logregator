@@ -399,7 +399,7 @@ fn block_cursor() {
     // --- seek: exact key match -----------------------------------------------
 
     for r in &records {
-        cursor.seek(r.key.clone());
+        cursor.seek(&r.key);
         let got = cursor.current().expect("exact seek must find a record");
         assert_eq!(got.key, r.key);
     }
@@ -414,7 +414,7 @@ fn block_cursor() {
         sequence_num: records[2].key.sequence_num.saturating_sub(1),
         stream_id: records[2].key.stream_id,
     };
-    cursor.seek(between);
+    cursor.seek(&between);
     // Binary search returns Err(i) = first index strictly greater than the
     // probe, which here should be records[2].
     let got = cursor
@@ -434,7 +434,7 @@ fn block_cursor() {
         sequence_num: 0,
         stream_id: 0,
     };
-    cursor.seek(before_all);
+    cursor.seek(&before_all);
     // Must not panic; if a record is returned it must be the first one.
     if cursor.is_record() {
         assert_eq!(cursor.current().unwrap().key, records[0].key);
@@ -449,7 +449,7 @@ fn block_cursor() {
         sequence_num: u64::MAX,
         stream_id: last.key.stream_id,
     };
-    cursor.seek(beyond);
+    cursor.seek(&beyond);
     assert!(
         !cursor.is_record(),
         "seek past last key must invalidate cursor"
@@ -457,9 +457,9 @@ fn block_cursor() {
 
     // --- seek: idempotent on same key ----------------------------------------
 
-    cursor.seek(records[2].key.clone());
+    cursor.seek(&records[2].key.clone());
     let first_result = cursor.current().map(|r| r.key.clone());
-    cursor.seek(records[2].key.clone());
+    cursor.seek(&records[2].key.clone());
     let second_result = cursor.current().map(|r| r.key.clone());
     assert_eq!(
         first_result, second_result,
@@ -474,7 +474,7 @@ fn block_cursor() {
     let decoded_block = Rc::new(Block::decode_block(&encoded).unwrap());
     let mut dc = BlockCursor::new(decoded_block, codec());
     for r in &records {
-        dc.seek(r.key.clone());
+        dc.seek(&r.key);
         let got = dc
             .current()
             .expect("seek on decoded block must find record");

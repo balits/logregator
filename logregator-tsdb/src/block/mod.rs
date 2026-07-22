@@ -194,16 +194,16 @@ impl Block {
         let data = src[..offset_segment_start].to_vec();
 
         let offsets = {
-            let offset_span = span!(Level::TRACE, "offset_checking");
-            let _guard = offset_span.enter();
+            // let offset_span = span!(Level::TRACE, "offset_checking");
+            // let _guard = offset_span.enter();
 
             let iter = src[offset_segment_start..offset_segment_end]
                 .as_chunks::<SZ_U16>()
                 .0
                 .iter()
-                .inspect(|ch| {
-                    trace!("decode: chunk: {:?}", ch);
-                })
+                // .inspect(|ch| {
+                //     trace!("decode: chunk: {:?}", ch);
+                // })
                 .map(|[a, b]| u16::from_be_bytes([*a, *b]));
 
             let mut offsets = Vec::with_capacity(num_of_records);
@@ -229,9 +229,9 @@ impl Block {
                     ));
                 }
 
-                trace!(
-                    "offset chunk: start = {start}, end = {end}, wire_length = {record_wire_len}"
-                );
+                // trace!(
+                //     "offset chunk: start = {start}, end = {end}, wire_length = {record_wire_len}"
+                // );
             }
 
             offsets
