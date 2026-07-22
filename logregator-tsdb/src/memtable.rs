@@ -56,9 +56,9 @@ impl Memtable {
         ))
     }
 
-    pub fn freeze(&mut self) -> Arc<FrozenMemtable> {
+    pub fn freeze(&mut self) -> FrozenMemtable {
         let frozen = std::mem::replace(self, Self::new(self.limit));
-        Arc::new(FrozenMemtable(frozen))
+        FrozenMemtable(frozen)
     }
 
     #[inline]
