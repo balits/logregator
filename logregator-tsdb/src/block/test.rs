@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 
 use super::{Block, BlockCursor, BlockWriter, MAX_BLOCK_SIZE, SZ_U16, SZ_U32, WriteOutput};
 use crate::codec::BytesCodec;
+use crate::codec::spec::WireLen;
 use crate::record::{Key, Record};
 
 fn tracing() {

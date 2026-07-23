@@ -1,5 +1,6 @@
 pub mod block;
 pub mod codec;
+pub mod manifest;
 pub mod memtable;
 pub mod record;
 pub mod sst;

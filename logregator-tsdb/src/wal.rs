@@ -37,7 +37,7 @@ impl<C: Codec> Wal<C> {
         Ok(())
     }
 
-    fn try_recovery(path: &Path, codec: C) -> io::Result<FramedReader<File, C>> {
+    fn try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C>> {
         let f = open_read_append(path)?;
         Ok(FramedReader::new(f, codec))
     }
@@ -99,7 +99,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::try_recovery(tempf.path(), codec.clone())
+        let recovered: Vec<Record> = Wal::try_recover(tempf.path(), codec.clone())
             .expect("failed to open wal for recovery")
             .enumerate()
             .map(|(i, res)| {
@@ -150,7 +150,7 @@ mod test {
 
         // Recover once — this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = Wal::try_recovery(f.path(), codec.clone())
+        let _ = Wal::try_recover(f.path(), codec.clone())
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
@@ -165,7 +165,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::try_recovery(f.path(), codec.clone())
+        let recovered: Vec<Record> = Wal::try_recover(f.path(), codec.clone())
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();

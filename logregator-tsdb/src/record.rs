@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, mem::size_of};
 
-use crate::codec::CodecError;
+use crate::codec::{self, CodecError};
 
 #[repr(C)]
 #[derive(Clone)]
@@ -29,6 +29,13 @@ pub const MIN_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MIN_PAYL
 /// [KEY_SIZE]+ u32 as the payloads length prefix + [MAX_PAYLOAD_LENGTH]
 pub const MAX_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MAX_PAYLOAD_LENGTH;
 
+impl crate::codec::spec::WireLen for Record {
+    #[inline]
+    fn wire_len(&self) -> usize {
+        self.key.wire_len() + size_of::<u32>() + self.payload.len()
+    }
+}
+
 impl Record {
     /// Returns the resident memory used by this record in bytes.
     /// This should equal [key: 4 * 8 bytes] [boxed_slice: 8 + 8 bytes] [1 byte * payload_len].
@@ -37,12 +44,12 @@ impl Record {
         size_of::<Self>() + self.payload.len()
     }
 
-    /// Returns the size of this record as its serialized to bytes.
-    /// This should equal [key: 4 * 8 bytes] [payload_len: 4 bytes] [1 byte * payload_len].
-    #[inline]
-    pub const fn wire_len(&self) -> usize {
-        KEY_SIZE + size_of::<u32>() + self.payload.len()
-    }
+    // /// Returns the size of this record as its serialized to bytes.
+    // /// This should equal [key: 4 * 8 bytes] [payload_len: 4 bytes] [1 byte * payload_len].
+    // #[inline]
+    // pub const fn wire_len(&self) -> usize {
+    //     KEY_SIZE + size_of::<u32>() + self.payload.len()
+    // }
 }
 
 impl PartialEq for Record {
@@ -81,6 +88,13 @@ pub struct Key {
 
     // stream_id is not used for any of the above
     pub stream_id: u64,
+}
+
+impl crate::codec::spec::WireLen for Key {
+    #[inline]
+    fn wire_len(&self) -> usize {
+        KEY_SIZE
+    }
 }
 
 impl PartialEq for Key {

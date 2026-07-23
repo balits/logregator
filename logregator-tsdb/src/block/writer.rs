@@ -2,7 +2,7 @@ use tracing::instrument;
 
 use crate::{
     block::{Block, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE},
-    codec::{Codec, CodecError},
+    codec::{Codec, CodecError, spec::WireLen},
     record::{Key, MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH, Record},
 };
 
