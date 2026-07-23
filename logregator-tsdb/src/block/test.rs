@@ -3,8 +3,8 @@ use std::rc::Rc;
 use pretty_assertions::assert_eq;
 
 use super::{Block, BlockCursor, BlockWriter, MAX_BLOCK_SIZE, SZ_U16, SZ_U32, WriteOutput};
-use crate::codec::BytesCodec;
-use crate::codec::spec::WireLen;
+use crate::codec::DefaultCodec;
+use crate::codec::WireLen;
 use crate::record::{Key, Record};
 
 fn tracing() {
@@ -14,8 +14,8 @@ fn tracing() {
         .try_init();
 }
 
-fn codec() -> BytesCodec {
-    BytesCodec
+fn codec() -> DefaultCodec {
+    DefaultCodec
 }
 
 fn key(source_id: u64, ts: u64, seq: u64) -> Key {

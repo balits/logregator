@@ -4,7 +4,7 @@ use tracing::trace;
 
 use crate::{
     block::Block,
-    codec::{Codec, CodecError},
+    codec::{self, CodecError, SpecCodec},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -14,14 +14,17 @@ use crate::{
 /// to update the cursors internal item, [in_valid()] will return false if this
 // fails. It also fails after [next()] results in going past the offset array.
 #[derive(Debug)]
-pub struct BlockCursor<C: Codec> {
+pub struct BlockCursor<C> {
     block: Rc<Block>,
     offset_idx: usize,
     record: Result<Option<Record>, CodecError>,
     codec: C,
 }
 
-impl<C: Codec> BlockCursor<C> {
+impl<C> BlockCursor<C>
+where
+    C: SpecCodec<Record> + SpecCodec<Key>,
+{
     pub fn new(block: Rc<Block>, c: C) -> Self {
         Self {
             block,
@@ -94,11 +97,15 @@ impl<C: Codec> BlockCursor<C> {
 
             let offset = *o as usize;
             let key_bs = &self.block.data[offset..offset + KEY_SIZE];
-            match self.codec.decode_key(key_bs) {
-                Ok(key) => key.cmp(&seek_key),
+            match <C as SpecCodec<Key>>::decode(&self.codec, key_bs) {
+                Ok(Some((key, _))) => key.cmp(seek_key),
+                Ok(None) => {
+                    search_err = Some(codec::unexpected("failed to decode key from block"));
+                    std::cmp::Ordering::Less // meaningless
+                }
                 Err(e) => {
                     search_err = Some(e);
-                    std::cmp::Ordering::Less // sentinel
+                    std::cmp::Ordering::Less // meaningless
                 }
             }
         });

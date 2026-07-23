@@ -4,25 +4,24 @@ use std::{fs::File, io};
 
 use tracing::instrument;
 
-use crate::codec::{BytesCodec, Codec, CodecError, FramedReader, FramedWriter};
+use crate::codec::{CodecError, FramedReader, FramedWriter, SpecCodec};
 use crate::record::Record;
 
-pub struct Wal<C: Codec = BytesCodec> {
+pub struct Wal<C: SpecCodec<Record>> {
     path: PathBuf,
-    framed: FramedWriter<File, C>,
-    codec: C,
+    framed: FramedWriter<File, C, Record>,
+    f: File,
 }
 
-impl<C: Codec> Wal<C> {
+impl<C> Wal<C>
+where
+    C: SpecCodec<Record>,
+{
     pub fn new(path: &Path, codec: C) -> io::Result<Self> {
         let f = open_read_append(path)?;
         let path = path.to_path_buf();
-        let framed = FramedWriter::new(f, codec.clone());
-        Ok(Self {
-            path,
-            framed,
-            codec,
-        })
+        let framed = FramedWriter::new(f.try_clone()?, codec.clone());
+        Ok(Self { path, framed, f })
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -37,7 +36,7 @@ impl<C: Codec> Wal<C> {
         Ok(())
     }
 
-    fn try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C>> {
+    fn try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C, Record>> {
         let f = open_read_append(path)?;
         Ok(FramedReader::new(f, codec))
     }
@@ -54,7 +53,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use crate::{
-        codec::BytesCodec,
+        codec::DefaultCodec,
         record::{Key, Record},
         wal::Wal,
     };
@@ -66,7 +65,7 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), BytesCodec).expect("wal::new");
+        let mut w = Wal::new(f.path(), DefaultCodec).expect("wal::new");
 
         for i in 0..100u64 {
             let rec = Record {
@@ -82,7 +81,7 @@ mod test {
     fn wal_recover() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let tempf = NamedTempFile::new().expect("tempfile");
         let mut w = Wal::new(tempf.path(), codec.clone()).expect("wal::new");
 
@@ -133,7 +132,7 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let f = NamedTempFile::new().expect("tempfile");
         let mut w = Wal::new(f.path(), codec.clone()).expect("wal::new");
 

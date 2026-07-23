@@ -12,7 +12,7 @@ use crate::{
     block::{
         self, Block, BlockCodecError, BlockCursor, BlockWriter, InvalidBlockLimit, WriteOutput,
     },
-    codec::{self, Codec, CodecError},
+    codec::{self, CodecError, SpecCodec, WireLen},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -62,7 +62,7 @@ pub enum SstWriteError {
 }
 
 #[derive(Debug)]
-pub struct SstWriter<W: io::Write, C: Codec> {
+pub struct SstWriter<W: io::Write, C> {
     writer: W,
     block_bytes_written: usize,
     block_writer: BlockWriter<C>,
@@ -74,7 +74,11 @@ pub struct SstWriter<W: io::Write, C: Codec> {
     codec: C,
 }
 
-impl<W: io::Write, C: Codec> SstWriter<W, C> {
+impl<W, C> SstWriter<W, C>
+where
+    W: io::Write,
+    C: SpecCodec<Record> + SpecCodec<Key>,
+{
     pub fn new(writer: W, codec: C, block_limit: Option<usize>) -> Result<Self, InvalidBlockLimit> {
         let block_writer = BlockWriter::new(codec.clone(), block_limit)?;
         let block_limit = block_writer.limit();
@@ -201,11 +205,14 @@ impl<W: io::Write, C: Codec> SstWriter<W, C> {
 }
 
 #[derive(Debug)]
-pub struct SstFileWriter<C: Codec> {
+pub struct SstFileWriter<C> {
     inner: SstWriter<FileHandle, C>,
 }
 
-impl<C: Codec> SstFileWriter<C> {
+impl<C> SstFileWriter<C>
+where
+    C: SpecCodec<Record> + SpecCodec<Key>,
+{
     pub fn new(
         id: u32,
         codec: C,
@@ -270,7 +277,10 @@ impl SstHandle {
         &self.meta.block_meta
     }
 
-    pub fn cursor<C: Codec>(self: &Rc<Self>, codec: C) -> Result<SstCursor<C>, SstReadError> {
+    pub fn cursor<C: SpecCodec<Record> + SpecCodec<Key>>(
+        self: &Rc<Self>,
+        codec: C,
+    ) -> Result<SstCursor<C>, SstReadError> {
         SstCursor::new(self.clone(), codec)
     }
 
@@ -316,14 +326,17 @@ pub struct SstMeta {
 }
 
 #[derive(Debug)]
-pub struct SstCursor<C: Codec> {
+pub struct SstCursor<C> {
     sst: Rc<SstHandle>,
     block_cursor: Result<BlockCursor<C>, SstReadError>,
     block_idx: usize,
     codec: C,
 }
 
-impl<C: Codec> SstCursor<C> {
+impl<C> SstCursor<C>
+where
+    C: SpecCodec<Record> + SpecCodec<Key>,
+{
     fn new(sst: Rc<SstHandle>, codec: C) -> Result<Self, SstReadError> {
         let block_idx = 0;
         let block = sst.read_block(block_idx)?;
@@ -527,22 +540,33 @@ pub struct BlockMetadata {
     last_key: Key,
 }
 
+impl WireLen for BlockMetadata {
+    fn wire_len(&self) -> usize {
+        Self::static_wire_len()
+    }
+}
+
 impl BlockMetadata {
-    const fn wire_len() -> usize {
+    pub const fn static_wire_len() -> usize {
         size_of::<u32>() + KEY_SIZE + KEY_SIZE
     }
 
-    pub fn encode_metas<C: Codec>(metas: &[Self], c: &C) -> Result<Vec<u8>, CodecError> {
+    pub fn encode_metas<C: SpecCodec<Key>>(metas: &[Self], c: &C) -> Result<Vec<u8>, CodecError> {
         // need enough bytes the lenght prefix, for the metas themselves,
         // and for the 32bit checksum
-        let capacity = SZ_U32 + metas.len() * Self::wire_len() + SZ_U32;
+        let capacity = SZ_U32 + metas.len() * Self::static_wire_len() + SZ_U32;
         let mut data = Vec::with_capacity(capacity);
         data.extend((metas.len() as u32).to_be_bytes());
+        let mut key_bytes = [0; KEY_SIZE];
+        let mut encode_key = |key: &Key| -> Result<[u8; KEY_SIZE], CodecError> {
+            c.encode(key, &mut key_bytes)?;
+            Ok(key_bytes)
+        };
 
         for m in metas {
             data.extend(&m.offset.to_be_bytes());
-            data.extend(c.encode_key(&m.first_key)?);
-            data.extend(c.encode_key(&m.last_key)?);
+            data.extend(encode_key(&m.first_key)?);
+            data.extend(encode_key(&m.last_key)?);
         }
         let checksum = crc32c::crc32c(&data[..]);
         data.extend(checksum.to_be_bytes());
@@ -550,7 +574,7 @@ impl BlockMetadata {
     }
 
     #[instrument(skip(src), err)]
-    pub fn decode_metas<C: Codec>(src: &[u8], codec: &C) -> Result<Vec<Self>, CodecError> {
+    pub fn decode_metas<C: SpecCodec<Key>>(src: &[u8], codec: &C) -> Result<Vec<Self>, CodecError> {
         if src.len() < SZ_U32 {
             trace!("not enough bytes for length prefix");
             return Err(CodecError::UnexpectedSize(codec::UnexpectedSize {
@@ -561,7 +585,7 @@ impl BlockMetadata {
         let metas_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
         let mut consumed = SZ_U32; // we already read length prefix
 
-        let want_total_size = SZ_U32 + metas_len * Self::wire_len() + SZ_U32;
+        let want_total_size = SZ_U32 + metas_len * Self::static_wire_len() + SZ_U32;
         if src.len() < want_total_size {
             trace!(
                 "not enough bytes for length prefix + {} * block metas + checksum (src.len() = {})",
@@ -574,6 +598,16 @@ impl BlockMetadata {
             }));
         }
 
+        let decode_key = |src: &[u8]| -> Result<Key, CodecError> {
+            match codec.decode(src) {
+                Ok(Some((key, _))) => Ok(key),
+                Ok(None) => Err(codec::unexpected(
+                    "BlockMetadata::decode_metas(): failed to decode key from raw bytes",
+                )),
+                Err(e) => Err(e),
+            }
+        };
+
         let mut data = Vec::with_capacity(metas_len);
         for _ in 0..metas_len {
             let offset = u32::from_be_bytes([
@@ -583,9 +617,9 @@ impl BlockMetadata {
                 src[consumed + 3],
             ]);
             consumed += SZ_U32;
-            let first_key = codec.decode_key(&src[consumed..consumed + KEY_SIZE])?;
+            let first_key = decode_key(&src[consumed..consumed + KEY_SIZE])?;
             consumed += KEY_SIZE;
-            let last_key = codec.decode_key(&src[consumed..consumed + KEY_SIZE])?;
+            let last_key = decode_key(&src[consumed..consumed + KEY_SIZE])?;
             consumed += KEY_SIZE;
 
             let meta = BlockMetadata {
@@ -604,7 +638,7 @@ impl BlockMetadata {
             src[consumed + 3],
         ]);
         if stored != computed {
-            return Err(CodecError::Other(format!(
+            return Err(codec::unexpected(format!(
                 "checksum mismatch, {stored:#x} (stored) != {computed:#x} (computed)"
             )));
         }
@@ -617,12 +651,11 @@ impl BlockMetadata {
 mod test {
     use std::rc::Rc;
 
-    use pretty_assertions::{assert_eq, assert_str_eq};
-    use tracing_subscriber::fmt::format::FmtSpan;
+    use pretty_assertions::assert_eq;
 
     use super::BlockMetadata;
     use crate::{
-        codec::BytesCodec,
+        codec::DefaultCodec,
         record::Record,
         sst::{SstFileWriter, SstWriter},
     };
@@ -651,7 +684,7 @@ mod test {
     #[test]
     fn meta_codec() {
         tracing();
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let metas: Vec<BlockMetadata> = (0..10)
             .map(|i| BlockMetadata {
                 offset: i as u32,
@@ -678,7 +711,7 @@ mod test {
     #[test]
     fn sst_writer_inmem() {
         tracing();
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let writer = std::io::Cursor::new(Vec::new());
         let mut sw = SstWriter::new(writer, codec, None).unwrap();
 
@@ -697,7 +730,7 @@ mod test {
         let tempdir = tempfile::TempDir::new().unwrap();
 
         tracing();
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
 
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
 
@@ -713,7 +746,7 @@ mod test {
     fn sst_read_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
         let num_records = 10usize;
         for i in 0..num_records {
@@ -741,7 +774,7 @@ mod test {
     fn sst_cursor() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
         let num_records = 10;
         let records: Vec<Record> = (0..num_records).map(|i| record(i as u64, 512)).collect();

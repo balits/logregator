@@ -6,15 +6,12 @@ use std::{
 
 use tracing::{instrument, trace};
 
-use crate::codec::{
-    self, CodecError,
-    spec::{FramedReader, WireLen},
-};
+use crate::codec::{self, CodecError, FramedReader, FramedWriter, SpecCodec, WireLen};
 
 /// TODO: should the methods return io::Error or CodecError (which an Io(io::Error) variant)
 pub struct Manifest {
     pathbuf: PathBuf,
-    framed: codec::spec::FramedWriter<File, ManifestCodec, ManifestOp>,
+    framed: FramedWriter<File, ManifestCodec, ManifestOp>,
     f: File,
 }
 
@@ -26,7 +23,7 @@ impl Manifest {
             .append(true)
             .open(path)?;
 
-        let framed = codec::spec::FramedWriter::new(f.try_clone()?, ManifestCodec);
+        let framed = FramedWriter::new(f.try_clone()?, ManifestCodec);
 
         Ok(Self {
             pathbuf: path.into(),
@@ -97,7 +94,7 @@ impl ManifestOp {
 #[derive(Debug, Clone)]
 pub struct ManifestCodec;
 
-impl codec::spec::SpecCodec<ManifestOp> for ManifestCodec {
+impl SpecCodec<ManifestOp> for ManifestCodec {
     #[instrument(err)]
     fn encode(&self, op: &ManifestOp, dst: &mut [u8]) -> Result<usize, codec::CodecError> {
         if dst.len() < op.wire_len() {
@@ -147,7 +144,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::codec::BytesCodec;
+    use crate::codec::DefaultCodec;
 
     const PAYLOAD: &[u8] = b"du bist gut genug";
 
@@ -228,7 +225,7 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = BytesCodec;
+        let codec = DefaultCodec;
         let f = NamedTempFile::new().unwrap();
         let mut w = Manifest::new(f.path()).unwrap();
 

@@ -1,8 +1,9 @@
+use std::fmt::Debug;
 use tracing::instrument;
 
 use crate::{
     block::{Block, DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE},
-    codec::{Codec, CodecError, spec::WireLen},
+    codec::{CodecError, SpecCodec, WireLen},
     record::{Key, MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH, Record},
 };
 
@@ -15,18 +16,18 @@ use crate::{
 ///
 /// Calculating the blocks size will always use [Record::wire_len]
 /// instead of its in-memory counterpart [Record::size_of]
-pub struct BlockWriter<C: Codec> {
+pub struct BlockWriter<C> {
     buffer: Vec<u8>,
     codec: C,
     offsets: Vec<u16>,
     size: usize,
     limit: usize,
-    _record_count: usize,
+    record_count: usize,
     first_key: Option<Key>,
     last_key: Option<Key>,
 }
 
-impl<C: Codec> std::fmt::Debug for BlockWriter<C> {
+impl<C: Debug> Debug for BlockWriter<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockWriter<C>")
             .field(
@@ -40,7 +41,7 @@ impl<C: Codec> std::fmt::Debug for BlockWriter<C> {
             )
             .field("size", &self.size)
             .field("limit", &self.limit)
-            .field("_record_count", &self._record_count)
+            .field("_record_count", &self.record_count)
             .field("first_key", &self.first_key)
             .field("last_key", &self.last_key)
             .finish()
@@ -56,8 +57,7 @@ pub enum WriteOutput {
 #[error("invalid block limit: got = {0}, max = {max}", max = MAX_BLOCK_SIZE)]
 pub struct InvalidBlockLimit(usize);
 
-impl<C: Codec> BlockWriter<C> {
-    #[instrument(err)]
+impl<C> BlockWriter<C> {
     pub fn new(codec: C, limit: Option<usize>) -> Result<Self, InvalidBlockLimit> {
         let limit = match limit {
             Some(l) => {
@@ -71,14 +71,14 @@ impl<C: Codec> BlockWriter<C> {
 
         let size = 0;
         let buffer = Vec::with_capacity(limit);
-        let offsets =
-            Vec::with_capacity(limit / (MAX_RECORD_WIRE_LENGTH + MIN_RECORD_WIRE_LENGTH / 2));
+        let avg_rec_length = (MAX_RECORD_WIRE_LENGTH + MIN_RECORD_WIRE_LENGTH) / 2;
+        let offsets = Vec::with_capacity(limit / avg_rec_length);
         let this = Self {
             buffer,
             size,
             codec,
             limit,
-            _record_count: 0,
+            record_count: 0,
             offsets,
             first_key: None,
             last_key: None,
@@ -86,10 +86,41 @@ impl<C: Codec> BlockWriter<C> {
         Ok(this)
     }
 
+    pub fn into_block(mut self) -> (Block, Option<Key>, Option<Key>) {
+        let block = Block {
+            data: self.buffer,
+            offsets: self.offsets,
+        };
+        let first_key = self.first_key.take();
+        let last_key = self.last_key.take();
+        (block, first_key, last_key)
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn first_key(&self) -> Option<&Key> {
+        self.first_key.as_ref()
+    }
+
+    pub fn last_key(&self) -> Option<&Key> {
+        self.last_key.as_ref()
+    }
+}
+
+impl<C> BlockWriter<C>
+where
+    C: SpecCodec<Record>,
+{
     /// Encodes record into the block, returning Ok(true) if successful.
     /// If the block is full, Ok(false) is returned,
     /// if any other error is encounder Err(..) is returned
-    #[instrument(skip(self), err, fields(block_size = self.size, record_count = self._record_count))]
+    #[instrument(skip(self), err, fields(block_size = self.size, record_count = self.record_count))]
     pub fn write(&mut self, rec: &Record) -> Result<WriteOutput, CodecError> {
         let est_total_size = self.size
             + rec.wire_len()
@@ -116,34 +147,7 @@ impl<C: Codec> BlockWriter<C> {
 
         self.offsets.push(self.size as u16);
         self.size += rec.wire_len();
-        self._record_count += 1;
+        self.record_count += 1;
         Ok(WriteOutput::Written)
-    }
-
-    #[instrument(skip(self), fields(first_key = ?self.first_key, last_key = ?self.last_key))]
-    pub fn into_block(mut self) -> (Block, Option<Key>, Option<Key>) {
-        let block = Block {
-            data: self.buffer,
-            offsets: self.offsets,
-        };
-        let first_key = self.first_key.take();
-        let last_key = self.last_key.take();
-        (block, first_key, last_key)
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-
-    pub fn first_key(&self) -> Option<&Key> {
-        self.first_key.as_ref()
-    }
-
-    pub fn last_key(&self) -> Option<&Key> {
-        self.last_key.as_ref()
     }
 }

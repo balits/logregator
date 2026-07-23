@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, mem::size_of};
 
-use crate::codec::{self, CodecError};
+use crate::codec::{CodecError, WireLen};
 
 #[repr(C)]
 #[derive(Clone)]
@@ -29,7 +29,7 @@ pub const MIN_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MIN_PAYL
 /// [KEY_SIZE]+ u32 as the payloads length prefix + [MAX_PAYLOAD_LENGTH]
 pub const MAX_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MAX_PAYLOAD_LENGTH;
 
-impl crate::codec::spec::WireLen for Record {
+impl WireLen for Record {
     #[inline]
     fn wire_len(&self) -> usize {
         self.key.wire_len() + size_of::<u32>() + self.payload.len()
@@ -90,7 +90,7 @@ pub struct Key {
     pub stream_id: u64,
 }
 
-impl crate::codec::spec::WireLen for Key {
+impl WireLen for Key {
     #[inline]
     fn wire_len(&self) -> usize {
         KEY_SIZE

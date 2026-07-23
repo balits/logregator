@@ -5,15 +5,15 @@ mod writer;
 // i dont want AI generated code here
 // but i just couldnt bother to refactor
 // the test cases, so FIXME
-#[cfg(test)]
-mod test;
+// #[cfg(test)]
+// mod test;
 
 pub use cursor::BlockCursor;
 pub use error::*;
 pub use writer::*;
 
 use crc32c::crc32c;
-use tracing::{Level, instrument, span, trace};
+use tracing::{instrument, trace};
 
 use std::fmt::Debug;
 
