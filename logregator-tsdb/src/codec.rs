@@ -507,3 +507,119 @@ mod test {
         assert_eq!(decoded, vec![good]);
     }
 }
+
+mod spec {
+    use std::{
+        fmt::Debug,
+        io::{self, Read},
+    };
+
+    use tracing::trace;
+
+    use crate::codec::CodecError;
+
+    const BUFSIZE: usize = 4 * 1024;
+
+    pub trait SpecCodec: Clone + Debug {
+        type Item;
+        fn encode(&self, item: Self::Item, dst: &mut [u8]) -> Result<usize, CodecError>;
+        fn decode(&self, src: &[u8]) -> Result<Option<(Self::Item, usize)>, CodecError>;
+    }
+
+    pub struct FramedReader<R: io::Read, C> {
+        inner: io::BufReader<R>,
+        buf: Vec<u8>,
+        start: usize,
+        end: usize,
+        codec: C,
+    }
+
+    impl<R, C> FramedReader<R, C>
+    where
+        R: io::Read,
+    {
+        pub fn new(r: R, codec: C) -> Self {
+            Self {
+                inner: io::BufReader::new(r),
+                buf: vec![0; BUFSIZE],
+                start: 0,
+                end: 0,
+                codec,
+            }
+        }
+
+        fn fill(&mut self) -> io::Result<bool> {
+            if self.end == self.buf.len() {
+                if self.start > 0 {
+                    self.buf.copy_within(self.start..self.end, 0);
+                    self.end -= self.start;
+                    self.start = 0;
+                }
+
+                if self.end == self.buf.len() {
+                    self.buf.resize(self.buf.len() * 2, 0);
+                }
+            }
+
+            match self.inner.read(&mut self.buf[self.end..]) {
+                Ok(0) => Ok(true),
+                Ok(n) => {
+                    self.end += n;
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        pub fn buf_reader(&mut self) -> &mut io::BufReader<R> {
+            &mut self.inner
+        }
+    }
+
+    impl<R, C, I> Iterator for FramedReader<R, C>
+    where
+        R: io::Read,
+        C: SpecCodec<Item = I>,
+    {
+        type Item = Result<<C as SpecCodec>::Item, CodecError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                match self.codec.decode(&self.buf[self.start..self.end]) {
+                    Ok(Some((item, n))) => {
+                        self.start += n;
+                        return Some(Ok(item));
+                    }
+                    Ok(None) => match self.fill() {
+                        Ok(false) => continue,
+                        Ok(true) => return None,
+                        Err(e) => {
+                            trace!(
+                                "FramedReader::fill (Iterator::next): failed to fill internal buffer: {}",
+                                e
+                            );
+                            return None;
+                        }
+                    },
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
+    }
+
+    impl<R, C> Debug for FramedReader<R, C>
+    where
+        R: io::Read + Debug,
+        C: Debug,
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FramedReader<R, C>")
+                .field("inner", &format_args!("{:?}", self.inner))
+                .field("buf", &format_args!("[0..{}]", self.buf.len()))
+                .field("start", &self.start)
+                .field("end", &self.end)
+                .field("codec", &self.codec)
+                .finish()
+        }
+    }
+}
