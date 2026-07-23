@@ -79,72 +79,27 @@ fn invalid_payload_sz(got: usize) -> CodecError {
 
 impl Codec for BytesCodec {
     fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
-        if dst.len() < rec.wire_len() {
-            trace!(
-                "not enough bytes to encode into (has: {}, need: {})",
-                dst.len(),
-                rec.wire_len()
-            );
-            return Err(not_enough_bytes(dst.len(), rec.wire_len()));
-        }
-
-        dst[0..KEY_SIZE].copy_from_slice(&self.encode_key(&rec.key)?);
-
-        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
-            return Err(invalid_payload_sz(rec.payload.len()));
-        }
-
-        let payload_len = (rec.payload.len() as u32).to_be_bytes();
-        dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
-        dst[KEY_SIZE + PAYLOAD_LEN_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
-            .copy_from_slice(&rec.payload);
-
-        Ok(rec.wire_len())
+        <Self as spec::SpecCodec<Record>>::encode(self, rec, dst)
     }
 
     fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
-        if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
-            trace!(
-                "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
-                src.len(),
-                KEY_SIZE + PAYLOAD_LEN_SIZE
-            );
-            return Ok(None);
-        }
-
-        let key = self.decode_key(src)?;
-
-        let payload_len = u32::from_be_bytes([
-            src[KEY_SIZE],
-            src[KEY_SIZE + 1],
-            src[KEY_SIZE + 2],
-            src[KEY_SIZE + 3],
-        ]) as usize;
-
-        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
-            return Err(invalid_payload_sz(payload_len));
-        }
-        let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len;
-        if src.len() < total {
-            trace!("not enoguh bytes to decode from (payload)");
-            return Ok(None);
-        }
-
-        let payload = src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]
-            .to_vec()
-            .into_boxed_slice();
-
-        Ok(Some((Record { key, payload }, total)))
+        <Self as spec::SpecCodec<Record>>::decode(self, src)
     }
 
     fn encode_key(&self, key: &Key) -> Result<[u8; KEY_SIZE], CodecError> {
-        let mut bytes = [0u8; KEY_SIZE];
-        key.to_be_bytes(&mut bytes);
-        Ok(bytes)
+        let mut dst = [0; KEY_SIZE];
+        <Self as spec::SpecCodec<Key>>::encode(self, key, &mut dst)?;
+        Ok(dst)
     }
 
     fn decode_key(&self, src: &[u8]) -> Result<Key, CodecError> {
-        Key::from_be_bytes(&src[..KEY_SIZE])
+        if let Some((key, _)) = <Self as spec::SpecCodec<Key>>::decode(self, src)? {
+            Ok(key)
+        } else {
+            Err(CodecError::Other(
+                "BytesCodec as SpecCodec<Key> couldnt decode key from `src`".into(),
+            ))
+        }
     }
 }
 
@@ -508,35 +463,119 @@ mod test {
     }
 }
 
-mod spec {
+pub mod spec {
     use std::{
         fmt::Debug,
         io::{self, Read},
+        marker::PhantomData,
     };
 
     use tracing::trace;
 
-    use crate::codec::CodecError;
+    use super::*;
 
     const BUFSIZE: usize = 4 * 1024;
 
-    pub trait SpecCodec: Clone + Debug {
-        type Item;
-        fn encode(&self, item: Self::Item, dst: &mut [u8]) -> Result<usize, CodecError>;
-        fn decode(&self, src: &[u8]) -> Result<Option<(Self::Item, usize)>, CodecError>;
+    pub trait SpecCodec<I: Sized>: Clone + Debug {
+        fn encode(&self, item: &I, dst: &mut [u8]) -> Result<usize, CodecError>;
+        fn decode(&self, src: &[u8]) -> Result<Option<(I, usize)>, CodecError>;
     }
 
-    pub struct FramedReader<R: io::Read, C> {
+    impl SpecCodec<Key> for super::BytesCodec {
+        fn encode(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
+            if dst.len() < KEY_SIZE {
+                return Err(CodecError::UnexpectedSize(UnexpectedSize {
+                    got: dst.len(),
+                    want: KEY_SIZE,
+                }));
+            }
+            key.to_be_bytes(dst.try_into().map_err(io::Error::other)?);
+            Ok(KEY_SIZE)
+        }
+
+        fn decode(&self, src: &[u8]) -> Result<Option<(Key, usize)>, CodecError> {
+            let k = Key::from_be_bytes(&src[..KEY_SIZE])?;
+            Ok(Some((k, KEY_SIZE)))
+        }
+    }
+
+    impl SpecCodec<Record> for super::BytesCodec {
+        fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
+            if dst.len() < rec.wire_len() {
+                trace!(
+                    "not enough bytes to encode into `dst` (got: {}, want: {})",
+                    dst.len(),
+                    rec.wire_len()
+                );
+                return Err(super::not_enough_bytes(dst.len(), rec.wire_len()));
+            }
+
+            let _ = <Self as SpecCodec<Key>>::encode(self, &rec.key, &mut dst[0..KEY_SIZE])?;
+
+            if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
+                return Err(invalid_payload_sz(rec.payload.len()));
+            }
+
+            let payload_len = (rec.payload.len() as u32).to_be_bytes();
+            dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
+            dst[KEY_SIZE + PAYLOAD_LEN_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
+                .copy_from_slice(&rec.payload);
+
+            Ok(rec.wire_len())
+        }
+
+        fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
+            if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
+                trace!(
+                    "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
+                    src.len(),
+                    KEY_SIZE + PAYLOAD_LEN_SIZE
+                );
+                return Ok(None);
+            }
+
+            let (key, _) = match <Self as SpecCodec<Key>>::decode(self, src)? {
+                None => return Ok(None),
+                Some(t) => t,
+            };
+
+            let payload_len = u32::from_be_bytes([
+                src[KEY_SIZE],
+                src[KEY_SIZE + 1],
+                src[KEY_SIZE + 2],
+                src[KEY_SIZE + 3],
+            ]) as usize;
+
+            if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
+                return Err(invalid_payload_sz(payload_len));
+            }
+            let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len;
+            if src.len() < total {
+                trace!("not enoguh bytes to decode from (payload)");
+                return Ok(None);
+            }
+
+            let payload = src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]
+                .to_vec()
+                .into_boxed_slice();
+
+            Ok(Some((Record { key, payload }, total)))
+        }
+    }
+
+    pub struct FramedReader<R: io::Read, C: SpecCodec<I>, I> {
         inner: io::BufReader<R>,
         buf: Vec<u8>,
         start: usize,
         end: usize,
         codec: C,
+        _phantom: PhantomData<I>,
     }
 
-    impl<R, C> FramedReader<R, C>
+    impl<R, C, I> FramedReader<R, C, I>
     where
         R: io::Read,
+        C: SpecCodec<I>,
     {
         pub fn new(r: R, codec: C) -> Self {
             Self {
@@ -545,6 +584,7 @@ mod spec {
                 start: 0,
                 end: 0,
                 codec,
+                _phantom: PhantomData,
             }
         }
 
@@ -576,12 +616,12 @@ mod spec {
         }
     }
 
-    impl<R, C, I> Iterator for FramedReader<R, C>
+    impl<R, C, I> Iterator for FramedReader<R, C, I>
     where
         R: io::Read,
-        C: SpecCodec<Item = I>,
+        C: SpecCodec<I>,
     {
-        type Item = Result<<C as SpecCodec>::Item, CodecError>;
+        type Item = Result<I, CodecError>;
 
         fn next(&mut self) -> Option<Self::Item> {
             loop {
@@ -607,10 +647,10 @@ mod spec {
         }
     }
 
-    impl<R, C> Debug for FramedReader<R, C>
+    impl<R, C, I> Debug for FramedReader<R, C, I>
     where
         R: io::Read + Debug,
-        C: Debug,
+        C: SpecCodec<I> + Debug,
     {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FramedReader<R, C>")
