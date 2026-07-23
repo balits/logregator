@@ -5,8 +5,9 @@ use std::{
 
 use tracing::trace;
 
-use crate::record::{
-    KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
+use crate::{
+    codec::spec::WireLen,
+    record::{KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record},
 };
 
 // TODO: migrate to decode = decode_key + decode_payload and
@@ -65,15 +66,15 @@ pub enum CodecError {
     Other(String),
 }
 
-fn not_enough_bytes(got: usize, want: usize) -> CodecError {
+pub fn not_enough_bytes(got: usize, want: usize) -> CodecError {
     CodecError::UnexpectedSize(UnexpectedSize { got, want })
 }
 
-fn unexpected(msg: &str) -> CodecError {
+pub fn unexpected(msg: &str) -> CodecError {
     CodecError::Unexpected { msg: msg.into() }
 }
 
-fn invalid_payload_sz(got: usize) -> CodecError {
+pub fn invalid_payload_sz(got: usize) -> CodecError {
     CodecError::InvalidPayloadSize(InvalidPayloadSize::new(got))
 }
 
@@ -476,17 +477,20 @@ pub mod spec {
 
     const BUFSIZE: usize = 4 * 1024;
 
-    pub trait SpecCodec<I: Sized>: Clone + Debug {
+    pub trait WireLen: Sized {
+        fn wire_len(&self) -> usize;
+    }
+    pub trait SpecCodec<I: WireLen>: Clone + Debug {
         fn encode(&self, item: &I, dst: &mut [u8]) -> Result<usize, CodecError>;
         fn decode(&self, src: &[u8]) -> Result<Option<(I, usize)>, CodecError>;
     }
 
     impl SpecCodec<Key> for super::BytesCodec {
         fn encode(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
-            if dst.len() < KEY_SIZE {
+            if dst.len() < key.wire_len() {
                 return Err(CodecError::UnexpectedSize(UnexpectedSize {
                     got: dst.len(),
-                    want: KEY_SIZE,
+                    want: key.wire_len(),
                 }));
             }
             key.to_be_bytes(dst.try_into().map_err(io::Error::other)?);
@@ -563,7 +567,7 @@ pub mod spec {
         }
     }
 
-    pub struct FramedReader<R: io::Read, C: SpecCodec<I>, I> {
+    pub struct FramedReader<R: io::Read, C: SpecCodec<I>, I: WireLen> {
         inner: io::BufReader<R>,
         buf: Vec<u8>,
         start: usize,
@@ -576,6 +580,7 @@ pub mod spec {
     where
         R: io::Read,
         C: SpecCodec<I>,
+        I: WireLen,
     {
         pub fn new(r: R, codec: C) -> Self {
             Self {
@@ -620,6 +625,7 @@ pub mod spec {
     where
         R: io::Read,
         C: SpecCodec<I>,
+        I: WireLen,
     {
         type Item = Result<I, CodecError>;
 
@@ -651,6 +657,7 @@ pub mod spec {
     where
         R: io::Read + Debug,
         C: SpecCodec<I> + Debug,
+        I: WireLen,
     {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FramedReader<R, C>")
@@ -658,6 +665,69 @@ pub mod spec {
                 .field("buf", &format_args!("[0..{}]", self.buf.len()))
                 .field("start", &self.start)
                 .field("end", &self.end)
+                .field("codec", &self.codec)
+                .finish()
+        }
+    }
+
+    pub struct FramedWriter<W: Write, C: SpecCodec<I>, I: WireLen> {
+        inner: BufWriter<W>,
+        buf: Vec<u8>,
+        codec: C,
+        _phantom: PhantomData<I>,
+    }
+
+    impl<W, C, I> FramedWriter<W, C, I>
+    where
+        W: io::Write,
+        C: SpecCodec<I>,
+        I: WireLen,
+    {
+        pub fn new(w: W, c: C) -> Self {
+            Self {
+                inner: BufWriter::new(w),
+                buf: vec![0; BUFSIZE],
+                codec: c,
+                _phantom: PhantomData,
+            }
+        }
+
+        pub fn write(&mut self, item: &I) -> Result<(), CodecError> {
+            self.buf.clear();
+            self.buf.resize(item.wire_len(), 0);
+
+            self.codec.encode(item, &mut self.buf)?;
+            self.inner.write_all(&self.buf).map_err(CodecError::from)?;
+            Ok(())
+        }
+
+        pub fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()?;
+            Ok(())
+        }
+
+        pub fn buf_writer(&mut self) -> &mut BufWriter<W> {
+            &mut self.inner
+        }
+
+        pub fn into_inner(self) -> Result<W, IntoInnerError<BufWriter<W>>> {
+            self.inner.into_inner()
+        }
+    }
+
+    impl<W, C, I> Debug for FramedWriter<W, C, I>
+    where
+        W: io::Write + Debug,
+        C: SpecCodec<I> + Debug,
+        I: WireLen,
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FramedWriter")
+                .field(
+                    "inner",
+                    &format_args!("{:?}", std::any::type_name_of_val(&self.inner)),
+                )
+                .field("buf", &format_args!("[0..{}]", self.buf.len()))
                 .field("codec", &self.codec)
                 .finish()
         }
