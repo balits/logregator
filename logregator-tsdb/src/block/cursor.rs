@@ -71,6 +71,14 @@ where
     }
 
     #[inline]
+    pub fn take_current(&mut self) -> Option<Record> {
+        match std::mem::replace(&mut self.record, Ok(None)) {
+            Ok(Some(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn next(&mut self) {
         self.offset_idx += 1;
         self.update_current();

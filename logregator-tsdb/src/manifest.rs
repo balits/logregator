@@ -55,7 +55,7 @@ const MANIFEST_OP_WIRE_LEN: usize = 1usize + MANIFEST_OP_ID_SIZE;
 /// [0 | 1 | ... Op enum tag: u8] [id_of_op_object: u32] => 40 byte each
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestOp {
-    MemtableFlush(u32),
+    SstFlush(u32),
     Compaction(u32),
 }
 
@@ -69,21 +69,21 @@ impl WireLen for ManifestOp {
 impl ManifestOp {
     pub fn tag(&self) -> u8 {
         match self {
-            Self::MemtableFlush(_) => 1,
+            Self::SstFlush(_) => 1,
             Self::Compaction(_) => 2,
         }
     }
 
     pub fn id(&self) -> u32 {
         match self {
-            Self::MemtableFlush(i) => *i,
+            Self::SstFlush(i) => *i,
             Self::Compaction(i) => *i,
         }
     }
 
     pub fn try_from_parts(tag: u8, id: u32) -> Option<Self> {
         let op = match tag {
-            1 => Self::MemtableFlush(id),
+            1 => Self::SstFlush(id),
             2 => Self::Compaction(id),
             _ => return None,
         };
@@ -146,8 +146,6 @@ mod test {
     use super::*;
     use crate::codec::DefaultCodec;
 
-    const PAYLOAD: &[u8] = b"du bist gut genug";
-
     #[test]
     fn lifecycle() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -157,7 +155,7 @@ mod test {
 
         for i in 0..100u32 {
             let op = match i % 2 {
-                0 => ManifestOp::MemtableFlush(i),
+                0 => ManifestOp::SstFlush(i),
                 1 => ManifestOp::Compaction(i),
                 _ => unreachable!(),
             };
@@ -181,7 +179,7 @@ mod test {
         let record_num = 100u32;
         let written: Vec<ManifestOp> = (0..record_num)
             .map(|i| match i % 2 {
-                0 => ManifestOp::MemtableFlush(i),
+                0 => ManifestOp::SstFlush(i),
                 1 => ManifestOp::Compaction(i),
                 _ => unreachable!(),
             })
@@ -231,7 +229,7 @@ mod test {
 
         let first_batch: Vec<ManifestOp> = (0..10u32)
             .map(|i| match i % 2 {
-                0 => ManifestOp::MemtableFlush(i),
+                0 => ManifestOp::SstFlush(i),
                 1 => ManifestOp::Compaction(i),
                 _ => unreachable!(),
             })
@@ -249,7 +247,7 @@ mod test {
 
         let second_batch: Vec<ManifestOp> = (10..20u32)
             .map(|i| match i % 2 {
-                0 => ManifestOp::MemtableFlush(i),
+                0 => ManifestOp::SstFlush(i),
                 1 => ManifestOp::Compaction(i),
                 _ => unreachable!(),
             })

@@ -1,13 +1,13 @@
 use std::{
     fmt::Debug,
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     rc::Rc,
 };
 
-use tracing::{info, instrument, trace};
+use tracing::{instrument, trace};
 
 use crate::{
     block::{
@@ -438,6 +438,15 @@ where
     }
 
     #[inline]
+    pub fn take_current(&mut self) -> Option<Record> {
+        if let Ok(c) = self.block_cursor.as_mut() {
+            c.take_current()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     #[instrument(skip(self), fields(block_idx = self.block_idx, block_count = self.sst.block_meta().len()))]
     pub fn next(&mut self) {
         if let Ok(c) = self.block_cursor.as_mut() {
@@ -756,7 +765,7 @@ mod test {
     use crate::{
         block::DEFAULT_BLOCK_SIZE,
         codec::DefaultCodec,
-        record::{KEY_SIZE, Key, Record},
+        record::Record,
         sst::{SstFileWriter, SstHandle, SstWriter},
     };
 

@@ -1,13 +1,17 @@
 use std::{
-    cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap},
+    collections::{BTreeSet, btree_set::Range},
     ops::Bound,
-    sync::Arc,
 };
 
-use tracing::trace;
+use tracing::{instrument, trace};
 
 use crate::record::{Key, Record};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppendOutput {
+    Ok,
+    Full,
+}
 
 #[derive(Debug)]
 pub struct Memtable {
@@ -26,10 +30,10 @@ impl Memtable {
         }
     }
 
-    pub fn append(&mut self, r: Record) -> bool {
+    #[instrument(skip(self, r),fields(key = ?r.key), ret)]
+    pub fn append(&mut self, r: Record) -> AppendOutput {
         if self.size_bytes + r.size_of() > self.limit {
-            trace!("append: memtable full");
-            return true;
+            return AppendOutput::Full;
         }
         trace!(
             "current_size: {}, limit: {}, new_record_size: {}",
@@ -39,15 +43,19 @@ impl Memtable {
         );
         self.size_bytes += r.size_of();
         self.set.insert(r);
-        self.size_bytes >= self.limit
+        if self.size_bytes > self.limit {
+            AppendOutput::Full
+        } else {
+            AppendOutput::Ok
+        }
     }
 
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
+    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_, Record> {
         self.set
             .range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
     }
 
-    pub fn full_range(&self) -> BTreeSetRange<'_> {
+    pub fn full_range(&self) -> Range<'_, Record> {
         let start = Key::default();
         let end = Key::new(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
         self.set.range::<Key, (Bound<&Key>, Bound<&Key>)>((
@@ -81,8 +89,11 @@ impl Memtable {
 pub struct FrozenMemtable(Memtable);
 
 impl FrozenMemtable {
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> BTreeSetRange<'_> {
+    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_, Record> {
         self.0.range(start, end)
+    }
+    pub fn full_range(&self) -> Range<'_, Record> {
+        self.0.full_range()
     }
 
     #[inline]
@@ -101,94 +112,12 @@ impl FrozenMemtable {
     }
 }
 
-pub type BTreeSetRange<'a> = std::collections::btree_set::Range<'a, Record>;
-
-pub struct MergeIter<'a> {
-    // TODO: use tinyvec / stack based vec to avoid heap allocations on
-    // (frequent) ranging + small amounts of btrees??
-    ranges: Vec<BTreeSetRange<'a>>,
-    minheap: BinaryHeap<Reverse<HeapItem<'a>>>,
-}
-
-impl<'a> MergeIter<'a> {
-    pub fn new(
-        active: &'a Memtable,
-        frozen: &'a [Arc<FrozenMemtable>],
-        start: Bound<&Key>,
-        end: Bound<&Key>,
-    ) -> Self {
-        let minheap = BinaryHeap::new();
-        let mut ranges = Vec::with_capacity(1 + frozen.len());
-        ranges.push(active.range(start, end));
-        ranges.extend(frozen.iter().map(|m| m.range(start, end)));
-
-        let mut this = Self { ranges, minheap };
-        this.fill_from_all();
-        this
-    }
-
-    fn fill_from_all(&mut self) {
-        for i in 0..self.ranges.len() {
-            self.fill_from_single(i);
-        }
-    }
-
-    fn fill_from_single(&mut self, iter_idx: usize) {
-        if let Some(rec) = self.ranges[iter_idx].next() {
-            self.minheap.push(Reverse(HeapItem {
-                inner: rec,
-                iter_idx,
-            }));
-        }
-    }
-}
-
-impl<'a> Iterator for MergeIter<'a> {
-    type Item = &'a Record;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.minheap
-            .pop()
-            .inspect(|item| {
-                self.fill_from_single(item.0.iter_idx);
-            })
-            .map(|item| item.0.inner)
-    }
-}
-
-struct HeapItem<'a> {
-    /// actual record
-    inner: &'a Record,
-    /// which iterator this item came from
-    iter_idx: usize,
-}
-
-impl<'a> PartialEq for HeapItem<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner.eq(other.inner)
-    }
-}
-
-impl<'a> Eq for HeapItem<'a> {}
-
-impl<'a> PartialOrd for HeapItem<'a> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<'a> Ord for HeapItem<'a> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.inner.cmp(other.inner)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::ops::Bound;
 
     use crate::{
-        memtable::Memtable,
+        memtable::{AppendOutput, Memtable},
         record::{Key, Record},
     };
     use pretty_assertions::assert_eq;
@@ -215,13 +144,13 @@ mod test {
             rec.key.source_id = i as u64;
             let rec_sz = rec.size_of();
 
-            assert_eq!(false, m.append(rec));
+            assert_eq!(AppendOutput::Ok, m.append(rec));
             assert_eq!(m.size_bytes, rec_sz * (i + 1))
         }
 
         // memtable just filled up
         assert_eq!(
-            true,
+            AppendOutput::Full,
             m.append(Record {
                 key: Key {
                     source_id: (max_count - 1) as u64,
@@ -234,7 +163,7 @@ mod test {
         assert_eq!(max_size, m.size_bytes());
 
         // memtable cant hold more records
-        assert_eq!(true, m.append(base.clone()));
+        assert_eq!(AppendOutput::Full, m.append(base.clone()));
         dbg!(max_count, m.count());
         dbg!(max_size, m.size_bytes());
 

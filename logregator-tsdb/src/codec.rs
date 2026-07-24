@@ -52,230 +52,13 @@ pub fn invalid_payload_sz(got: usize) -> CodecError {
     CodecError::InvalidPayloadSize(InvalidPayloadSize::new(got))
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::record::{
-        KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
-    };
-    use proptest::prelude::*;
-    use std::io::Cursor;
-
-    pub fn arb_record() -> impl Strategy<Value = Record> {
-        (
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            proptest::collection::vec(any::<u8>(), MIN_PAYLOAD_LENGTH..MAX_PAYLOAD_LENGTH),
-        )
-            .prop_map(
-                |(source_id, timestamp, sequence_num, stream_id, payload)| Record {
-                    key: Key::new(source_id, timestamp, sequence_num, stream_id),
-                    payload: payload.into_boxed_slice(),
-                },
-            )
-    }
-
-    proptest! {
-        /// encode -> decode reproduces the original record, and reports
-        /// exactly rec.wire_len() bytes consumed.
-        #[test]
-        fn prop_encode_decode_roundtrip(rec in arb_record()) {
-            let codec = DefaultCodec;
-            let mut buf = vec![0u8; rec.wire_len()];
-            let written = codec.encode(&rec, &mut buf).unwrap();
-            prop_assert_eq!(written, rec.wire_len());
-
-            let (decoded, consumed): (Record, usize) = codec.decode(&buf).unwrap().expect("should decode");
-            prop_assert_eq!(consumed, rec.wire_len());
-            prop_assert_eq!(decoded, rec);
-        }
-
-        /// Trailing garbage after a valid frame is ignored, and the
-        /// reported consumed length still points exactly at the frame end
-        /// (this is what lets FramedReader slice buf[start..] correctly).
-        #[test]
-        fn prop_decode_ignores_trailing_bytes(
-            rec in arb_record(),
-            trailing in proptest::collection::vec(any::<u8>(), 0..64),
-        ) {
-            let codec = DefaultCodec;
-            let mut buf = vec![0u8; rec.wire_len()];
-            codec.encode(&rec, &mut buf).unwrap();
-            buf.extend_from_slice(&trailing);
-
-            let (decoded, consumed): (Record, usize) = codec.decode(&buf).unwrap().expect("should decode");
-            prop_assert_eq!(consumed, rec.wire_len());
-            prop_assert_eq!(decoded, rec);
-        }
-
-        /// Fewer than KEY_SIZE + PAYLOAD_LEN_SIZE bytes -> Ok(None), never panics.
-        #[test]
-        fn prop_partial_header_returns_none(
-            bytes in proptest::collection::vec(any::<u8>(), 0..(KEY_SIZE + PAYLOAD_LEN_SIZE)),
-        ) {
-            let codec = DefaultCodec;
-            let buf = bytes;
-            let result: Option<(Record, usize)> = codec.decode(&buf).unwrap();
-            prop_assert!(result.is_none());
-        }
-
-        /// Full header but a truncated payload -> Ok(None), never panics.
-        #[test]
-        fn prop_partial_payload_returns_none(
-            rec in arb_record().prop_filter("need a non-empty payload", |r| !r.payload.is_empty()),
-            missing in 1usize..=1000,
-        ) {
-            let codec = DefaultCodec;
-            let mut full = vec![0u8; rec.wire_len()];
-            codec.encode(&rec, &mut full).unwrap();
-            let cut = full.len().saturating_sub(missing.min(rec.payload.len()));
-            let truncated = full[..cut.max(KEY_SIZE + PAYLOAD_LEN_SIZE)].to_vec();
-
-            let result: Option<(Record, usize)> = codec.decode(&truncated).unwrap();
-            prop_assert!(result.is_none());
-        }
-
-        /// A length prefix over MAX_PAYLOAD_LENGTH is rejected immediately,
-        /// without requiring the payload bytes to actually be buffered.
-        #[test]
-        fn prop_max_payload_exceeded(over_by in 1u32..1_000_000) {
-            let codec = DefaultCodec;
-            let bogus_len = MAX_PAYLOAD_LENGTH as u32 + over_by;
-            let mut buf = vec![0u8; KEY_SIZE + PAYLOAD_LEN_SIZE];
-            buf[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE]
-                .copy_from_slice(&bogus_len.to_be_bytes());
-
-            let err= SpecCodec::<Record>::decode(&codec, &buf).unwrap_err();
-            let m = matches!(err, CodecError::InvalidPayloadSize { .. });
-            prop_assert!(m);
-        }
-
-        /// decode() never panics on arbitrary bytes of any length.
-        #[test]
-        fn prop_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
-            let codec = DefaultCodec;
-            let buf = bytes;
-
-            let _ = SpecCodec::<Record>::decode(&codec, &buf);
-        }
-
-        /// Writing N records then reading them back through
-        /// FramedWriter/FramedReader reproduces the same sequence.
-        /// Payload sizes deliberately range past BUFSIZE so this exercises
-        /// fill()'s compaction/resize path, not just a single read().
-        #[test]
-        fn prop_framed_writer_reader_roundtrip(
-            records in proptest::collection::vec(arb_record(), 1..40),
-        ) {
-            let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
-            for rec in &records {
-                writer.write(rec).unwrap();
-            }
-            writer.flush().unwrap();
-            let bytes = writer.into_inner().unwrap().into_inner();
-
-            let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
-            let decoded: Vec<Record> = reader.map(|r| r.expect("decode failed")).collect();
-
-            prop_assert_eq!(records, decoded);
-        }
-
-    }
-
-    #[test]
-    fn framed_reader_grows_buffer_even_after_prior_compaction() {
-        let small = Record {
-            key: crate::record::Key::new(1, 1, 1, 1),
-            payload: vec![0xAA; 4].into_boxed_slice(),
-        };
-        let big_payload_len = MAX_PAYLOAD_LENGTH - KEY_SIZE - PAYLOAD_LEN_SIZE; // several buffer-doublings' worth
-        let big = Record {
-            key: crate::record::Key::new(2, 2, 2, 2),
-            payload: vec![0xBB; big_payload_len].into_boxed_slice(),
-        };
-
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
-        writer.write(&small).unwrap();
-        writer.write(&big).unwrap();
-        writer.flush().unwrap();
-        let bytes = writer.into_inner().unwrap().into_inner();
-
-        let reader: FramedReader<Cursor<Vec<u8>>, DefaultCodec, Record> =
-            FramedReader::new(Cursor::new(bytes), DefaultCodec);
-        let mut decoded = vec![];
-        for r in reader {
-            let r = r.unwrap();
-            decoded.push(r);
-        }
-
-        assert_eq!(decoded, vec![small, big]);
-    }
-
-    /// Deterministic (non-property) test: forces a record to straddle the
-    /// BUFSIZE fill boundary exactly, to reliably catch the fill()
-    /// overwrite-on-refill bug regardless of proptest shrinking luck.
-    #[test]
-    fn framed_reader_handles_record_split_across_fill_boundary() {
-        let leading_payload_len = BUFSIZE - KEY_SIZE - PAYLOAD_LEN_SIZE - 10;
-        let straddling = Record {
-            key: crate::record::Key::new(1, 2, 3, 4),
-            payload: vec![0xAB; leading_payload_len].into_boxed_slice(),
-        };
-        let second = Record {
-            key: crate::record::Key::new(5, 6, 7, 8),
-            payload: vec![0xCD; 500].into_boxed_slice(),
-        };
-
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
-        writer.write(&straddling).unwrap();
-        writer.write(&second).unwrap();
-        writer.flush().unwrap();
-        let bytes = writer.into_inner().unwrap().into_inner();
-
-        let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
-        let decoded: Vec<Record> = reader.map(|r| r.unwrap()).collect();
-
-        assert_eq!(decoded, vec![straddling, second]);
-    }
-
-    /// Documents current WAL-style recovery semantics: a torn trailing
-    /// record at EOF ends the stream cleanly (no error) rather than
-    /// failing. If SSTable reads need strict behavior instead, this is
-    /// the test to change once that's added.
-    #[test]
-    fn framed_reader_stops_cleanly_on_torn_trailing_record() {
-        let good = Record {
-            key: crate::record::Key::new(1, 1, 1, 1),
-            payload: vec![1, 2, 3].into_boxed_slice(),
-        };
-        let torn = Record {
-            key: crate::record::Key::new(2, 2, 2, 2),
-            payload: vec![9; 100].into_boxed_slice(),
-        };
-
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
-        writer.write(&good).unwrap();
-        writer.write(&torn).unwrap();
-        writer.flush().unwrap();
-        let mut bytes = writer.into_inner().unwrap().into_inner();
-        bytes.truncate(bytes.len() - 40); // chop the tail of the second record
-
-        let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
-        let decoded: Vec<Record> = reader.map(|r| r.unwrap()).collect();
-
-        assert_eq!(decoded, vec![good]);
-    }
-}
-
 use std::{
     fmt::Debug,
     io::{self, BufWriter, IntoInnerError, Read, Write},
     marker::PhantomData,
 };
 
-use tracing::{info, instrument, trace, trace_span};
+use tracing::trace;
 
 use crate::record::{
     KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
@@ -289,6 +72,10 @@ pub trait SpecCodec<I: WireLen>: Clone + Debug {
     fn encode(&self, item: &I, dst: &mut [u8]) -> Result<usize, CodecError>;
     fn decode(&self, src: &[u8]) -> Result<Option<(I, usize)>, CodecError>;
 }
+
+/// Convenience wrapper trait around a codec that works over both [Record]
+/// and [Key]
+pub trait RecordCodec: SpecCodec<Record> + SpecCodec<Key> {}
 
 impl SpecCodec<Key> for DefaultCodec {
     // #[instrument(ret)]
@@ -547,5 +334,222 @@ where
             .field("buf", &format_args!("[0..{}]", self.buf.len()))
             .field("codec", &self.codec)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::record::{
+        KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
+    };
+    use proptest::prelude::*;
+    use std::io::Cursor;
+
+    pub fn arb_record() -> impl Strategy<Value = Record> {
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            proptest::collection::vec(any::<u8>(), MIN_PAYLOAD_LENGTH..MAX_PAYLOAD_LENGTH),
+        )
+            .prop_map(
+                |(source_id, timestamp, sequence_num, stream_id, payload)| Record {
+                    key: Key::new(source_id, timestamp, sequence_num, stream_id),
+                    payload: payload.into_boxed_slice(),
+                },
+            )
+    }
+
+    proptest! {
+        /// encode -> decode reproduces the original record, and reports
+        /// exactly rec.wire_len() bytes consumed.
+        #[test]
+        fn prop_encode_decode_roundtrip(rec in arb_record()) {
+            let codec = DefaultCodec;
+            let mut buf = vec![0u8; rec.wire_len()];
+            let written = codec.encode(&rec, &mut buf).unwrap();
+            prop_assert_eq!(written, rec.wire_len());
+
+            let (decoded, consumed): (Record, usize) = codec.decode(&buf).unwrap().expect("should decode");
+            prop_assert_eq!(consumed, rec.wire_len());
+            prop_assert_eq!(decoded, rec);
+        }
+
+        /// Trailing garbage after a valid frame is ignored, and the
+        /// reported consumed length still points exactly at the frame end
+        /// (this is what lets FramedReader slice buf[start..] correctly).
+        #[test]
+        fn prop_decode_ignores_trailing_bytes(
+            rec in arb_record(),
+            trailing in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let codec = DefaultCodec;
+            let mut buf = vec![0u8; rec.wire_len()];
+            codec.encode(&rec, &mut buf).unwrap();
+            buf.extend_from_slice(&trailing);
+
+            let (decoded, consumed): (Record, usize) = codec.decode(&buf).unwrap().expect("should decode");
+            prop_assert_eq!(consumed, rec.wire_len());
+            prop_assert_eq!(decoded, rec);
+        }
+
+        /// Fewer than KEY_SIZE + PAYLOAD_LEN_SIZE bytes -> Ok(None), never panics.
+        #[test]
+        fn prop_partial_header_returns_none(
+            bytes in proptest::collection::vec(any::<u8>(), 0..(KEY_SIZE + PAYLOAD_LEN_SIZE)),
+        ) {
+            let codec = DefaultCodec;
+            let buf = bytes;
+            let result: Option<(Record, usize)> = codec.decode(&buf).unwrap();
+            prop_assert!(result.is_none());
+        }
+
+        /// Full header but a truncated payload -> Ok(None), never panics.
+        #[test]
+        fn prop_partial_payload_returns_none(
+            rec in arb_record().prop_filter("need a non-empty payload", |r| !r.payload.is_empty()),
+            missing in 1usize..=1000,
+        ) {
+            let codec = DefaultCodec;
+            let mut full = vec![0u8; rec.wire_len()];
+            codec.encode(&rec, &mut full).unwrap();
+            let cut = full.len().saturating_sub(missing.min(rec.payload.len()));
+            let truncated = full[..cut.max(KEY_SIZE + PAYLOAD_LEN_SIZE)].to_vec();
+
+            let result: Option<(Record, usize)> = codec.decode(&truncated).unwrap();
+            prop_assert!(result.is_none());
+        }
+
+        /// A length prefix over MAX_PAYLOAD_LENGTH is rejected immediately,
+        /// without requiring the payload bytes to actually be buffered.
+        #[test]
+        fn prop_max_payload_exceeded(over_by in 1u32..1_000_000) {
+            let codec = DefaultCodec;
+            let bogus_len = MAX_PAYLOAD_LENGTH as u32 + over_by;
+            let mut buf = vec![0u8; KEY_SIZE + PAYLOAD_LEN_SIZE];
+            buf[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE]
+                .copy_from_slice(&bogus_len.to_be_bytes());
+
+            let err= SpecCodec::<Record>::decode(&codec, &buf).unwrap_err();
+            let m = matches!(err, CodecError::InvalidPayloadSize { .. });
+            prop_assert!(m);
+        }
+
+        /// decode() never panics on arbitrary bytes of any length.
+        #[test]
+        fn prop_decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let codec = DefaultCodec;
+            let buf = bytes;
+
+            let _ = SpecCodec::<Record>::decode(&codec, &buf);
+        }
+
+        /// Writing N records then reading them back through
+        /// FramedWriter/FramedReader reproduces the same sequence.
+        /// Payload sizes deliberately range past BUFSIZE so this exercises
+        /// fill()'s compaction/resize path, not just a single read().
+        #[test]
+        fn prop_framed_writer_reader_roundtrip(
+            records in proptest::collection::vec(arb_record(), 1..40),
+        ) {
+            let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
+            for rec in &records {
+                writer.write(rec).unwrap();
+            }
+            writer.flush().unwrap();
+            let bytes = writer.into_inner().unwrap().into_inner();
+
+            let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
+            let decoded: Vec<Record> = reader.map(|r| r.expect("decode failed")).collect();
+
+            prop_assert_eq!(records, decoded);
+        }
+
+    }
+
+    #[test]
+    fn framed_reader_grows_buffer_even_after_prior_compaction() {
+        let small = Record {
+            key: crate::record::Key::new(1, 1, 1, 1),
+            payload: vec![0xAA; 4].into_boxed_slice(),
+        };
+        let big_payload_len = MAX_PAYLOAD_LENGTH - KEY_SIZE - PAYLOAD_LEN_SIZE; // several buffer-doublings' worth
+        let big = Record {
+            key: crate::record::Key::new(2, 2, 2, 2),
+            payload: vec![0xBB; big_payload_len].into_boxed_slice(),
+        };
+
+        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
+        writer.write(&small).unwrap();
+        writer.write(&big).unwrap();
+        writer.flush().unwrap();
+        let bytes = writer.into_inner().unwrap().into_inner();
+
+        let reader: FramedReader<Cursor<Vec<u8>>, DefaultCodec, Record> =
+            FramedReader::new(Cursor::new(bytes), DefaultCodec);
+        let mut decoded = vec![];
+        for r in reader {
+            let r = r.unwrap();
+            decoded.push(r);
+        }
+
+        assert_eq!(decoded, vec![small, big]);
+    }
+
+    /// Deterministic (non-property) test: forces a record to straddle the
+    /// BUFSIZE fill boundary exactly, to reliably catch the fill()
+    /// overwrite-on-refill bug regardless of proptest shrinking luck.
+    #[test]
+    fn framed_reader_handles_record_split_across_fill_boundary() {
+        let leading_payload_len = BUFSIZE - KEY_SIZE - PAYLOAD_LEN_SIZE - 10;
+        let straddling = Record {
+            key: crate::record::Key::new(1, 2, 3, 4),
+            payload: vec![0xAB; leading_payload_len].into_boxed_slice(),
+        };
+        let second = Record {
+            key: crate::record::Key::new(5, 6, 7, 8),
+            payload: vec![0xCD; 500].into_boxed_slice(),
+        };
+
+        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
+        writer.write(&straddling).unwrap();
+        writer.write(&second).unwrap();
+        writer.flush().unwrap();
+        let bytes = writer.into_inner().unwrap().into_inner();
+
+        let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
+        let decoded: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+
+        assert_eq!(decoded, vec![straddling, second]);
+    }
+
+    /// Documents current WAL-style recovery semantics: a torn trailing
+    /// record at EOF ends the stream cleanly (no error) rather than
+    /// failing. If SSTable reads need strict behavior instead, this is
+    /// the test to change once that's added.
+    #[test]
+    fn framed_reader_stops_cleanly_on_torn_trailing_record() {
+        let good = Record {
+            key: crate::record::Key::new(1, 1, 1, 1),
+            payload: vec![1, 2, 3].into_boxed_slice(),
+        };
+        let torn = Record {
+            key: crate::record::Key::new(2, 2, 2, 2),
+            payload: vec![9; 100].into_boxed_slice(),
+        };
+
+        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), DefaultCodec);
+        writer.write(&good).unwrap();
+        writer.write(&torn).unwrap();
+        writer.flush().unwrap();
+        let mut bytes = writer.into_inner().unwrap().into_inner();
+        bytes.truncate(bytes.len() - 40); // chop the tail of the second record
+
+        let reader = FramedReader::new(Cursor::new(bytes), DefaultCodec);
+        let decoded: Vec<Record> = reader.map(|r| r.unwrap()).collect();
+
+        assert_eq!(decoded, vec![good]);
     }
 }
