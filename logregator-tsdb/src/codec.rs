@@ -275,7 +275,7 @@ use std::{
     marker::PhantomData,
 };
 
-use tracing::trace;
+use tracing::{info, instrument, trace, trace_span};
 
 use crate::record::{
     KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
@@ -291,6 +291,7 @@ pub trait SpecCodec<I: WireLen>: Clone + Debug {
 }
 
 impl SpecCodec<Key> for DefaultCodec {
+    // #[instrument(ret)]
     fn encode(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
         if dst.len() < key.wire_len() {
             return Err(CodecError::UnexpectedSize(UnexpectedSize {
@@ -299,6 +300,7 @@ impl SpecCodec<Key> for DefaultCodec {
             }));
         }
         key.to_be_bytes(dst.try_into().map_err(io::Error::other)?);
+        // info!(dst);
         Ok(KEY_SIZE)
     }
 

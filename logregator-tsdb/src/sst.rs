@@ -1,12 +1,13 @@
 use std::{
+    fmt::Debug,
     fs::{File, OpenOptions},
-    io,
+    io::{self, Read, Write},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     rc::Rc,
 };
 
-use tracing::{instrument, trace};
+use tracing::{info, instrument, trace};
 
 use crate::{
     block::{
@@ -118,7 +119,7 @@ where
         Ok(())
     }
 
-    pub fn finalize(mut self) -> Result<(W, SstMeta), SstFinalizeError> {
+    pub fn finalize(mut self) -> Result<(W, Vec<BlockMetadata>, usize), SstFinalizeError> {
         if self.block_writer.size() > 0 {
             self.flush()?;
         }
@@ -139,18 +140,9 @@ where
         self.writer
             .write_all(&meta_start.to_be_bytes())
             .map_err(SstWriteError::from)?;
-        let size = self.block_bytes_written + metadata_bytes.len() + size_of_val(&meta_start);
+        // let size = self.block_bytes_written + metadata_bytes.len() + size_of_val(&meta_start);
 
-        let meta = SstMeta {
-            block_meta: self.block_meta,
-            block_meta_offset: meta_start as usize, // meta_start was usize originally so this cast is safe
-            size,
-            record_count: self.record_count,
-            first_key: self.first_key.unwrap(),
-            last_key: self.last_key.unwrap(),
-        };
-
-        Ok((self.writer, meta))
+        Ok((self.writer, self.block_meta, meta_start as usize))
     }
 
     #[instrument(skip(self), err)]
@@ -238,19 +230,16 @@ where
         self.inner.write(rec)
     }
 
-    pub fn finalize_file(self) -> Result<SstHandle, SstFinalizeError> {
-        let (fh, meta) = self.inner.finalize()?;
-        Ok(SstHandle { fh, meta })
+    pub fn finalize_file(self) -> Result<SstHandle<C>, SstFinalizeError> {
+        let codec = self.inner.codec.clone();
+        let (fh, block_meta, block_meta_offset) = self.inner.finalize()?;
+        Ok(SstHandle {
+            fh,
+            block_meta,
+            block_meta_offset,
+            codec,
+        })
     }
-}
-
-/// Handle to an immutable SSTable file on the disk.
-/// This is created by [SstWriter::finish] and is used
-/// in [SstReader].
-#[derive(Debug)]
-pub struct SstHandle {
-    fh: FileHandle,
-    meta: SstMeta,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -271,17 +260,77 @@ pub enum SstReadError {
     CorruptedBlockNotSorted,
 }
 
-impl SstHandle {
-    #[inline]
-    pub fn block_meta(&self) -> &[BlockMetadata] {
-        &self.meta.block_meta
+/// Handle to an immutable SSTable file on the disk.
+/// This is created by [SstWriter::finish] and is used
+/// in [SstReader].
+#[derive(Debug)]
+pub struct SstHandle<C> {
+    fh: FileHandle,
+    block_meta: Vec<BlockMetadata>,
+    block_meta_offset: usize,
+    codec: C,
+}
+
+impl<C> SstHandle<C>
+where
+    C: SpecCodec<Record> + SpecCodec<Key>,
+{
+    #[instrument(err)]
+    pub fn open<P>(path: P, codec: C) -> Result<Self, SstReadError>
+    where
+        P: AsRef<Path> + std::fmt::Debug,
+    {
+        let fh = FileHandle::open_from_path(path.as_ref())?;
+        let f = fh.as_file();
+        let fsize = f.metadata()?.len();
+        if fsize < (SZ_U32 + SZ_U32) as u64 {
+            // need at least u32 footer and metas_length_prefix
+            return Err(io::Error::other(format!(
+                "sst file too small (got: {fsize} min: {})",
+                SZ_U32 * 2
+            ))
+            .into());
+        }
+        if fsize > MAX_SST_SIZE as u64 {
+            return Err(io::Error::other(format!(
+                "sst file too large (got: {fsize} max: {MAX_SST_SIZE})"
+            ))
+            .into());
+        }
+
+        let mut u32_buf = [0u8; SZ_U32];
+        f.read_exact_at(&mut u32_buf, fsize - SZ_U32 as u64)?;
+        let meta_offset = u32::from_be_bytes(u32_buf) as u64;
+        if meta_offset > fsize {
+            return Err(io::Error::other(format!(
+                "block meta offset points past the size of the file (offset: {meta_offset} file_size: {fsize})"
+            )).into());
+        }
+        let meta_segment_len: usize = (fsize - meta_offset).try_into().map_err(|e| {
+            io::Error::other(format!(
+                "faild to cast meta_segment_lenght (= file_size {fsize} - meta_offset {meta_offset}) from u64 to usize: {e}"
+            ))
+        })?;
+
+        let mut meta_buf = vec![0; meta_segment_len];
+        f.read_exact_at(&mut meta_buf, meta_offset)?;
+        let block_meta = BlockMetadata::decode_metas(&meta_buf[..], &codec)?;
+
+        Ok(SstHandle {
+            fh,
+            block_meta,
+            block_meta_offset: meta_offset as usize,
+            codec,
+        })
     }
 
-    pub fn cursor<C: SpecCodec<Record> + SpecCodec<Key>>(
-        self: &Rc<Self>,
-        codec: C,
-    ) -> Result<SstCursor<C>, SstReadError> {
-        SstCursor::new(self.clone(), codec)
+    #[inline]
+    pub fn block_meta(&self) -> &[BlockMetadata] {
+        &self.block_meta
+    }
+
+    pub fn cursor(self: &Rc<Self>) -> Result<SstCursor<C>, SstReadError> {
+        SstCursor::new(self.clone())
     }
 
     pub fn read_block(&self, block_idx: usize) -> Result<Rc<Block>, SstReadError> {
@@ -290,12 +339,12 @@ impl SstHandle {
             .get(block_idx)
             .ok_or(SstReadError::BlockIdxOutOfBounds {
                 idx: block_idx,
-                len: self.meta.block_meta.len(),
+                len: self.block_meta.len(),
             })?
             .offset as usize;
 
         let block_end = if block_idx == self.block_meta().len() - 1 {
-            self.meta.block_meta_offset
+            self.block_meta_offset
         } else {
             self.block_meta()[block_idx + 1].offset as usize
         };
@@ -313,21 +362,15 @@ impl SstHandle {
         let b = Block::decode_block(&buf)?;
         Ok(Rc::new(b))
     }
-}
 
-#[derive(Debug)]
-pub struct SstMeta {
-    block_meta: Vec<BlockMetadata>,
-    block_meta_offset: usize,
-    size: usize, // can be derived with block_meta_offset + size_of block metas wire_length + size_of_val(block_meta_offset)
-    record_count: usize, // for debugging purposes
-    first_key: Key,
-    last_key: Key,
+    pub fn file_handle(&self) -> &FileHandle {
+        &self.fh
+    }
 }
 
 #[derive(Debug)]
 pub struct SstCursor<C> {
-    sst: Rc<SstHandle>,
+    sst: Rc<SstHandle<C>>,
     block_cursor: Result<BlockCursor<C>, SstReadError>,
     block_idx: usize,
     codec: C,
@@ -337,7 +380,8 @@ impl<C> SstCursor<C>
 where
     C: SpecCodec<Record> + SpecCodec<Key>,
 {
-    fn new(sst: Rc<SstHandle>, codec: C) -> Result<Self, SstReadError> {
+    fn new(sst: Rc<SstHandle<C>>) -> Result<Self, SstReadError> {
+        let codec = sst.codec.clone();
         let block_idx = 0;
         let block = sst.read_block(block_idx)?;
         let mut cursor = BlockCursor::new(block, codec.clone());
@@ -507,6 +551,36 @@ impl FileHandle {
         Ok(Self { id, path, file })
     }
 
+    /// checks if the path is a valid sst file path, then opens it
+    /// as read-only
+    pub fn open_from_path(path: &Path) -> io::Result<Self> {
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?;
+
+        if !fname.ends_with(".sst") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not an .sst file",
+            ));
+        }
+
+        let digits = &fname[..fname.len() - ".sst".len()];
+        let id: u32 = digits.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse sst id: {e}"),
+            )
+        })?;
+
+        Ok(FileHandle {
+            id,
+            file: File::open(path)?,
+            path: path.to_path_buf(),
+        })
+    }
+
     #[inline]
     pub fn as_file(&self) -> &File {
         &self.file
@@ -529,11 +603,18 @@ impl io::Read for FileHandle {
     }
 }
 
+impl io::Seek for FileHandle {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.as_file().seek(pos)
+    }
+}
+
 pub const SZ_U32: usize = size_of::<u32>();
 
 /// Metadata for blocks inside an SSTable. It contains the blocks start in bytes as offset
 /// and the first/last keys in this block.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
 pub struct BlockMetadata {
     offset: u32,
     first_key: Key,
@@ -542,24 +623,34 @@ pub struct BlockMetadata {
 
 impl WireLen for BlockMetadata {
     fn wire_len(&self) -> usize {
-        Self::static_wire_len()
+        Self::BLOCK_META_SIZE
     }
 }
 
 impl BlockMetadata {
-    pub const fn static_wire_len() -> usize {
-        size_of::<u32>() + KEY_SIZE + KEY_SIZE
-    }
+    pub const BLOCK_META_SIZE: usize = size_of::<u32>() + 2 * KEY_SIZE;
 
-    pub fn encode_metas<C: SpecCodec<Key>>(metas: &[Self], c: &C) -> Result<Vec<u8>, CodecError> {
+    /// # Format
+    ///
+    /// ```not_rust
+    /// [len: u32]
+    /// // len times many metas:
+    /// [meta: offset: u32, first_key: 4 * u64, last_key: 4 * u64]
+    /// ...
+    /// ```
+    #[instrument(skip(metas), fields(metas_count = metas.len(), codec = ?codec), err)]
+    pub fn encode_metas<C: SpecCodec<Key>>(
+        metas: &[Self],
+        codec: &C,
+    ) -> Result<Vec<u8>, CodecError> {
         // need enough bytes the lenght prefix, for the metas themselves,
         // and for the 32bit checksum
-        let capacity = SZ_U32 + metas.len() * Self::static_wire_len() + SZ_U32;
+        let capacity = SZ_U32 + metas.len() * Self::BLOCK_META_SIZE + SZ_U32;
         let mut data = Vec::with_capacity(capacity);
         data.extend((metas.len() as u32).to_be_bytes());
         let mut key_bytes = [0; KEY_SIZE];
         let mut encode_key = |key: &Key| -> Result<[u8; KEY_SIZE], CodecError> {
-            c.encode(key, &mut key_bytes)?;
+            codec.encode(key, &mut key_bytes)?;
             Ok(key_bytes)
         };
 
@@ -570,6 +661,13 @@ impl BlockMetadata {
         }
         let checksum = crc32c::crc32c(&data[..]);
         data.extend(checksum.to_be_bytes());
+        debug_assert_eq!(
+            capacity,
+            data.len(),
+            "before encoding we allocated {} bytes but wrote {}",
+            capacity,
+            data.len()
+        );
         Ok(data)
     }
 
@@ -585,12 +683,13 @@ impl BlockMetadata {
         let metas_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
         let mut consumed = SZ_U32; // we already read length prefix
 
-        let want_total_size = SZ_U32 + metas_len * Self::static_wire_len() + SZ_U32;
+        let want_total_size = SZ_U32 + metas_len * Self::BLOCK_META_SIZE + SZ_U32;
         if src.len() < want_total_size {
             trace!(
-                "not enough bytes for length prefix + {} * block metas + checksum (src.len() = {})",
-                metas_len,
-                src.len()
+                "not enough bytes for length prefix + {metas_len} * block metas + checksum. src.len() = {}, want_total = {want_total_size} = length prefix {SZ_U32} + {} (= metas_len {metas_len} * BlockMetadata::wire_len() {}) + checksum u32 {SZ_U32}",
+                src.len(),
+                metas_len * Self::BLOCK_META_SIZE,
+                Self::BLOCK_META_SIZE
             );
             return Err(CodecError::UnexpectedSize(codec::UnexpectedSize {
                 got: src.len(),
@@ -655,9 +754,10 @@ mod test {
 
     use super::BlockMetadata;
     use crate::{
+        block::DEFAULT_BLOCK_SIZE,
         codec::DefaultCodec,
-        record::Record,
-        sst::{SstFileWriter, SstWriter},
+        record::{KEY_SIZE, Key, Record},
+        sst::{SstFileWriter, SstHandle, SstWriter},
     };
 
     fn tracing() {
@@ -682,23 +782,23 @@ mod test {
     }
 
     #[test]
-    fn meta_codec() {
+    fn block_meta_codec() {
         tracing();
         let codec = DefaultCodec;
-        let metas: Vec<BlockMetadata> = (0..10)
+        let metas: Vec<BlockMetadata> = (0..2)
             .map(|i| BlockMetadata {
                 offset: i as u32,
                 first_key: crate::record::Key {
-                    source_id: i,
-                    timestamp: i,
-                    sequence_num: i,
-                    stream_id: i,
+                    source_id: i + 1,
+                    timestamp: i + 1,
+                    sequence_num: i + 1,
+                    stream_id: i + 1,
                 },
                 last_key: crate::record::Key {
-                    source_id: i,
-                    timestamp: i,
-                    sequence_num: i,
-                    stream_id: i,
+                    source_id: i + 2,
+                    timestamp: i + 2,
+                    sequence_num: i + 2,
+                    stream_id: i + 2,
                 },
             })
             .collect();
@@ -720,8 +820,8 @@ mod test {
             sw.write(&record(i as u64, 512)).unwrap();
         }
 
-        let (_, meta) = sw.finalize().unwrap();
-        assert_eq!(meta.record_count, num_records);
+        let (_, meta, _) = sw.finalize().unwrap();
+        // assert_eq!(meta._record_count, num_records);
         dbg!(meta);
     }
 
@@ -754,15 +854,15 @@ mod test {
         }
         dbg!(&sw);
         let sst = sw.finalize_file().unwrap();
-        assert_eq!(sst.meta.record_count, num_records);
+        // assert_eq!(sst.meta._record_count, num_records);
         dbg!(&sst);
 
-        for i in 0..sst.meta.block_meta.len() {
+        for i in 0..sst.block_meta.len() {
             let block = sst.read_block(i).unwrap();
             dbg!(block);
         }
 
-        match sst.read_block(sst.meta.block_meta.len()) {
+        match sst.read_block(sst.block_meta.len()) {
             Err(e) => {
                 dbg!(e);
             }
@@ -783,14 +883,14 @@ mod test {
         }
         dbg!(&sw);
         let sst = Rc::new(sw.finalize_file().unwrap());
-        assert_eq!(sst.meta.record_count, num_records);
+        // assert_eq!(sst.meta._record_count, num_records);
 
-        let mut c = sst.cursor(codec).unwrap();
+        let mut c = sst.cursor().unwrap();
         println!("\n\n=> CURSOR: iterating using .next() <=\n\n");
         println!(
-            "Before iterating the cursor: sst has {} block(s) and {} record(s) in total",
+            "Before iterating the cursor: sst has {} block(s)",
             sst.block_meta().len(),
-            sst.meta.record_count
+            // sst.meta._record_count
         );
 
         let mut i = 0;
@@ -866,5 +966,25 @@ mod test {
                 "{i}/{num_records}: c.current() returned None"
             );
         }
+    }
+
+    #[test]
+    fn sst_open() {
+        tracing();
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let codec = DefaultCodec;
+        let block_limit = DEFAULT_BLOCK_SIZE;
+
+        let mut sw = SstFileWriter::new(1, codec, Some(block_limit), Some(tempdir.path())).unwrap();
+
+        for i in 0..10 {
+            sw.write(&record(i, 512)).unwrap();
+        }
+
+        let sst = sw.finalize_file().unwrap();
+        dbg!(&sst);
+        let fh = sst.file_handle();
+
+        SstHandle::open(&fh.path, codec).unwrap();
     }
 }
