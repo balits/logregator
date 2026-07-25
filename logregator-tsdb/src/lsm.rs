@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ops::Bound, path::Path, rc::Rc, sync::Arc};
 
 use crate::{
-    codec::RecordCodec,
+    codec::RecordCodecExt,
     memtable::{AppendOutput, FrozenMemtable, Memtable},
     merge_iter::MergeIter,
     record::{Key, Record},
@@ -20,7 +20,7 @@ pub struct LsmState<C> {
 
 impl<C> LsmState<C>
 where
-    C: RecordCodec,
+    C: RecordCodecExt,
 {
     pub fn append(&mut self, rec: Record) {
         if AppendOutput::Full == self.active_memtable.append(rec) {
@@ -61,7 +61,7 @@ pub enum MemtableFlushError {
 }
 
 #[allow(unused)]
-pub fn flush<C: RecordCodec>(
+pub fn flush<C: RecordCodecExt>(
     memtable: Arc<FrozenMemtable>,
     sst_id: u32,
     block_limit: Option<usize>,

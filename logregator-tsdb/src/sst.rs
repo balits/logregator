@@ -764,7 +764,7 @@ mod test {
     use super::BlockMetadata;
     use crate::{
         block::DEFAULT_BLOCK_SIZE,
-        codec::DefaultCodec,
+        codec::RecordCodec,
         record::Record,
         sst::{SstFileWriter, SstHandle, SstWriter},
     };
@@ -793,7 +793,7 @@ mod test {
     #[test]
     fn block_meta_codec() {
         tracing();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let metas: Vec<BlockMetadata> = (0..2)
             .map(|i| BlockMetadata {
                 offset: i as u32,
@@ -820,7 +820,7 @@ mod test {
     #[test]
     fn sst_writer_inmem() {
         tracing();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let writer = std::io::Cursor::new(Vec::new());
         let mut sw = SstWriter::new(writer, codec, None).unwrap();
 
@@ -839,7 +839,7 @@ mod test {
         let tempdir = tempfile::TempDir::new().unwrap();
 
         tracing();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
 
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
 
@@ -855,7 +855,7 @@ mod test {
     fn sst_read_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
         let num_records = 10usize;
         for i in 0..num_records {
@@ -883,7 +883,7 @@ mod test {
     fn sst_cursor() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let mut sw = SstFileWriter::new(1, codec, None, Some(tempdir.path())).unwrap();
         let num_records = 10;
         let records: Vec<Record> = (0..num_records).map(|i| record(i as u64, 512)).collect();
@@ -981,7 +981,7 @@ mod test {
     fn sst_open() {
         tracing();
         let tempdir = tempfile::TempDir::new().unwrap();
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let block_limit = DEFAULT_BLOCK_SIZE;
 
         let mut sw = SstFileWriter::new(1, codec, Some(block_limit), Some(tempdir.path())).unwrap();

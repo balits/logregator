@@ -144,7 +144,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::codec::DefaultCodec;
+    use crate::codec::RecordCodec;
 
     #[test]
     fn lifecycle() {
@@ -223,7 +223,7 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let f = NamedTempFile::new().unwrap();
         let mut w = Manifest::new(f.path()).unwrap();
 

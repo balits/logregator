@@ -1,6 +1,8 @@
-use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, mem::size_of};
+use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, io, mem::size_of};
 
-use crate::codec::{CodecError, WireLen};
+use tracing::trace;
+
+use crate::codec::*;
 
 #[repr(C)]
 #[derive(Clone)]
@@ -79,15 +81,12 @@ impl Borrow<Key> for Record {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
-    // fields for keys, hashing, eq, and ord
-    pub source_id: u64,
+    pub stream_id: u64,
     pub timestamp: u64,
     pub sequence_num: u64,
-
-    // stream_id is not used for any of the above
-    pub stream_id: u64,
+    pub source_id: u64,
 }
 
 impl WireLen for Key {
@@ -97,30 +96,30 @@ impl WireLen for Key {
     }
 }
 
-impl PartialEq for Key {
-    fn eq(&self, other: &Self) -> bool {
-        self.source_id == other.source_id
-            && self.timestamp == other.timestamp
-            && self.sequence_num == other.sequence_num
-    }
-}
+// impl PartialEq for Key {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.source_id == other.source_id
+//             && self.timestamp == other.timestamp
+//             && self.sequence_num == other.sequence_num
+//     }
+// }
 
-impl Eq for Key {}
+// impl Eq for Key {}
 
-impl PartialOrd for Key {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+// impl PartialOrd for Key {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         Some(self.cmp(other))
+//     }
+// }
 
-impl Ord for Key {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.source_id
-            .cmp(&other.source_id)
-            .then(self.timestamp.cmp(&other.timestamp))
-            .then(self.sequence_num.cmp(&other.sequence_num))
-    }
-}
+// impl Ord for Key {
+//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+//         self.source_id
+//             .cmp(&other.source_id)
+//             .then(self.timestamp.cmp(&other.timestamp))
+//             .then(self.sequence_num.cmp(&other.sequence_num))
+//     }
+// }
 
 impl Key {
     pub fn new(source_id: u64, timestamp: u64, sequence_num: u64, stream_id: u64) -> Self {
@@ -130,6 +129,12 @@ impl Key {
             sequence_num,
             stream_id,
         }
+    }
+
+    #[cfg(test)]
+    pub fn dummy(i: impl Into<u64>) -> Self {
+        let i = i.into();
+        Self::new(i, i, i, i)
     }
 
     pub fn from_be_bytes(src: &[u8]) -> Result<Self, CodecError> {
@@ -166,6 +171,102 @@ impl Key {
         dst[8..16].copy_from_slice(&self.timestamp.to_be_bytes());
         dst[16..24].copy_from_slice(&self.sequence_num.to_be_bytes());
         dst[24..32].copy_from_slice(&self.stream_id.to_be_bytes());
+    }
+}
+
+/// More concretely, it implements both [SpecCodec<Record>] and [SpecCodec<Key>]
+#[derive(Debug, Clone, Copy)]
+pub struct RecordCodec;
+
+impl SpecCodec<Key> for RecordCodec {
+    // #[instrument(ret)]
+    fn encode(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
+        if dst.len() < key.wire_len() {
+            return Err(CodecError::UnexpectedSize(UnexpectedSize {
+                got: dst.len(),
+                want: key.wire_len(),
+            }));
+        }
+        key.to_be_bytes(dst.try_into().map_err(io::Error::other)?);
+        // info!(dst);
+        Ok(KEY_SIZE)
+    }
+
+    fn decode(&self, src: &[u8]) -> Result<Option<(Key, usize)>, CodecError> {
+        if src.len() < KEY_SIZE {
+            trace!(
+                "not enough bytes to decode from (got = {}, want = {})",
+                src.len(),
+                KEY_SIZE
+            );
+            return Ok(None);
+        }
+        let k = Key::from_be_bytes(&src[..KEY_SIZE])?;
+        Ok(Some((k, KEY_SIZE)))
+    }
+}
+
+impl SpecCodec<Record> for RecordCodec {
+    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
+        if dst.len() < rec.wire_len() {
+            trace!(
+                "not enough bytes to encode into `dst` (got: {}, want: {})",
+                dst.len(),
+                rec.wire_len()
+            );
+            return Err(not_enough_bytes(dst.len(), rec.wire_len()));
+        }
+
+        let _ = <Self as SpecCodec<Key>>::encode(self, &rec.key, &mut dst[0..KEY_SIZE])?;
+
+        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
+            return Err(invalid_payload_sz(rec.payload.len()));
+        }
+
+        let payload_len = (rec.payload.len() as u32).to_be_bytes();
+        dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
+        dst[KEY_SIZE + PAYLOAD_LEN_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
+            .copy_from_slice(&rec.payload);
+
+        Ok(rec.wire_len())
+    }
+
+    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
+        if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
+            trace!(
+                "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
+                src.len(),
+                KEY_SIZE + PAYLOAD_LEN_SIZE
+            );
+            return Ok(None);
+        }
+
+        let (key, _) = match <Self as SpecCodec<Key>>::decode(self, src)? {
+            None => return Ok(None),
+            Some(t) => t,
+        };
+
+        let payload_len = u32::from_be_bytes([
+            src[KEY_SIZE],
+            src[KEY_SIZE + 1],
+            src[KEY_SIZE + 2],
+            src[KEY_SIZE + 3],
+        ]) as usize;
+
+        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
+            return Err(invalid_payload_sz(payload_len));
+        }
+        let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len;
+        if src.len() < total {
+            trace!("not enoguh bytes to decode from (payload)");
+            return Ok(None);
+        }
+
+        let payload = src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]
+            .to_vec()
+            .into_boxed_slice();
+
+        Ok(Some((Record { key, payload }, total)))
     }
 }
 

@@ -53,7 +53,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use crate::{
-        codec::DefaultCodec,
+        codec::RecordCodec,
         record::{Key, Record},
         wal::Wal,
     };
@@ -65,7 +65,7 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), DefaultCodec).expect("wal::new");
+        let mut w = Wal::new(f.path(), RecordCodec).expect("wal::new");
 
         for i in 0..100u64 {
             let rec = Record {
@@ -81,7 +81,7 @@ mod test {
     fn wal_recover() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let tempf = NamedTempFile::new().expect("tempfile");
         let mut w = Wal::new(tempf.path(), codec.clone()).expect("wal::new");
 
@@ -132,7 +132,7 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = DefaultCodec;
+        let codec = RecordCodec;
         let f = NamedTempFile::new().expect("tempfile");
         let mut w = Wal::new(f.path(), codec.clone()).expect("wal::new");
 

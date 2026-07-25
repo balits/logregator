@@ -3,7 +3,7 @@ use std::{
     ops::Bound,
 };
 
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 use crate::record::{Key, Record};
 
@@ -30,20 +30,14 @@ impl Memtable {
         }
     }
 
-    #[instrument(skip(self, r),fields(key = ?r.key), ret)]
+    #[instrument(skip(self, r),fields(key = ?r.key, rec_size = r.size_of(), memtable_size = self.size_bytes, memtable_limit = self.limit), ret)]
     pub fn append(&mut self, r: Record) -> AppendOutput {
         if self.size_bytes + r.size_of() > self.limit {
             return AppendOutput::Full;
         }
-        trace!(
-            "current_size: {}, limit: {}, new_record_size: {}",
-            self.size_bytes,
-            self.limit,
-            r.size_of()
-        );
         self.size_bytes += r.size_of();
         self.set.insert(r);
-        if self.size_bytes > self.limit {
+        if self.size_bytes >= self.limit {
             AppendOutput::Full
         } else {
             AppendOutput::Ok
@@ -122,8 +116,18 @@ mod test {
     };
     use pretty_assertions::assert_eq;
 
+    fn tracing() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            // .with_target(true)
+            // .with_span_events(FmtSpan::NEW)
+            .with_test_writer()
+            .try_init();
+    }
+
     #[test]
     fn lifecylce() {
+        tracing();
         let base = Record {
             key: Key::new(1, 2, 3, 4),
             payload: vec![0x01, 0x02, 0x03, 0x04].into_boxed_slice(),
@@ -133,10 +137,7 @@ mod test {
 
         let mut m = Memtable::new(max_size);
         for i in 0..(max_count - 1) {
-            let k = Key {
-                source_id: i as u64,
-                ..Default::default()
-            };
+            let k = Key::dummy(i as u64);
             let mut rec = Record {
                 key: k,
                 payload: base.payload.clone(),
@@ -149,16 +150,13 @@ mod test {
         }
 
         // memtable just filled up
-        assert_eq!(
-            AppendOutput::Full,
-            m.append(Record {
-                key: Key {
-                    source_id: (max_count - 1) as u64,
-                    ..Default::default()
-                },
-                payload: base.payload.clone(),
-            })
-        );
+        let res = m.append(Record {
+            key: Key::dummy(max_count as u64 - 1),
+            payload: base.payload.clone(),
+        });
+
+        dbg!(&m);
+        assert_eq!(AppendOutput::Full, res, "memtable shouldve filled up");
         assert_eq!(max_count, m.count());
         assert_eq!(max_size, m.size_bytes());
 
@@ -167,17 +165,9 @@ mod test {
         dbg!(max_count, m.count());
         dbg!(max_size, m.size_bytes());
 
-        for (i, rec) in m
-            .range(
-                Bound::Included(&Key::default()),
-                Bound::Excluded(&Key {
-                    source_id: u64::MAX,
-                    ..Default::default()
-                }),
-            )
-            .enumerate()
-        {
-            assert_eq!(i as u64, rec.key.source_id);
+        for (i, rec) in m.full_range().enumerate() {
+            dbg!(&rec.key);
+            assert_eq!(i as u64, rec.key.stream_id);
         }
 
         let f = m.freeze();

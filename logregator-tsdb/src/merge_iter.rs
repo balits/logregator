@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    codec::RecordCodec,
+    codec::RecordCodecExt,
     memtable::{FrozenMemtable, Memtable},
     record::{Key, Record},
     sst::{SstCursor, SstHandle, SstReadError},
@@ -22,7 +22,7 @@ pub struct MergeIter<'a, C> {
 
 impl<'a, C> MergeIter<'a, C>
 where
-    C: RecordCodec,
+    C: RecordCodecExt,
 {
     pub fn new(
         active: &'a Memtable,
@@ -87,7 +87,7 @@ where
 // 2) swallow errors from ssts silently, maybe logging it
 impl<'a, C> Iterator for MergeIter<'a, C>
 where
-    C: RecordCodec,
+    C: RecordCodecExt,
 {
     type Item = Cow<'a, Record>;
 

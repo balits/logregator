@@ -1,5 +1,6 @@
 pub mod block;
 pub mod codec;
+pub mod label;
 pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
