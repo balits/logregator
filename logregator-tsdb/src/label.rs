@@ -105,6 +105,24 @@ impl LabelMap {
     pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &Arc<str>)> {
         self.inner.iter()
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn new(map: BTreeMap<Arc<str>, Arc<str>>) -> Self {
+        let mut hasher = DefaultHasher::new();
+
+        for (k, v) in &map {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+
+        LabelMap {
+            inner: map,
+            fingerprint: hasher.finish(),
+        }
+    }
 }
 
 /// Helps to decode [LabelMap]s.
@@ -146,7 +164,6 @@ fn parse_label_map(src: &[u8]) -> IResult<&[u8], LabelMap> {
     let label_count = label_count as usize;
     // trace!(label_count);
 
-    let mut hasher = DefaultHasher::new();
     let mut map: BTreeMap<Arc<str>, Arc<str>> = BTreeMap::new();
     for _ in 0..label_count {
         let (_input, k) = take_lp_str(remainder)?;
@@ -157,18 +174,9 @@ fn parse_label_map(src: &[u8]) -> IResult<&[u8], LabelMap> {
         map.insert(Arc::from(k), Arc::from(v));
     }
 
-    for (k, v) in &map {
-        k.hash(&mut hasher);
-        v.hash(&mut hasher);
-    }
+    let labelmap = LabelMap::new(map);
 
-    Ok((
-        remainder,
-        LabelMap {
-            inner: map,
-            fingerprint: hasher.finish(),
-        },
-    ))
+    Ok((remainder, labelmap))
 }
 
 impl SpecCodec<LabelMap> for LabelMapCodec {

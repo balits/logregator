@@ -2,11 +2,15 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use tracing::{instrument, trace};
 
-use crate::codec::{self, CodecError, FramedReader, FramedWriter, SpecCodec, WireLen};
+use crate::{
+    codec::{self, CodecError, FramedReader, FramedWriter, SZ_U64, SpecCodec, WireLen},
+    label::{self, LabelMap, LabelMapCodec},
+};
 
 /// TODO: should the methods return io::Error or CodecError (which an Io(io::Error) variant)
 pub struct Manifest {
@@ -16,14 +20,14 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new(path: &std::path::Path) -> std::io::Result<Self> {
+    pub fn new(path: &std::path::Path, codec: ManifestCodec) -> std::io::Result<Self> {
         let f = std::fs::File::options()
             .read(true)
             .create(true)
             .append(true)
             .open(path)?;
 
-        let framed = FramedWriter::new(f.try_clone()?, ManifestCodec);
+        let framed = FramedWriter::new(f.try_clone()?, codec);
 
         Ok(Self {
             _pathbuf: path.into(),
@@ -41,31 +45,45 @@ impl Manifest {
         self.f.sync_data()?;
         Ok(())
     }
-    fn _try_recover(
+
+    pub fn try_recover(
         p: impl AsRef<Path>,
+        codec: ManifestCodec,
     ) -> io::Result<FramedReader<File, ManifestCodec, ManifestEntry>> {
         let f = OpenOptions::new().read(true).append(true).open(p)?;
-        Ok(FramedReader::new(f, ManifestCodec))
+        Ok(FramedReader::new(f, codec))
     }
 }
 
-const MANIFEST_OP_ID_SIZE: usize = size_of::<u32>();
-const MANIFEST_OP_WIRE_LEN: usize = 1usize + MANIFEST_OP_ID_SIZE;
+const MANIFEST_ENTRY_TAG_SZ: usize = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEntry {
-    SstFlush(u32),
-    Compaction(u32),
-    // StreamUpdate {
-    //     stream_id: u64,
-    //     labelmap: Rc<LabelMap>,
-    // },
+    SstFlush(u64),
+    Compaction(u64),
+    StreamUpdate {
+        stream_id: u64,
+        labelmap: Arc<LabelMap>,
+    },
 }
 
 impl WireLen for ManifestEntry {
     #[inline]
     fn wire_len(&self) -> usize {
-        MANIFEST_OP_WIRE_LEN
+        let mut sz = 1; // tag
+        match self {
+            Self::SstFlush(_) | Self::Compaction(_) => {
+                sz += SZ_U64;
+            }
+            Self::StreamUpdate {
+                stream_id: _,
+                labelmap,
+            } => {
+                sz += SZ_U64;
+                sz += labelmap.wire_len();
+            }
+        };
+        sz
     }
 }
 
@@ -74,74 +92,170 @@ impl ManifestEntry {
         match self {
             Self::SstFlush(_) => 1,
             Self::Compaction(_) => 2,
+            Self::StreamUpdate { .. } => 3,
         }
     }
 
-    pub fn id(&self) -> u32 {
+    pub fn sst_flush(id: u64) -> Self {
+        Self::SstFlush(id)
+    }
+
+    pub fn compactoin(id: u64) -> Self {
+        Self::Compaction(id)
+    }
+
+    pub fn stream_update(stream_id: u64, labelmap: Arc<LabelMap>) -> Option<Self> {
+        if labelmap.len() > label::MAX_LABEL_COUNT {
+            return None;
+        }
+
+        for (k, v) in labelmap.iter() {
+            if !(label::MIN_STR_SIZE..label::MAX_STR_SIZE).contains(&k.len()) {
+                return None;
+            }
+            if !(label::MIN_STR_SIZE..label::MAX_STR_SIZE).contains(&v.len()) {
+                return None;
+            }
+        }
+
+        Some(Self::StreamUpdate {
+            stream_id,
+            labelmap,
+        })
+    }
+
+    pub fn variant_str(&self) -> &str {
         match self {
-            Self::SstFlush(i) => *i,
-            Self::Compaction(i) => *i,
+            Self::SstFlush(_) => "ManifestEntry::SstFlush",
+            Self::Compaction(_) => "ManifestEntry::SstFlush",
+            Self::StreamUpdate { .. } => "ManifestEntry::StreamUpdate",
         }
-    }
-
-    pub fn try_from_parts(tag: u8, id: u32) -> Option<Self> {
-        let op = match tag {
-            1 => Self::SstFlush(id),
-            2 => Self::Compaction(id),
-            _ => return None,
-        };
-        Some(op)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ManifestCodec;
+pub struct ManifestCodec {
+    label_codec: LabelMapCodec,
+}
 
 impl SpecCodec<ManifestEntry> for ManifestCodec {
     #[instrument(err)]
     fn encode(&self, item: &ManifestEntry, dst: &mut [u8]) -> Result<usize, codec::CodecError> {
         if dst.len() < item.wire_len() {
             trace!(
-                "not enough bytes to encode {item:?} into `dst` (got: {}, want: {})",
+                "not enough bytes to encode {item:?} into `dst` (got: {}, want: {}, entry variant {})",
                 dst.len(),
-                item.wire_len()
+                item.wire_len(),
+                item.variant_str(),
             );
 
             return Err(crate::codec::not_enough_bytes(dst.len(), item.wire_len()));
         }
         dst[0] = item.tag();
-        dst[1..1 + MANIFEST_OP_ID_SIZE].copy_from_slice(&item.id().to_be_bytes());
+
+        match item {
+            ManifestEntry::SstFlush(id) => {
+                dst[1..1 + SZ_U64].copy_from_slice(&(*id).to_be_bytes());
+            }
+            ManifestEntry::Compaction(id) => {
+                dst[1..1 + SZ_U64].copy_from_slice(&(*id).to_be_bytes());
+            }
+            ManifestEntry::StreamUpdate {
+                stream_id,
+                labelmap,
+            } => {
+                dst[1..1 + SZ_U64].copy_from_slice(&(*stream_id).to_be_bytes());
+                let n = self.label_codec.encode(
+                    labelmap,
+                    &mut dst[1 + SZ_U64..1 + SZ_U64 + labelmap.wire_len()],
+                )?;
+                if n != labelmap.wire_len() {
+                    return Err(CodecError::Other(format!(
+                        "failed to encode labelmap field of ManifestEntry, wrote {} bytes out of {}",
+                        n,
+                        labelmap.wire_len()
+                    )));
+                }
+            }
+        };
+
         Ok(item.wire_len())
     }
 
     // #[instrument(err)]
     fn decode(&self, src: &[u8]) -> Result<Option<(ManifestEntry, usize)>, codec::CodecError> {
-        if src.len() < MANIFEST_OP_WIRE_LEN {
+        if src.len() < MANIFEST_ENTRY_TAG_SZ {
             trace!(
                 "not enough bytes to decode from (got: {}, want: {})",
                 src.len(),
-                MANIFEST_OP_WIRE_LEN
+                MANIFEST_ENTRY_TAG_SZ
             );
 
             return Ok(None);
         }
 
         let tag = src[0];
-        let id = u32::from_be_bytes(
-            src[1..1 + MANIFEST_OP_ID_SIZE]
-                .try_into()
-                .map_err(io::Error::other)?,
-        );
-        let e = ManifestEntry::try_from_parts(tag, id).ok_or(io::Error::other(
-            "failed to convert (tag: u8, id: u32) to Operation",
-        ))?;
 
-        Ok(Some((e, e.wire_len())))
+        let me = match tag {
+            n @ 1..=2 => {
+                if src.len() < MANIFEST_ENTRY_TAG_SZ + SZ_U64 {
+                    trace!(
+                        "not enough bytes to decode from (got: {}, want: {})",
+                        src.len(),
+                        MANIFEST_ENTRY_TAG_SZ + SZ_U64
+                    );
+                }
+
+                let id = u64::from_be_bytes([
+                    src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8],
+                ]);
+                match n {
+                    1 => ManifestEntry::SstFlush(id),
+                    2 => ManifestEntry::Compaction(id),
+                    _n => unreachable!("match: n was fixed to 1..=2, but got the value {_n}"),
+                }
+            }
+            3 => {
+                if src.len() < MANIFEST_ENTRY_TAG_SZ + SZ_U64 {
+                    trace!(
+                        "not enough bytes to decode from (got: {}, want: {})",
+                        src.len(),
+                        MANIFEST_ENTRY_TAG_SZ + SZ_U64
+                    );
+                }
+                let stream_id = u64::from_be_bytes([
+                    src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8],
+                ]);
+
+                if let Some((labelmap, _)) = self
+                    .label_codec
+                    .decode(&src[MANIFEST_ENTRY_TAG_SZ + SZ_U64..])?
+                {
+                    // decode() already parses only valid labelmaps
+                    ManifestEntry::StreamUpdate {
+                        stream_id,
+                        labelmap: Arc::new(labelmap),
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            n => {
+                return Err(CodecError::Other(format!(
+                    "unknown ManifestEntry variant {n}"
+                )));
+            }
+        };
+
+        let wrote = me.wire_len();
+        Ok(Some((me, wrote)))
     }
 }
 
 #[cfg(test)]
 mod test {
+
+    use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
     use tempfile::NamedTempFile;
@@ -153,12 +267,26 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let f = NamedTempFile::new().unwrap();
-        let mut m = Manifest::new(f.path()).unwrap();
+        let codec = ManifestCodec {
+            label_codec: LabelMapCodec,
+        };
+        let mut m = Manifest::new(f.path(), codec).unwrap();
 
-        for i in 0..100u32 {
-            let op = match i % 2 {
+        for i in 0..100u64 {
+            let op = match i % 3 {
                 0 => ManifestEntry::SstFlush(i),
                 1 => ManifestEntry::Compaction(i),
+                2 => {
+                    let mut map = BTreeMap::new();
+                    map.insert("foo".into(), "barbar".into());
+                    map.insert("bar".into(), "bazbaz".into());
+                    map.insert("baz".into(), "foofoo".into());
+                    let labelmap = Arc::new(LabelMap::new(map));
+                    ManifestEntry::StreamUpdate {
+                        stream_id: 67,
+                        labelmap,
+                    }
+                }
                 _ => unreachable!(),
             };
             m.append(&op).unwrap();
@@ -176,13 +304,27 @@ mod test {
             .try_init();
 
         let tempf = NamedTempFile::new().expect("tempfile");
-        let mut m = Manifest::new(tempf.path()).unwrap();
+        let codec = ManifestCodec {
+            label_codec: LabelMapCodec,
+        };
+        let mut m = Manifest::new(tempf.path(), codec.clone()).unwrap();
 
-        let record_num = 100u32;
+        let record_num = 100u64;
         let written: Vec<ManifestEntry> = (0..record_num)
-            .map(|i| match i % 2 {
+            .map(|i| match i % 3 {
                 0 => ManifestEntry::SstFlush(i),
                 1 => ManifestEntry::Compaction(i),
+                2 => {
+                    let mut map = BTreeMap::new();
+                    map.insert("foo".into(), "barbar".into());
+                    map.insert("bar".into(), "bazbaz".into());
+                    map.insert("baz".into(), "foofoo".into());
+                    let labelmap = Arc::new(LabelMap::new(map));
+                    ManifestEntry::StreamUpdate {
+                        stream_id: 67,
+                        labelmap,
+                    }
+                }
                 _ => unreachable!(),
             })
             .collect();
@@ -193,7 +335,7 @@ mod test {
         m.sync().unwrap();
         // dbg!(&written);
 
-        let recovered: Vec<ManifestEntry> = Manifest::_try_recover(tempf.path())
+        let recovered: Vec<ManifestEntry> = Manifest::try_recover(tempf.path(), codec)
             .unwrap()
             .map(|res| {
                 let op = res.expect("recover: failed to decode op");
@@ -225,12 +367,26 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let f = NamedTempFile::new().unwrap();
-        let mut w = Manifest::new(f.path()).unwrap();
+        let codec = ManifestCodec {
+            label_codec: LabelMapCodec,
+        };
+        let mut w = Manifest::new(f.path(), codec.clone()).unwrap();
 
-        let first_batch: Vec<ManifestEntry> = (0..10u32)
-            .map(|i| match i % 2 {
+        let first_batch: Vec<ManifestEntry> = (0..10u64)
+            .map(|i| match i % 3 {
                 0 => ManifestEntry::SstFlush(i),
                 1 => ManifestEntry::Compaction(i),
+                2 => {
+                    let mut map = BTreeMap::new();
+                    map.insert("foo".into(), "barbar".into());
+                    map.insert("bar".into(), "bazbaz".into());
+                    map.insert("baz".into(), "foofoo".into());
+                    let labelmap = Arc::new(LabelMap::new(map));
+                    ManifestEntry::StreamUpdate {
+                        stream_id: 67,
+                        labelmap,
+                    }
+                }
                 _ => unreachable!(),
             })
             .collect();
@@ -241,14 +397,25 @@ mod test {
 
         // Recover once, this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = Manifest::_try_recover(f.path())
+        let _ = Manifest::try_recover(f.path(), codec.clone())
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
-        let second_batch: Vec<ManifestEntry> = (10..20u32)
-            .map(|i| match i % 2 {
+        let second_batch: Vec<ManifestEntry> = (10..20u64)
+            .map(|i| match i % 3 {
                 0 => ManifestEntry::SstFlush(i),
                 1 => ManifestEntry::Compaction(i),
+                2 => {
+                    let mut map = BTreeMap::new();
+                    map.insert("foo".into(), "barbar".into());
+                    map.insert("bar".into(), "bazbaz".into());
+                    map.insert("baz".into(), "foofoo".into());
+                    let labelmap = Arc::new(LabelMap::new(map));
+                    ManifestEntry::StreamUpdate {
+                        stream_id: 67,
+                        labelmap,
+                    }
+                }
                 _ => unreachable!(),
             })
             .collect();
@@ -258,7 +425,7 @@ mod test {
         }
         w.sync().expect("sync failed");
 
-        let recovered: Vec<ManifestEntry> = Manifest::_try_recover(f.path())
+        let recovered: Vec<ManifestEntry> = Manifest::try_recover(f.path(), codec)
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();

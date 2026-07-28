@@ -5,6 +5,7 @@ use crate::record::{Key, Record};
 pub const SZ_U8: usize = size_of::<u8>();
 pub const SZ_U16: usize = size_of::<u16>();
 pub const SZ_U32: usize = size_of::<u32>();
+pub const SZ_U64: usize = size_of::<u64>();
 
 #[derive(thiserror::Error, Debug, Clone)]
 #[error("unexpected_size: not enough bytes: got {got}, want: {want}")]
