@@ -18,7 +18,7 @@ pub enum DecodeBlockError {
     NumOfRecordsMissing,
 
     #[error("decode_block_error: failed to decode raw bytes: {0}")]
-    UnexpectedSize(crate::codec::UnexpectedSize),
+    UnexpectedSize(crate::codec::NotEnoughBytes),
 }
 
 /// BlockCodecError encapsulates any error that could occurr during encoding/decoding
@@ -74,7 +74,7 @@ pub(super) fn num_of_records_missing() -> BlockCodecError {
 
 pub(super) fn unexpected_size(got: usize, want: usize) -> BlockCodecError {
     BlockCodecError::DecodeError(DecodeBlockError::UnexpectedSize(
-        crate::codec::UnexpectedSize { got, want },
+        crate::codec::NotEnoughBytes { got, want },
     ))
 }
 

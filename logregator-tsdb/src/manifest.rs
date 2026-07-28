@@ -10,8 +10,8 @@ use crate::codec::{self, CodecError, FramedReader, FramedWriter, SpecCodec, Wire
 
 /// TODO: should the methods return io::Error or CodecError (which an Io(io::Error) variant)
 pub struct Manifest {
-    pathbuf: PathBuf,
-    framed: FramedWriter<File, ManifestCodec, ManifestOp>,
+    _pathbuf: PathBuf,
+    framed: FramedWriter<File, ManifestCodec, ManifestEntry>,
     f: File,
 }
 
@@ -26,13 +26,13 @@ impl Manifest {
         let framed = FramedWriter::new(f.try_clone()?, ManifestCodec);
 
         Ok(Self {
-            pathbuf: path.into(),
+            _pathbuf: path.into(),
             framed,
             f,
         })
     }
 
-    pub fn append(&mut self, op: &ManifestOp) -> Result<(), CodecError> {
+    pub fn append(&mut self, op: &ManifestEntry) -> Result<(), CodecError> {
         self.framed.write(op)
     }
 
@@ -41,9 +41,9 @@ impl Manifest {
         self.f.sync_data()?;
         Ok(())
     }
-    fn try_recover(
+    fn _try_recover(
         p: impl AsRef<Path>,
-    ) -> io::Result<FramedReader<File, ManifestCodec, ManifestOp>> {
+    ) -> io::Result<FramedReader<File, ManifestCodec, ManifestEntry>> {
         let f = OpenOptions::new().read(true).append(true).open(p)?;
         Ok(FramedReader::new(f, ManifestCodec))
     }
@@ -52,21 +52,24 @@ impl Manifest {
 const MANIFEST_OP_ID_SIZE: usize = size_of::<u32>();
 const MANIFEST_OP_WIRE_LEN: usize = 1usize + MANIFEST_OP_ID_SIZE;
 
-/// [0 | 1 | ... Op enum tag: u8] [id_of_op_object: u32] => 40 byte each
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestOp {
+pub enum ManifestEntry {
     SstFlush(u32),
     Compaction(u32),
+    // StreamUpdate {
+    //     stream_id: u64,
+    //     labelmap: Rc<LabelMap>,
+    // },
 }
 
-impl WireLen for ManifestOp {
+impl WireLen for ManifestEntry {
     #[inline]
     fn wire_len(&self) -> usize {
         MANIFEST_OP_WIRE_LEN
     }
 }
 
-impl ManifestOp {
+impl ManifestEntry {
     pub fn tag(&self) -> u8 {
         match self {
             Self::SstFlush(_) => 1,
@@ -94,25 +97,25 @@ impl ManifestOp {
 #[derive(Debug, Clone)]
 pub struct ManifestCodec;
 
-impl SpecCodec<ManifestOp> for ManifestCodec {
+impl SpecCodec<ManifestEntry> for ManifestCodec {
     #[instrument(err)]
-    fn encode(&self, op: &ManifestOp, dst: &mut [u8]) -> Result<usize, codec::CodecError> {
-        if dst.len() < op.wire_len() {
+    fn encode(&self, item: &ManifestEntry, dst: &mut [u8]) -> Result<usize, codec::CodecError> {
+        if dst.len() < item.wire_len() {
             trace!(
-                "not enough bytes to encode {op:?} into `dst` (got: {}, want: {})",
+                "not enough bytes to encode {item:?} into `dst` (got: {}, want: {})",
                 dst.len(),
-                op.wire_len()
+                item.wire_len()
             );
 
-            return Err(crate::codec::not_enough_bytes(dst.len(), op.wire_len()));
+            return Err(crate::codec::not_enough_bytes(dst.len(), item.wire_len()));
         }
-        dst[0] = op.tag();
-        dst[1..1 + MANIFEST_OP_ID_SIZE].copy_from_slice(&op.id().to_be_bytes());
-        Ok(op.wire_len())
+        dst[0] = item.tag();
+        dst[1..1 + MANIFEST_OP_ID_SIZE].copy_from_slice(&item.id().to_be_bytes());
+        Ok(item.wire_len())
     }
 
     // #[instrument(err)]
-    fn decode(&self, src: &[u8]) -> Result<Option<(ManifestOp, usize)>, codec::CodecError> {
+    fn decode(&self, src: &[u8]) -> Result<Option<(ManifestEntry, usize)>, codec::CodecError> {
         if src.len() < MANIFEST_OP_WIRE_LEN {
             trace!(
                 "not enough bytes to decode from (got: {}, want: {})",
@@ -129,11 +132,11 @@ impl SpecCodec<ManifestOp> for ManifestCodec {
                 .try_into()
                 .map_err(io::Error::other)?,
         );
-        let op = ManifestOp::try_from_parts(tag, id).ok_or(io::Error::other(
+        let e = ManifestEntry::try_from_parts(tag, id).ok_or(io::Error::other(
             "failed to convert (tag: u8, id: u32) to Operation",
         ))?;
 
-        Ok(Some((op, op.wire_len())))
+        Ok(Some((e, e.wire_len())))
     }
 }
 
@@ -144,7 +147,6 @@ mod test {
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::codec::RecordCodec;
 
     #[test]
     fn lifecycle() {
@@ -155,8 +157,8 @@ mod test {
 
         for i in 0..100u32 {
             let op = match i % 2 {
-                0 => ManifestOp::SstFlush(i),
-                1 => ManifestOp::Compaction(i),
+                0 => ManifestEntry::SstFlush(i),
+                1 => ManifestEntry::Compaction(i),
                 _ => unreachable!(),
             };
             m.append(&op).unwrap();
@@ -177,10 +179,10 @@ mod test {
         let mut m = Manifest::new(tempf.path()).unwrap();
 
         let record_num = 100u32;
-        let written: Vec<ManifestOp> = (0..record_num)
+        let written: Vec<ManifestEntry> = (0..record_num)
             .map(|i| match i % 2 {
-                0 => ManifestOp::SstFlush(i),
-                1 => ManifestOp::Compaction(i),
+                0 => ManifestEntry::SstFlush(i),
+                1 => ManifestEntry::Compaction(i),
                 _ => unreachable!(),
             })
             .collect();
@@ -191,10 +193,9 @@ mod test {
         m.sync().unwrap();
         // dbg!(&written);
 
-        let recovered: Vec<ManifestOp> = Manifest::try_recover(tempf.path())
+        let recovered: Vec<ManifestEntry> = Manifest::_try_recover(tempf.path())
             .unwrap()
-            .enumerate()
-            .map(|(i, res)| {
+            .map(|res| {
                 let op = res.expect("recover: failed to decode op");
                 // dbg!(&op);
                 // assert_eq!(i as u32, op.as_u32());
@@ -223,14 +224,13 @@ mod test {
     fn wal_append_after_recovery_does_not_corrupt_prior_records() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let codec = RecordCodec;
         let f = NamedTempFile::new().unwrap();
         let mut w = Manifest::new(f.path()).unwrap();
 
-        let first_batch: Vec<ManifestOp> = (0..10u32)
+        let first_batch: Vec<ManifestEntry> = (0..10u32)
             .map(|i| match i % 2 {
-                0 => ManifestOp::SstFlush(i),
-                1 => ManifestOp::Compaction(i),
+                0 => ManifestEntry::SstFlush(i),
+                1 => ManifestEntry::Compaction(i),
                 _ => unreachable!(),
             })
             .collect();
@@ -241,14 +241,14 @@ mod test {
 
         // Recover once, this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = Manifest::try_recover(f.path())
+        let _ = Manifest::_try_recover(f.path())
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
-        let second_batch: Vec<ManifestOp> = (10..20u32)
+        let second_batch: Vec<ManifestEntry> = (10..20u32)
             .map(|i| match i % 2 {
-                0 => ManifestOp::SstFlush(i),
-                1 => ManifestOp::Compaction(i),
+                0 => ManifestEntry::SstFlush(i),
+                1 => ManifestEntry::Compaction(i),
                 _ => unreachable!(),
             })
             .collect();
@@ -258,12 +258,12 @@ mod test {
         }
         w.sync().expect("sync failed");
 
-        let recovered: Vec<ManifestOp> = Manifest::try_recover(f.path())
+        let recovered: Vec<ManifestEntry> = Manifest::_try_recover(f.path())
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();
 
-        let expected: Vec<ManifestOp> = first_batch.into_iter().chain(second_batch).collect();
+        let expected: Vec<ManifestEntry> = first_batch.into_iter().chain(second_batch).collect();
         assert_eq!(
             expected, recovered,
             "appending after a recovery pass must not corrupt or overwrite prior ops"

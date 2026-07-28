@@ -55,8 +55,12 @@ where
         for i in 0..self.memtables.len() {
             self.fill_from_single(Source::Memtable(i));
         }
+        for i in 0..self.ssts.len() {
+            self.fill_from_single(Source::Sst(i));
+        }
     }
 
+    #[inline]
     fn fill_from_single(&mut self, source: Source) {
         match source {
             Source::Memtable(idx) => {

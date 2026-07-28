@@ -18,12 +18,9 @@ use tracing::{instrument, trace};
 use std::fmt::Debug;
 
 use crate::{
-    codec::InvalidPayloadSize,
+    codec::{InvalidPayloadSize, SZ_U16, SZ_U32},
     record::{MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH},
 };
-
-pub const SZ_U16: usize = size_of::<u16>();
-pub const SZ_U32: usize = size_of::<u32>();
 
 /// couple times larger than 4KB page cache
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024;

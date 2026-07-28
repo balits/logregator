@@ -2,25 +2,29 @@ use tracing::trace;
 
 use crate::record::{Key, Record};
 
+pub const SZ_U8: usize = size_of::<u8>();
+pub const SZ_U16: usize = size_of::<u16>();
 pub const SZ_U32: usize = size_of::<u32>();
 
 #[derive(thiserror::Error, Debug, Clone)]
 #[error("unexpected_size: not enough bytes: got {got}, want: {want}")]
-pub struct UnexpectedSize {
+pub struct NotEnoughBytes {
     pub got: usize,
     pub want: usize,
 }
 
+/// TODO: this should be refactored to be a more general
+/// and intuitive enum for codec errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("codec error: io error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("codec error: unexpected error: {msg}")]
-    Unexpected { msg: String },
+    #[error("codec error: custom error: {0}")]
+    Other(String),
 
     #[error("codec error: {0}")]
-    UnexpectedSize(UnexpectedSize),
+    NotEnoughBytes(NotEnoughBytes),
 
     #[error("codec error: {0}")]
     InvalidPayloadSize(InvalidPayloadSize),
@@ -43,11 +47,11 @@ impl InvalidPayloadSize {
 }
 
 pub fn not_enough_bytes(got: usize, want: usize) -> CodecError {
-    CodecError::UnexpectedSize(UnexpectedSize { got, want })
+    CodecError::NotEnoughBytes(NotEnoughBytes { got, want })
 }
 
-pub fn unexpected(msg: impl Into<String>) -> CodecError {
-    CodecError::Unexpected { msg: msg.into() }
+pub fn other(msg: impl Into<String>) -> CodecError {
+    CodecError::Other(msg.into())
 }
 
 pub fn invalid_payload_sz(got: usize) -> CodecError {
@@ -65,13 +69,37 @@ pub trait WireLen: Sized {
 }
 
 pub trait SpecCodec<I: WireLen>: Clone + Debug {
+    /// Tries to encode an instance of `I` into `dst`, returning
+    /// Some(bytes_written: usize) if successful or a codec error.
+    ///
+    /// Most implementations should always check if `dst` has enough space
+    /// for the items wire length (hence the [WireLen] trait bound)
     fn encode(&self, item: &I, dst: &mut [u8]) -> Result<usize, CodecError>;
+
+    /// Tries to decode an instance of `I` from `src`, returning
+    /// Some(item: I, bytes_read: usize) if successful or a codec error.
     fn decode(&self, src: &[u8]) -> Result<Option<(I, usize)>, CodecError>;
 }
 
 /// Convenience wrapper trait around a codec that works over both [Record]
 /// and [Key]
-pub trait RecordCodecExt: SpecCodec<Record> + SpecCodec<Key> {}
+pub trait RecordCodecExt: SpecCodec<Record> + SpecCodec<Key> {
+    fn encode_key(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
+        self.encode(key, dst)
+    }
+
+    fn encode_record(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
+        self.encode(rec, dst)
+    }
+
+    fn decode_key(&self, src: &[u8]) -> Result<Option<(Key, usize)>, CodecError> {
+        self.decode(src)
+    }
+
+    fn decode_record(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
+        self.decode(src)
+    }
+}
 
 pub(super) const BUFSIZE: usize = 4 * 1024;
 

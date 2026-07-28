@@ -1,8 +1,14 @@
-use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, io, mem::size_of};
+use std::{
+    borrow::{Borrow, Cow},
+    cmp::Ordering,
+    fmt::Debug,
+    io,
+    mem::size_of,
+};
 
 use tracing::trace;
 
-use crate::codec::*;
+use crate::{codec::*, label};
 
 #[repr(C)]
 #[derive(Clone)]
@@ -20,10 +26,22 @@ impl Debug for Record {
     }
 }
 
+impl std::fmt::Display for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match std::str::from_utf8(&self.payload) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(e) => Cow::Owned(format!("ERR: {e}")),
+        };
+        write!(f, "key: {:?}, payload: {}", self.key, s)
+    }
+}
+
 pub const KEY_SIZE: usize = std::mem::size_of::<Key>();
 pub const PAYLOAD_LEN_SIZE: usize = 4; // vec.len() as u32
 
-pub const MIN_PAYLOAD_LENGTH: usize = 1;
+/// Min. payload size is 2, since the first byte '0' could signal
+/// the payload got no labels, other than that a payload cannot be empty
+pub const MIN_PAYLOAD_LENGTH: usize = label::LABEL_COUNT_SIZE + 1;
 pub const MAX_PAYLOAD_LENGTH: usize = 4096;
 
 /// [KEY_SIZE]+ u32 as the payloads length prefix + [MIN_PAYLOAD_LENGTH]
@@ -34,13 +52,13 @@ pub const MAX_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MAX_PAYL
 impl WireLen for Record {
     #[inline]
     fn wire_len(&self) -> usize {
-        self.key.wire_len() + size_of::<u32>() + self.payload.len()
+        self.key.wire_len() + SZ_U32 + self.payload.len()
     }
 }
 
 impl Record {
-    /// Returns the resident memory used by this record in bytes.
-    /// This should equal [key: 4 * 8 bytes] [boxed_slice: 8 + 8 bytes] [1 byte * payload_len].
+    /// Returns the memory used by this record in bytes.
+    /// This should equal 4 * 8 bytes (key) +  8 + 8 bytes (boxed_slice_ptrs) payload_len bytes.
     #[inline]
     pub const fn size_of(&self) -> usize {
         size_of::<Self>() + self.payload.len()
@@ -96,31 +114,6 @@ impl WireLen for Key {
     }
 }
 
-// impl PartialEq for Key {
-//     fn eq(&self, other: &Self) -> bool {
-//         self.source_id == other.source_id
-//             && self.timestamp == other.timestamp
-//             && self.sequence_num == other.sequence_num
-//     }
-// }
-
-// impl Eq for Key {}
-
-// impl PartialOrd for Key {
-//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-//         Some(self.cmp(other))
-//     }
-// }
-
-// impl Ord for Key {
-//     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-//         self.source_id
-//             .cmp(&other.source_id)
-//             .then(self.timestamp.cmp(&other.timestamp))
-//             .then(self.sequence_num.cmp(&other.sequence_num))
-//     }
-// }
-
 impl Key {
     pub fn new(source_id: u64, timestamp: u64, sequence_num: u64, stream_id: u64) -> Self {
         Self {
@@ -139,7 +132,7 @@ impl Key {
 
     pub fn from_be_bytes(src: &[u8]) -> Result<Self, CodecError> {
         if src.len() < KEY_SIZE {
-            return Err(CodecError::UnexpectedSize(crate::codec::UnexpectedSize {
+            return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
                 got: src.len(),
                 want: KEY_SIZE,
             }));
@@ -178,11 +171,13 @@ impl Key {
 #[derive(Debug, Clone, Copy)]
 pub struct RecordCodec;
 
+impl RecordCodecExt for RecordCodec {}
+
 impl SpecCodec<Key> for RecordCodec {
     // #[instrument(ret)]
     fn encode(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
         if dst.len() < key.wire_len() {
-            return Err(CodecError::UnexpectedSize(UnexpectedSize {
+            return Err(CodecError::NotEnoughBytes(NotEnoughBytes {
                 got: dst.len(),
                 want: key.wire_len(),
             }));
@@ -253,9 +248,7 @@ impl SpecCodec<Record> for RecordCodec {
             src[KEY_SIZE + 3],
         ]) as usize;
 
-        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
-            return Err(invalid_payload_sz(payload_len));
-        }
+        check_payload_size(payload_len)?;
         let total = KEY_SIZE + PAYLOAD_LEN_SIZE + payload_len;
         if src.len() < total {
             trace!("not enoguh bytes to decode from (payload)");
@@ -268,6 +261,13 @@ impl SpecCodec<Record> for RecordCodec {
 
         Ok(Some((Record { key, payload }, total)))
     }
+}
+
+pub fn check_payload_size(payload_len: usize) -> Result<(), CodecError> {
+    if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
+        return Err(invalid_payload_sz(payload_len));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

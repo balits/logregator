@@ -7,10 +7,11 @@ use tracing::instrument;
 use crate::codec::{CodecError, FramedReader, FramedWriter, SpecCodec};
 use crate::record::Record;
 
+#[derive(Debug)]
 pub struct Wal<C: SpecCodec<Record>> {
-    path: PathBuf,
+    _path: PathBuf,
     framed: FramedWriter<File, C, Record>,
-    f: File,
+    _f: File,
 }
 
 impl<C> Wal<C>
@@ -21,7 +22,11 @@ where
         let f = open_read_append(path)?;
         let path = path.to_path_buf();
         let framed = FramedWriter::new(f.try_clone()?, codec.clone());
-        Ok(Self { path, framed, f })
+        Ok(Self {
+            _path: path,
+            framed,
+            _f: f,
+        })
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -36,7 +41,7 @@ where
         Ok(())
     }
 
-    fn try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C, Record>> {
+    fn _try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C, Record>> {
         let f = open_read_append(path)?;
         Ok(FramedReader::new(f, codec))
     }
@@ -53,7 +58,7 @@ mod test {
     use tempfile::NamedTempFile;
 
     use crate::{
-        codec::RecordCodec,
+        record::RecordCodec,
         record::{Key, Record},
         wal::Wal,
     };
@@ -83,7 +88,7 @@ mod test {
 
         let codec = RecordCodec;
         let tempf = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(tempf.path(), codec.clone()).expect("wal::new");
+        let mut w = Wal::new(tempf.path(), codec).expect("wal::new");
 
         let record_num = 100u64;
         let written: Vec<Record> = (0..record_num)
@@ -98,7 +103,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::try_recover(tempf.path(), codec.clone())
+        let recovered: Vec<Record> = Wal::_try_recover(tempf.path(), codec)
             .expect("failed to open wal for recovery")
             .enumerate()
             .map(|(i, res)| {
@@ -134,7 +139,7 @@ mod test {
 
         let codec = RecordCodec;
         let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), codec.clone()).expect("wal::new");
+        let mut w = Wal::new(f.path(), codec).expect("wal::new");
 
         let first_batch: Vec<Record> = (0..10u64)
             .map(|seq| Record {
@@ -149,7 +154,7 @@ mod test {
 
         // Recover once — this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = Wal::try_recover(f.path(), codec.clone())
+        let _ = Wal::_try_recover(f.path(), codec)
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
@@ -164,7 +169,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::try_recover(f.path(), codec.clone())
+        let recovered: Vec<Record> = Wal::_try_recover(f.path(), codec)
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();

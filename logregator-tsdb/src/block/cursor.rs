@@ -4,7 +4,7 @@ use tracing::trace;
 
 use crate::{
     block::Block,
-    codec::{self, CodecError, SpecCodec},
+    codec::{self, CodecError, RecordCodecExt},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -23,7 +23,7 @@ pub struct BlockCursor<C> {
 
 impl<C> BlockCursor<C>
 where
-    C: SpecCodec<Record> + SpecCodec<Key>,
+    C: RecordCodecExt,
 {
     pub fn new(block: Rc<Block>, c: C) -> Self {
         Self {
@@ -105,10 +105,10 @@ where
 
             let offset = *o as usize;
             let key_bs = &self.block.data[offset..offset + KEY_SIZE];
-            match <C as SpecCodec<Key>>::decode(&self.codec, key_bs) {
+            match self.codec.decode_key(key_bs) {
                 Ok(Some((key, _))) => key.cmp(seek_key),
                 Ok(None) => {
-                    search_err = Some(codec::unexpected("failed to decode key from block"));
+                    search_err = Some(codec::other("failed to decode key from block"));
                     std::cmp::Ordering::Less // meaningless
                 }
                 Err(e) => {

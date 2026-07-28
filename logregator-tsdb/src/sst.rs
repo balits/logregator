@@ -13,7 +13,7 @@ use crate::{
     block::{
         self, Block, BlockCodecError, BlockCursor, BlockWriter, InvalidBlockLimit, WriteOutput,
     },
-    codec::{self, CodecError, SpecCodec, WireLen},
+    codec::{self, CodecError, RecordCodecExt, SpecCodec, WireLen},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -273,7 +273,7 @@ pub struct SstHandle<C> {
 
 impl<C> SstHandle<C>
 where
-    C: SpecCodec<Record> + SpecCodec<Key>,
+    C: RecordCodecExt,
 {
     #[instrument(err)]
     pub fn open<P>(path: P, codec: C) -> Result<Self, SstReadError>
@@ -378,7 +378,7 @@ pub struct SstCursor<C> {
 
 impl<C> SstCursor<C>
 where
-    C: SpecCodec<Record> + SpecCodec<Key>,
+    C: RecordCodecExt,
 {
     fn new(sst: Rc<SstHandle<C>>) -> Result<Self, SstReadError> {
         let codec = sst.codec.clone();
@@ -544,9 +544,9 @@ where
 /// Wrapper around a file, a unique ID, and the files path
 #[derive(Debug)]
 pub struct FileHandle {
-    id: u32,
+    _id: u32,
     file: File,
-    path: PathBuf,
+    _path: PathBuf,
 }
 
 impl FileHandle {
@@ -557,7 +557,11 @@ impl FileHandle {
             None => fmt.into(),
         };
         let file = opts.open(&path)?;
-        Ok(Self { id, path, file })
+        Ok(Self {
+            _id: id,
+            _path: path,
+            file,
+        })
     }
 
     /// checks if the path is a valid sst file path, then opens it
@@ -584,9 +588,9 @@ impl FileHandle {
         })?;
 
         Ok(FileHandle {
-            id,
+            _id: id,
             file: File::open(path)?,
-            path: path.to_path_buf(),
+            _path: path.to_path_buf(),
         })
     }
 
@@ -684,7 +688,7 @@ impl BlockMetadata {
     pub fn decode_metas<C: SpecCodec<Key>>(src: &[u8], codec: &C) -> Result<Vec<Self>, CodecError> {
         if src.len() < SZ_U32 {
             trace!("not enough bytes for length prefix");
-            return Err(CodecError::UnexpectedSize(codec::UnexpectedSize {
+            return Err(CodecError::NotEnoughBytes(codec::NotEnoughBytes {
                 got: src.len(),
                 want: SZ_U32,
             }));
@@ -700,7 +704,7 @@ impl BlockMetadata {
                 metas_len * Self::BLOCK_META_SIZE,
                 Self::BLOCK_META_SIZE
             );
-            return Err(CodecError::UnexpectedSize(codec::UnexpectedSize {
+            return Err(CodecError::NotEnoughBytes(codec::NotEnoughBytes {
                 got: src.len(),
                 want: want_total_size,
             }));
@@ -709,7 +713,7 @@ impl BlockMetadata {
         let decode_key = |src: &[u8]| -> Result<Key, CodecError> {
             match codec.decode(src) {
                 Ok(Some((key, _))) => Ok(key),
-                Ok(None) => Err(codec::unexpected(
+                Ok(None) => Err(codec::other(
                     "BlockMetadata::decode_metas(): failed to decode key from raw bytes",
                 )),
                 Err(e) => Err(e),
@@ -746,7 +750,7 @@ impl BlockMetadata {
             src[consumed + 3],
         ]);
         if stored != computed {
-            return Err(codec::unexpected(format!(
+            return Err(codec::other(format!(
                 "checksum mismatch, {stored:#x} (stored) != {computed:#x} (computed)"
             )));
         }
@@ -764,8 +768,7 @@ mod test {
     use super::BlockMetadata;
     use crate::{
         block::DEFAULT_BLOCK_SIZE,
-        codec::RecordCodec,
-        record::Record,
+        record::{Record, RecordCodec},
         sst::{SstFileWriter, SstHandle, SstWriter},
     };
 
@@ -994,6 +997,6 @@ mod test {
         dbg!(&sst);
         let fh = sst.file_handle();
 
-        SstHandle::open(&fh.path, codec).unwrap();
+        SstHandle::open(&fh._path, codec).unwrap();
     }
 }

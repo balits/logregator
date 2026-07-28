@@ -3,14 +3,41 @@ use std::{
     ops::Bound,
 };
 
-use tracing::instrument;
+use tracing::{instrument, trace};
 
 use crate::record::{Key, Record};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppendOutput {
+    /// Signals that the record was inserted
+    /// successfuly.
     Ok,
-    Full,
+
+    /// Signals that the memtable is full,
+    /// and if the record wasnt inserted before the
+    /// memtable filled up, returns the original record
+    Full(Option<Record>),
+}
+
+impl AppendOutput {
+    /// returns true if the record was inserted into
+    /// the memtable, even if it filled up afterwards
+    pub fn was_appended(&self) -> bool {
+        match &self {
+            AppendOutput::Ok => true,
+            AppendOutput::Full(None) => true,
+            AppendOutput::Full(Some(_)) => false,
+        }
+    }
+
+    /// Returns the leftover record
+    /// that couldnt be inserted into the memtable.
+    pub fn leftover(self) -> Option<Record> {
+        match self {
+            AppendOutput::Full(Some(r)) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -30,18 +57,24 @@ impl Memtable {
         }
     }
 
-    #[instrument(skip(self, r),fields(key = ?r.key, rec_size = r.size_of(), memtable_size = self.size_bytes, memtable_limit = self.limit), ret)]
-    pub fn append(&mut self, r: Record) -> AppendOutput {
-        if self.size_bytes + r.size_of() > self.limit {
-            return AppendOutput::Full;
+    #[instrument(skip(self, rec),fields(rec_size = rec.size_of(), memtable_size = self.size_bytes, memtable_limit = self.limit), ret)]
+    pub fn append(&mut self, rec: Record) -> AppendOutput {
+        // ensure first records is always inserted,
+        // even if it would overflow the memtable (which is unlikely)
+        if self.size_bytes + rec.size_of() > self.limit && self.size_bytes != 0 {
+            return AppendOutput::Full(Some(rec));
         }
-        self.size_bytes += r.size_of();
-        self.set.insert(r);
+        self.size_bytes += rec.size_of();
+        self.set.insert(rec);
         if self.size_bytes >= self.limit {
-            AppendOutput::Full
+            AppendOutput::Full(None)
         } else {
             AppendOutput::Ok
         }
+    }
+
+    pub fn last(&self) -> Option<&Record> {
+        self.set.last()
     }
 
     pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_, Record> {
@@ -58,8 +91,13 @@ impl Memtable {
         ))
     }
 
+    #[instrument(skip(self))]
     pub fn freeze(&mut self) -> FrozenMemtable {
         let frozen = std::mem::replace(self, Self::new(self.limit));
+        trace!(
+            "memtable frozen, size = {} limit = {}",
+            self.size_bytes, self.limit
+        );
         FrozenMemtable(frozen)
     }
 
@@ -156,26 +194,30 @@ mod test {
         });
 
         dbg!(&m);
-        assert_eq!(AppendOutput::Full, res, "memtable shouldve filled up");
-        assert_eq!(max_count, m.count());
-        assert_eq!(max_size, m.size_bytes());
+        assert!(res.was_appended(), "record shouldve fit into memtable");
+        pretty_assertions::assert_eq!(AppendOutput::Full(None), res);
+        pretty_assertions::assert_eq!(max_count, m.count());
+        pretty_assertions::assert_eq!(max_size, m.size_bytes());
 
         // memtable cant hold more records
-        assert_eq!(AppendOutput::Full, m.append(base.clone()));
+        let filled = m.append(base.clone());
+        dbg!(&filled);
+        assert!(!filled.was_appended());
+
         dbg!(max_count, m.count());
         dbg!(max_size, m.size_bytes());
 
         for (i, rec) in m.full_range().enumerate() {
             dbg!(&rec.key);
-            assert_eq!(i as u64, rec.key.stream_id);
+            pretty_assertions::assert_eq!(i as u64, rec.key.stream_id);
         }
 
         let f = m.freeze();
-        assert_eq!(max_size, f.size_bytes());
-        assert_eq!(max_count, f.count());
+        pretty_assertions::assert_eq!(max_size, f.size_bytes());
+        pretty_assertions::assert_eq!(max_count, f.count());
         // .freeze leaves behind an empty memtable
-        assert_eq!(0, m.size_bytes());
-        assert_eq!(0, m.count());
+        pretty_assertions::assert_eq!(0, m.size_bytes());
+        pretty_assertions::assert_eq!(0, m.count());
 
         for (i, rec) in f
             .range(
@@ -187,7 +229,7 @@ mod test {
             )
             .enumerate()
         {
-            assert_eq!(i as u64, rec.key.source_id);
+            pretty_assertions::assert_eq!(i as u64, rec.key.source_id);
         }
 
         dbg!(m);
