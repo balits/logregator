@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use nom::IResult;
 use nom::{bytes::complete::take, number::complete::be_u8};
+use serde::{Deserialize, Serialize};
 
 use crate::codec::{self, CodecError, RecordCodecExt, SZ_U8, SpecCodec, WireLen};
 use crate::merge_iter::MergeIter;
@@ -59,7 +60,7 @@ impl StreamRegistry {
 /// stores labels -> stream_id
 /// Its a wrapper over HashMap<S, S> where s is currently a String
 /// but i might replace it with Arc<str> for cheap copies.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LabelMap {
     pub(crate) inner: BTreeMap<Arc<str>, Arc<str>>,
     pub(crate) fingerprint: u64,

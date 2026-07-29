@@ -8,7 +8,7 @@ pub const SZ_U32: usize = size_of::<u32>();
 pub const SZ_U64: usize = size_of::<u64>();
 
 #[derive(thiserror::Error, Debug, Clone)]
-#[error("unexpected_size: not enough bytes: got {got}, want: {want}")]
+#[error("not enough bytes, got {got}, want: {want}")]
 pub struct NotEnoughBytes {
     pub got: usize,
     pub want: usize,
@@ -211,6 +211,7 @@ pub struct FramedWriter<W: Write, C: SpecCodec<I>, I: WireLen> {
     inner: BufWriter<W>,
     buf: Vec<u8>,
     codec: C,
+    bytes_written: usize,
     _phantom: PhantomData<I>,
 }
 
@@ -225,22 +226,30 @@ where
             inner: BufWriter::new(w),
             buf: vec![0; BUFSIZE],
             codec: c,
+            bytes_written: 0,
             _phantom: PhantomData,
         }
+    }
+
+    /// returns the number of bytes written
+    /// to the underlying BufWriter<W>, not all
+    /// of which might be flushed to W yet.
+    pub fn size_hint(&self) -> usize {
+        self.bytes_written
     }
 
     pub fn write(&mut self, item: &I) -> Result<(), CodecError> {
         self.buf.clear();
         self.buf.resize(item.wire_len(), 0);
 
-        self.codec.encode(item, &mut self.buf)?;
+        let n = self.codec.encode(item, &mut self.buf)?;
         self.inner.write_all(&self.buf).map_err(CodecError::from)?;
+        self.bytes_written += n;
         Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()?;
-        Ok(())
+        self.inner.flush()
     }
 
     pub fn buf_writer(&mut self) -> &mut BufWriter<W> {
