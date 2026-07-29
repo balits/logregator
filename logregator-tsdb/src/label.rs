@@ -29,7 +29,7 @@ pub struct StreamRegistry {
 }
 
 impl StreamRegistry {
-    pub fn insert(&mut self, stream_id: u64, labelmap: &Arc<LabelMap>) {
+    pub fn insert(&mut self, stream_id: u64, labelmap: Arc<LabelMap>) {
         self.labelmap_by_stream.insert(stream_id, labelmap.clone());
         self.stream_by_labelmap.insert(labelmap.clone(), stream_id);
         for (k, v) in labelmap.inner.iter() {

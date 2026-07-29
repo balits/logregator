@@ -42,15 +42,17 @@ impl AppendOutput {
 
 #[derive(Debug)]
 pub struct Memtable {
+    id: u64,
     set: BTreeSet<Record>,
     limit: usize,
     size_bytes: usize,
 }
 
 impl Memtable {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(id: u64, limit: usize) -> Self {
         let set = BTreeSet::new();
         Self {
+            id,
             set,
             limit,
             size_bytes: 0,
@@ -92,12 +94,8 @@ impl Memtable {
     }
 
     #[instrument(skip(self))]
-    pub fn freeze(&mut self) -> FrozenMemtable {
-        let frozen = std::mem::replace(self, Self::new(self.limit));
-        trace!(
-            "memtable frozen, size = {} limit = {}",
-            self.size_bytes, self.limit
-        );
+    pub fn freeze(&mut self, new_id: u64) -> FrozenMemtable {
+        let frozen = std::mem::replace(self, Self::new(new_id, self.limit));
         FrozenMemtable(frozen)
     }
 
@@ -173,7 +171,7 @@ mod test {
         let max_count = 4;
         let max_size = max_count * base.size_of();
 
-        let mut m = Memtable::new(max_size);
+        let mut m = Memtable::new(1, max_size);
         for i in 0..(max_count - 1) {
             let k = Key::dummy(i as u64);
             let mut rec = Record {
@@ -212,7 +210,7 @@ mod test {
             pretty_assertions::assert_eq!(i as u64, rec.key.stream_id);
         }
 
-        let f = m.freeze();
+        let f = m.freeze(2);
         pretty_assertions::assert_eq!(max_size, f.size_bytes());
         pretty_assertions::assert_eq!(max_count, f.count());
         // .freeze leaves behind an empty memtable

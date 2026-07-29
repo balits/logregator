@@ -1,7 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     ops::Bound,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,8 +10,11 @@ use std::{
 
 use tracing::instrument;
 
-use crate::codec;
-use crate::codec::RecordCodecExt;
+use crate::{
+    codec,
+    manifest::{Manifest, ManifestCodecExt},
+};
+use crate::{codec::RecordCodecExt, manifest::ManifestEntry};
 use crate::{
     codec::SpecCodec,
     label::{LabeledIter, StreamRegistry},
@@ -23,15 +26,19 @@ use crate::{
 use crate::{label::LabelMap, wal::Wal};
 
 #[derive(Debug)]
-pub struct LsmState<R: RecordCodecExt, L> {
+pub struct LsmState<R: RecordCodecExt, L: SpecCodec<LabelMap>, M: ManifestCodecExt<L>> {
+    _basepath: PathBuf,
+
     active_memtable: Memtable,
     frozen_memtables: VecDeque<Arc<FrozenMemtable>>,
     sst_handles: Vec<Rc<SstHandle<R>>>,
     wal: Wal<R>,
+    manifest: Manifest<M, L>,
 
     stream_reg: Arc<RwLock<Arc<StreamRegistry>>>,
     label_codec: L,
 
+    next_memtable_id: u64,
     next_stream_id: u64,
     next_seq_num: u64,
 }
@@ -57,27 +64,44 @@ pub enum RangeError {
     LockError(String),
 }
 
-impl<R, L> LsmState<R, L>
+impl<R, L, M> LsmState<R, L, M>
 where
     R: RecordCodecExt,
     L: SpecCodec<LabelMap>,
+    M: ManifestCodecExt<L>,
 {
-    pub fn new_uninit(memtable_limit: usize, wal: Wal<R>, label_codec: L) -> Self {
-        let active_memtable = Memtable::new(memtable_limit);
+    #[cfg(test)]
+    pub fn new_uninit(
+        basepath: PathBuf,
+        memtable_limit: usize,
+        record_codec: R,
+        label_codec: L,
+        manifest_codec: M,
+        manifest_max_file_size: Option<usize>,
+    ) -> std::io::Result<Self> {
+        let memtable_id = 0;
+        let active_memtable = Memtable::new(memtable_id, memtable_limit);
+        let wal = Wal::new(memtable_id, &basepath, record_codec.clone())?;
+
+        let manifest = Manifest::open(&basepath, manifest_codec, manifest_max_file_size)?;
+
         let frozen_memtables = VecDeque::new();
         let sst_handles = Vec::new();
         let stream_reg = Arc::new(RwLock::new(Arc::new(StreamRegistry::default())));
 
-        Self {
+        Ok(Self {
+            _basepath: basepath,
             active_memtable,
             frozen_memtables,
             sst_handles,
             wal,
+            manifest,
             stream_reg,
             label_codec,
+            next_memtable_id: memtable_id + 1,
             next_stream_id: 0,
             next_seq_num: 0,
-        }
+        })
     }
 
     pub fn append_batch<'a>(
@@ -147,10 +171,13 @@ where
                     let stream_id = self.next_stream_id;
 
                     let mut reg = (**write_guard).clone();
-                    reg.insert(stream_id, &labelmap);
+                    reg.insert(stream_id, labelmap.clone());
                     *write_guard = Arc::new(reg);
 
-                    // write entry to manifest
+                    // labelmap came from LabelMapCodec, so it must be well formed
+                    let e = ManifestEntry::stream_update(stream_id, labelmap)
+                        .expect("labelmap was invalid based on ManifestEntry::stream_update(_, _), but it came from LabelMapCodec::decode(_)");
+                    self.manifest.append(&e)?;
                     stream_id
                 }
             }
@@ -179,12 +206,14 @@ where
         match self.active_memtable.append(rec) {
             AppendOutput::Ok => Ok(false),
             AppendOutput::Full(None) => {
-                let frozen = self.active_memtable.freeze();
+                self.next_memtable_id += 1;
+                let frozen = self.active_memtable.freeze(self.next_memtable_id);
                 self.frozen_memtables.push_back(Arc::new(frozen));
                 Ok(true)
             }
             AppendOutput::Full(Some(rec)) => {
-                let frozen = self.active_memtable.freeze();
+                self.next_memtable_id += 1;
+                let frozen = self.active_memtable.freeze(self.next_memtable_id);
                 self.frozen_memtables.push_back(Arc::new(frozen));
                 let res = self.active_memtable.append(rec);
                 debug_assert_eq!(
@@ -303,22 +332,40 @@ pub enum MemtableFlushError {
 
     #[error("failed to flush memtable to disk: {0}")]
     SstFinalizeError(#[from] sst::SstFinalizeError),
+
+    #[error("failed to flush memtable to disk: failed to append entry to manifest: {0}")]
+    ManifestError(#[from] codec::CodecError),
 }
 
 #[allow(unused)]
-pub fn flush<C: RecordCodecExt>(
+pub fn flush<R, M, L>(
     memtable: Arc<FrozenMemtable>,
-    sst_id: u32,
+    manifest: &mut Manifest<M, L>,
+    sst_id: u64,
     block_limit: Option<usize>,
     dir: &Path,
-    codec: C,
-) -> Result<SstHandle<C>, MemtableFlushError> {
+    codec: R,
+) -> Result<SstHandle<R>, MemtableFlushError>
+where
+    R: RecordCodecExt,
+    L: SpecCodec<LabelMap>,
+    M: ManifestCodecExt<L>,
+{
     let mut sw = SstFileWriter::new(sst_id, codec, block_limit, Some(dir))?;
     for rec in memtable.full_range() {
         sw.write(rec)?;
     }
+    manifest.append(&ManifestEntry::SstFlush(sst_id))?;
     Ok(sw.finalize_file()?)
 }
+
+// pub fn compact<C: RecordCodecExt>(
+//     sstables: &[Rc<SstHandle<C>>]
+// ) {
+//     for sst in sstables {
+//         let created_at = sst.file_handle().as_file().metadata().unwrap().created().unwrap();
+//     }
+// }
 
 #[cfg(test)]
 mod test {
@@ -330,8 +377,8 @@ mod test {
         codec::{SpecCodec, WireLen},
         label::{LabelMap, LabelMapCodec},
         lsm::LsmState,
+        manifest::ManifestCodec,
         record::{KEY_SIZE, RecordCodec},
-        wal::Wal,
     };
 
     fn tracing() {
@@ -375,7 +422,7 @@ mod test {
     #[test]
     fn append() {
         tracing();
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmpdir = tempfile::TempDir::new().expect("tempdir");
         let label_codec = LabelMapCodec;
         let (payload_with_labelmap, payload_no_labelmap, _labelmap) = data(label_codec);
 
@@ -383,9 +430,17 @@ mod test {
         let record_size_of = KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
         // let record_wire_len = KEY_SIZE + SZ_U32 + payload_no_labelmap.len();
         let memtable_limit = max_count * record_size_of;
-        let record_codce = RecordCodec;
-        let wal = Wal::new(tmp.path(), record_codce).expect("wal::new");
-        let mut lsm = LsmState::new_uninit(memtable_limit, wal, label_codec);
+        let record_codec = RecordCodec;
+        let manifest_codec = ManifestCodec::new(label_codec);
+        let mut lsm = LsmState::new_uninit(
+            tmpdir.path().to_path_buf(),
+            memtable_limit,
+            record_codec,
+            label_codec,
+            manifest_codec,
+            None,
+        )
+        .expect("lsmstate::new");
 
         let mut computed_sz = 0;
         for i in 0..max_count {
@@ -426,17 +481,24 @@ mod test {
     #[test]
     fn range() {
         tracing();
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmpdir = tempfile::TempDir::new().expect("tempdir");
         let label_codec = LabelMapCodec;
         let (payload_with_labelmap, payload_no_labelmap, labelmap) = data(label_codec);
 
         let max_count = 4;
         let record_size_of = KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
-        // let record_wire_len = KEY_SIZE + SZ_U32 + payload_no_labelmap.len();
         let memtable_limit = max_count * record_size_of;
-        let record_codce = RecordCodec;
-        let wal = Wal::new(tmp.path(), record_codce).expect("wal::new");
-        let mut lsm = LsmState::new_uninit(memtable_limit, wal, label_codec);
+        let record_codec = RecordCodec;
+        let manifest_codec = ManifestCodec::new(label_codec);
+        let mut lsm = LsmState::new_uninit(
+            tmpdir.path().to_path_buf(),
+            memtable_limit,
+            record_codec,
+            label_codec,
+            manifest_codec,
+            None,
+        )
+        .expect("lsmstate::new");
 
         // let mut computed_sz = 0;
         let rec_count = max_count * 4;

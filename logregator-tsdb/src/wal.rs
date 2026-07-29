@@ -7,25 +7,39 @@ use tracing::instrument;
 use crate::codec::{CodecError, FramedReader, FramedWriter, SpecCodec};
 use crate::record::Record;
 
+pub const WAL_FILE_EXT: &str = ".wal";
+
 #[derive(Debug)]
 pub struct Wal<C: SpecCodec<Record>> {
-    _path: PathBuf,
+    id: u64,
+    basepath: PathBuf,
     framed: FramedWriter<File, C, Record>,
-    _f: File,
+    // _f: File,
+    codec: C,
+}
+
+pub fn format_wal_filename(id: u64) -> String {
+    format!("{id:020}{WAL_FILE_EXT}")
+}
+
+pub fn format_frozen_wal_filename(id: u64) -> String {
+    format!("{id:020}.frozen{WAL_FILE_EXT}")
 }
 
 impl<C> Wal<C>
 where
     C: SpecCodec<Record>,
 {
-    pub fn new(path: &Path, codec: C) -> io::Result<Self> {
-        let f = open_read_append(path)?;
-        let path = path.to_path_buf();
-        let framed = FramedWriter::new(f.try_clone()?, codec.clone());
+    pub fn new(id: u64, basepath: &Path, codec: C) -> io::Result<Self> {
+        let wal_path = basepath.join(format_wal_filename(id));
+        let f = open_read_append(&wal_path)?;
+
+        let framed = FramedWriter::new(f, codec.clone());
         Ok(Self {
-            _path: path,
+            id,
+            basepath: basepath.to_path_buf(),
             framed,
-            _f: f,
+            codec,
         })
     }
 
@@ -41,6 +55,15 @@ where
         Ok(())
     }
 
+    pub fn freeze(&mut self, new_id: u64) -> Result<Self, CodecError> {
+        let old_name = self.basepath.join(format_wal_filename(self.id));
+        let frozen_name = self.basepath.join(format_frozen_wal_filename(self.id));
+        std::fs::rename(old_name, frozen_name)?;
+
+        let new = Self::new(new_id, &self.basepath, self.codec.clone())?;
+        Ok(std::mem::replace(self, new))
+    }
+
     fn _try_recover(path: &Path, codec: C) -> io::Result<FramedReader<File, C, Record>> {
         let f = open_read_append(path)?;
         Ok(FramedReader::new(f, codec))
@@ -48,19 +71,22 @@ where
 }
 
 fn open_read_append(path: &Path) -> io::Result<File> {
-    OpenOptions::new().read(true).append(true).open(path)
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
 }
 
 #[cfg(test)]
 mod test {
 
     use pretty_assertions::assert_eq;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
     use crate::{
-        record::RecordCodec,
-        record::{Key, Record},
-        wal::Wal,
+        record::{Key, Record, RecordCodec},
+        wal::{Wal, format_wal_filename},
     };
 
     const PAYLOAD: &[u8] = b"du bist gut genug";
@@ -69,8 +95,8 @@ mod test {
     fn wal_lifecycle() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), RecordCodec).expect("wal::new");
+        let d = TempDir::new().expect("tempdir");
+        let mut w = Wal::new(0, d.path(), RecordCodec).expect("wal::new");
 
         for i in 0..100u64 {
             let rec = Record {
@@ -87,8 +113,8 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let codec = RecordCodec;
-        let tempf = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(tempf.path(), codec).expect("wal::new");
+        let d = TempDir::new().expect("tempdir");
+        let mut w = Wal::new(0, d.path(), codec).expect("wal::new");
 
         let record_num = 100u64;
         let written: Vec<Record> = (0..record_num)
@@ -103,20 +129,21 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::_try_recover(tempf.path(), codec)
-            .expect("failed to open wal for recovery")
-            .enumerate()
-            .map(|(i, res)| {
-                let rec = res.expect("recover: failed to decode record");
-                assert_eq!(
-                    i as u64, rec.key.sequence_num,
-                    "recover: sequence_num mismatch"
-                );
-                assert_eq!(67, rec.key.stream_id, "recover: stream_id mismatch");
-                assert_eq!(PAYLOAD, &*rec.payload, "recover: payload mismatch");
-                rec
-            })
-            .collect();
+        let recovered: Vec<Record> =
+            Wal::_try_recover(&w.basepath.join(format_wal_filename(w.id)), codec)
+                .expect("failed to open wal for recovery")
+                .enumerate()
+                .map(|(i, res)| {
+                    let rec = res.expect("recover: failed to decode record");
+                    assert_eq!(
+                        i as u64, rec.key.sequence_num,
+                        "recover: sequence_num mismatch"
+                    );
+                    assert_eq!(67, rec.key.stream_id, "recover: stream_id mismatch");
+                    assert_eq!(PAYLOAD, &*rec.payload, "recover: payload mismatch");
+                    rec
+                })
+                .collect();
 
         assert_eq!(
             record_num as usize,
@@ -138,8 +165,8 @@ mod test {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let codec = RecordCodec;
-        let f = NamedTempFile::new().expect("tempfile");
-        let mut w = Wal::new(f.path(), codec).expect("wal::new");
+        let d = TempDir::new().expect("tempdir");
+        let mut w = Wal::new(0, d.path(), codec).expect("wal::new");
 
         let first_batch: Vec<Record> = (0..10u64)
             .map(|seq| Record {
@@ -152,9 +179,10 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        // Recover once — this seeks a shared fd back to 0 in the current
+        let wal_file_path = d.path().join(format_wal_filename(w.id));
+        // Recover once: this seeks a shared fd back to 0 in the current
         // implementation, which is exactly the bug this test targets.
-        let _ = Wal::_try_recover(f.path(), codec)
+        let _ = Wal::_try_recover(&wal_file_path, codec)
             .expect("recovery failed")
             .collect::<Vec<_>>();
 
@@ -169,7 +197,7 @@ mod test {
         }
         w.flush().expect("flush failed");
 
-        let recovered: Vec<Record> = Wal::_try_recover(f.path(), codec)
+        let recovered: Vec<Record> = Wal::_try_recover(&wal_file_path, codec)
             .expect("recovery failed")
             .map(|r| r.expect("decode failed"))
             .collect();

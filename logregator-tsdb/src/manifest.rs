@@ -2,13 +2,14 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Seek},
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use crate::{
     codec::{CodecError, FramedReader, FramedWriter, SZ_U32, SZ_U64, SpecCodec, WireLen},
-    label::{self, LabelMap, LabelMapCodec},
+    label::{self, LabelMap},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, trace};
@@ -17,29 +18,33 @@ pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 pub const MANIFEST_SNAPSHOT_FILE_NAME: &str = "MANIFEST.snapshot";
 pub const MAINFEST_DEFAULT_MAX_FILE_SIZE: usize = 20 * 1028;
 
+pub trait ManifestCodecExt<L>: SpecCodec<ManifestEntry> {}
+
 /// TODO: should the methods return io::Error or CodecError::Io(io::Error)
-pub struct Manifest {
+#[derive(Debug)]
+pub struct Manifest<C: ManifestCodecExt<L>, L> {
     basepath: PathBuf,
-    framed: FramedWriter<File, ManifestCodec, ManifestEntry>,
+    framed: FramedWriter<File, C, ManifestEntry>,
     f: File,
-    codec: ManifestCodec,
+    codec: C,
     max_file_size: usize,
+    _phantom: PhantomData<L>,
 }
 
-impl Manifest {
-    pub fn open(
-        path: impl AsRef<Path>,
-        codec: ManifestCodec,
-        max_file_size: Option<usize>,
-    ) -> io::Result<Self> {
-        let basepath = path.as_ref().to_path_buf();
+impl<C, L> Manifest<C, L>
+where
+    C: ManifestCodecExt<L>,
+    L: SpecCodec<LabelMap>,
+{
+    pub fn open(basepath: &Path, codec: C, max_file_size: Option<usize>) -> io::Result<Self> {
+        let basepath = basepath.to_path_buf();
         let f = File::options()
             .read(true)
             .create(true)
             .append(true)
             .open(basepath.join(MANIFEST_FILE_NAME))?;
 
-        let framed = FramedWriter::new(f.try_clone()?, codec);
+        let framed = FramedWriter::new(f.try_clone()?, codec.clone());
 
         Ok(Self {
             basepath,
@@ -47,6 +52,7 @@ impl Manifest {
             f,
             codec,
             max_file_size: max_file_size.unwrap_or(MAINFEST_DEFAULT_MAX_FILE_SIZE),
+            _phantom: PhantomData,
         })
     }
 
@@ -68,10 +74,10 @@ impl Manifest {
         Ok(())
     }
 
-    fn as_reader(&self) -> io::Result<FramedReader<File, ManifestCodec, ManifestEntry>> {
+    fn as_reader(&self) -> io::Result<FramedReader<File, C, ManifestEntry>> {
         let mut f = self.f.try_clone()?;
         f.seek(io::SeekFrom::Start(0))?;
-        Ok(FramedReader::new(f, self.codec))
+        Ok(FramedReader::new(f, self.codec.clone()))
     }
 
     #[cfg(test)]
@@ -84,8 +90,8 @@ impl Manifest {
     #[cfg(test)]
     fn new_reader(
         p: impl AsRef<Path>,
-        codec: ManifestCodec,
-    ) -> io::Result<FramedReader<File, ManifestCodec, ManifestEntry>> {
+        codec: C,
+    ) -> io::Result<FramedReader<File, C, ManifestEntry>> {
         let basepath = p.as_ref().to_path_buf();
         let f = OpenOptions::new()
             .read(true)
@@ -107,7 +113,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn from_manifest(manifest: &Manifest) -> Result<Snapshot, CodecError> {
+    pub fn from_manifest<C, L>(manifest: &Manifest<C, L>) -> Result<Snapshot, CodecError>
+    where
+        C: ManifestCodecExt<L>,
+        L: SpecCodec<LabelMap>,
+    {
         let r = manifest.as_reader()?;
         let mut ssts = HashMap::new();
         let mut labelmaps = HashMap::new();
@@ -191,9 +201,9 @@ impl Snapshot {
 const MANIFEST_ENTRY_TAG_SZ: usize = 1;
 
 /// Represents what can reside in the Manifest file.
-/// Users should call the respective constructors functions
+/// Users should call the onstructors functions
 /// of each enum variant so that their respective
-/// invariants are upheld and panics/UB happens during
+/// invariants are upheld and panics/UB wont happen during
 /// encoding / decoding.  
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEntry {
@@ -283,11 +293,19 @@ impl ManifestEntry {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ManifestCodec {
-    label_codec: LabelMapCodec,
+pub struct ManifestCodec<L: SpecCodec<LabelMap>> {
+    label_codec: L,
 }
 
-impl SpecCodec<ManifestEntry> for ManifestCodec {
+impl<L: SpecCodec<LabelMap>> ManifestCodec<L> {
+    pub fn new(l: L) -> Self {
+        Self { label_codec: l }
+    }
+}
+
+impl<L: SpecCodec<LabelMap>> ManifestCodecExt<L> for ManifestCodec<L> {}
+
+impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
     #[instrument(ret, err)]
     fn encode(&self, item: &ManifestEntry, dst: &mut [u8]) -> Result<usize, CodecError> {
         if dst.len() < item.wire_len() {
@@ -458,6 +476,8 @@ mod test {
 
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+
+    use crate::label::LabelMapCodec;
 
     use super::*;
 

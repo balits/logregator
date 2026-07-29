@@ -22,8 +22,8 @@ use crate::{
 /// offset as u32
 pub const MAX_SST_SIZE: usize = (u32::MAX / 2) as usize; // 2GB
 
-pub fn format_sst_filename(id: u32) -> String {
-    format!("{id:010}.sst")
+pub fn format_sst_filename(id: u64) -> String {
+    format!("{id:020}.sst")
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -206,7 +206,7 @@ where
     C: SpecCodec<Record> + SpecCodec<Key>,
 {
     pub fn new(
-        id: u32,
+        id: u64,
         codec: C,
         block_limit: Option<usize>,
         path_prefix: Option<&Path>,
@@ -544,13 +544,13 @@ where
 /// Wrapper around a file, a unique ID, and the files path
 #[derive(Debug)]
 pub struct FileHandle {
-    _id: u32,
+    _id: u64,
     file: File,
     _path: PathBuf,
 }
 
 impl FileHandle {
-    pub fn open(id: u32, prefix: Option<&Path>, opts: &mut OpenOptions) -> io::Result<Self> {
+    pub fn open(id: u64, prefix: Option<&Path>, opts: &mut OpenOptions) -> io::Result<Self> {
         let fmt = format_sst_filename(id);
         let path = match prefix {
             Some(p) => p.join(fmt),
@@ -580,7 +580,7 @@ impl FileHandle {
         }
 
         let digits = &fname[..fname.len() - ".sst".len()];
-        let id: u32 = digits.parse().map_err(|e| {
+        let id: u64 = digits.parse().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("failed to parse sst id: {e}"),
