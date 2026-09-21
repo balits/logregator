@@ -1,4 +1,4 @@
-use tracing::trace;
+use tracing::{instrument, trace};
 
 use crate::record::{Key, Record};
 
@@ -7,6 +7,9 @@ pub const SZ_U16: usize = size_of::<u16>();
 pub const SZ_U32: usize = size_of::<u32>();
 pub const SZ_U64: usize = size_of::<u64>();
 
+/// This is pretty usefull, but record codec
+/// returns Ok(None) instead when a whole record could not be read,
+/// this makes sense for framed reads and framed writes
 #[derive(thiserror::Error, Debug, Clone)]
 #[error("not enough bytes, got {got}, want: {want}")]
 pub struct NotEnoughBytes {
@@ -16,10 +19,10 @@ pub struct NotEnoughBytes {
 
 /// TODO: this should be refactored to be a more general
 /// and intuitive enum for codec errors.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CodecError {
     #[error("codec error: io error: {0}")]
-    Io(#[from] io::Error),
+    Io(Arc<io::Error>),
 
     #[error("codec error: custom error: {0}")]
     Other(String),
@@ -27,24 +30,22 @@ pub enum CodecError {
     #[error("codec error: {0}")]
     NotEnoughBytes(NotEnoughBytes),
 
-    #[error("codec error: {0}")]
-    InvalidPayloadSize(InvalidPayloadSize),
+    #[error("codec error: {0} (record payload size)")]
+    InvalidPayloadSize(InvalidSize),
+}
+
+impl From<std::io::Error> for CodecError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(Arc::new(e))
+    }
 }
 
 #[derive(thiserror::Error, Debug, Clone)]
-#[error("invalid payload size: min: {min}, max: {max}, got: {got}")]
-pub struct InvalidPayloadSize {
+#[error("invalid size: got = {got}, min = {min}, max = {max}")]
+pub struct InvalidSize {
+    pub got: usize,
     pub min: usize,
     pub max: usize,
-    pub got: usize,
-}
-
-impl InvalidPayloadSize {
-    pub fn new(got: usize) -> Self {
-        let min = crate::record::MIN_PAYLOAD_LENGTH;
-        let max = crate::record::MAX_PAYLOAD_LENGTH;
-        Self { min, max, got }
-    }
 }
 
 pub fn not_enough_bytes(got: usize, want: usize) -> CodecError {
@@ -55,14 +56,15 @@ pub fn other(msg: impl Into<String>) -> CodecError {
     CodecError::Other(msg.into())
 }
 
-pub fn invalid_payload_sz(got: usize) -> CodecError {
-    CodecError::InvalidPayloadSize(InvalidPayloadSize::new(got))
+pub fn invalid_payload_sz(got: usize, max: usize, min: usize) -> CodecError {
+    CodecError::InvalidPayloadSize(InvalidSize { got, max, min })
 }
 
 use std::{
     fmt::Debug,
     io::{self, BufWriter, IntoInnerError, Read, Write},
     marker::PhantomData,
+    sync::Arc,
 };
 
 pub trait WireLen: Sized {
@@ -85,19 +87,33 @@ pub trait SpecCodec<I: WireLen>: Clone + Debug {
 /// Convenience wrapper trait around a codec that works over both [Record]
 /// and [Key]
 pub trait RecordCodecExt: SpecCodec<Record> + SpecCodec<Key> {
-    fn encode_key(&self, key: &Key, dst: &mut [u8]) -> Result<usize, CodecError> {
+    fn encode_key(
+        &self,
+        key: &Key,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
         self.encode(key, dst)
     }
 
-    fn encode_record(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
+    fn encode_record(
+        &self,
+        rec: &Record,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
         self.encode(rec, dst)
     }
 
-    fn decode_key(&self, src: &[u8]) -> Result<Option<(Key, usize)>, CodecError> {
+    fn decode_key(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(Key, usize)>, CodecError> {
         self.decode(src)
     }
 
-    fn decode_record(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
+    fn decode_record(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(Record, usize)>, CodecError> {
         self.decode(src)
     }
 }
@@ -105,7 +121,9 @@ pub trait RecordCodecExt: SpecCodec<Record> + SpecCodec<Key> {
 pub(super) const BUFSIZE: usize = 4 * 1024;
 
 pub struct FramedReader<R: io::Read, C: SpecCodec<I>, I: WireLen> {
+    /// buffer for raw bytes read from R
     inner: io::BufReader<R>,
+    /// buffer for raw bytes that from which I could be decodec from
     buf: Vec<u8>,
     start: usize,
     end: usize,
@@ -130,6 +148,8 @@ where
         }
     }
 
+    /// returns true if the underlying BufReader has cant read
+    /// more bytes
     fn fill(&mut self) -> io::Result<bool> {
         if self.end == self.buf.len() {
             if self.start > 0 {
@@ -198,12 +218,11 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FramedReader<R, C>")
-            .field("inner", &format_args!("{:?}", self.inner))
             .field("buf", &format_args!("[0..{}]", self.buf.len()))
             .field("start", &self.start)
             .field("end", &self.end)
             .field("codec", &self.codec)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -217,9 +236,9 @@ pub struct FramedWriter<W: Write, C: SpecCodec<I>, I: WireLen> {
 
 impl<W, C, I> FramedWriter<W, C, I>
 where
-    W: io::Write,
+    W: io::Write + std::fmt::Debug,
     C: SpecCodec<I>,
-    I: WireLen,
+    I: WireLen + std::fmt::Debug,
 {
     pub fn new(w: W, c: C) -> Self {
         Self {
@@ -238,6 +257,7 @@ where
         self.bytes_written
     }
 
+    #[instrument(ret, err)]
     pub fn write(&mut self, item: &I) -> Result<(), CodecError> {
         self.buf.clear();
         self.buf.resize(item.wire_len(), 0);
@@ -269,13 +289,9 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FramedWriter")
-            .field(
-                "inner",
-                &format_args!("{:?}", std::any::type_name_of_val(&self.inner)),
-            )
             .field("buf", &format_args!("[0..{}]", self.buf.len()))
             .field("codec", &self.codec)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -283,8 +299,8 @@ where
 mod test {
     use super::*;
     use crate::record::{
-        KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE, Record,
-        RecordCodec,
+        Key, Record, RecordCodec, KEY_SIZE, MAX_PAYLOAD_LENGTH,
+        MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE,
     };
     use proptest::prelude::*;
     use std::io::Cursor;
@@ -295,12 +311,22 @@ mod test {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
-            proptest::collection::vec(any::<u8>(), MIN_PAYLOAD_LENGTH..MAX_PAYLOAD_LENGTH),
+            proptest::collection::vec(
+                any::<u8>(),
+                MIN_PAYLOAD_LENGTH..MAX_PAYLOAD_LENGTH,
+            ),
         )
             .prop_map(
-                |(source_id, timestamp, sequence_num, stream_id, payload)| Record {
-                    key: Key::new(source_id, timestamp, sequence_num, stream_id),
-                    payload: payload.into_boxed_slice(),
+                |(source_id, timestamp, sequence_num, stream_id, payload)| {
+                    Record {
+                        key: Key::new(
+                            source_id,
+                            timestamp,
+                            sequence_num,
+                            stream_id,
+                        ),
+                        payload: payload.into(),
+                    }
                 },
             )
     }
@@ -416,15 +442,16 @@ mod test {
     fn framed_reader_grows_buffer_even_after_prior_compaction() {
         let small = Record {
             key: crate::record::Key::new(1, 1, 1, 1),
-            payload: vec![0xAA; 4].into_boxed_slice(),
+            payload: vec![0xAA; 4].into(),
         };
         let big_payload_len = MAX_PAYLOAD_LENGTH - KEY_SIZE - PAYLOAD_LEN_SIZE; // several buffer-doublings' worth
         let big = Record {
             key: crate::record::Key::new(2, 2, 2, 2),
-            payload: vec![0xBB; big_payload_len].into_boxed_slice(),
+            payload: vec![0xBB; big_payload_len].into(),
         };
 
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
+        let mut writer =
+            FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
         writer.write(&small).unwrap();
         writer.write(&big).unwrap();
         writer.flush().unwrap();
@@ -449,14 +476,15 @@ mod test {
         let leading_payload_len = BUFSIZE - KEY_SIZE - PAYLOAD_LEN_SIZE - 10;
         let straddling = Record {
             key: crate::record::Key::new(1, 2, 3, 4),
-            payload: vec![0xAB; leading_payload_len].into_boxed_slice(),
+            payload: vec![0xAB; leading_payload_len].into(),
         };
         let second = Record {
             key: crate::record::Key::new(5, 6, 7, 8),
-            payload: vec![0xCD; 500].into_boxed_slice(),
+            payload: vec![0xCD; 500].into(),
         };
 
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
+        let mut writer =
+            FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
         writer.write(&straddling).unwrap();
         writer.write(&second).unwrap();
         writer.flush().unwrap();
@@ -476,14 +504,15 @@ mod test {
     fn framed_reader_stops_cleanly_on_torn_trailing_record() {
         let good = Record {
             key: crate::record::Key::new(1, 1, 1, 1),
-            payload: vec![1, 2, 3].into_boxed_slice(),
+            payload: vec![1, 2, 3].into(),
         };
         let torn = Record {
             key: crate::record::Key::new(2, 2, 2, 2),
-            payload: vec![9; 100].into_boxed_slice(),
+            payload: vec![9; 100].into(),
         };
 
-        let mut writer = FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
+        let mut writer =
+            FramedWriter::new(Cursor::new(Vec::new()), RecordCodec);
         writer.write(&good).unwrap();
         writer.write(&torn).unwrap();
         writer.flush().unwrap();

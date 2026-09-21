@@ -1,9 +1,10 @@
 use std::{
-    collections::{BTreeSet, btree_set::Range},
-    ops::Bound,
+    collections::{btree_set::Range, BTreeSet},
+    ops::{Bound, Deref, DerefMut},
+    sync::{atomic::AtomicBool, Arc},
 };
 
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 use crate::record::{Key, Record};
 
@@ -29,26 +30,98 @@ impl AppendOutput {
             AppendOutput::Full(Some(_)) => false,
         }
     }
+}
 
-    /// Returns the leftover record
-    /// that couldnt be inserted into the memtable.
-    pub fn leftover(self) -> Option<Record> {
-        match self {
-            AppendOutput::Full(Some(r)) => Some(r),
-            _ => None,
+/// A wrapper around a memtable giving both read
+/// and wrtie access to it by the [Deref] and [DerefMut] traits.
+#[derive(Debug, Clone)]
+pub struct MutMemtable(MemtableInner);
+
+impl Deref for MutMemtable {
+    type Target = MemtableInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for MutMemtable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl MutMemtable {
+    pub fn new(id: u64, limit: usize) -> Self {
+        Self(MemtableInner::new(id, limit))
+    }
+}
+
+/// A wrapper around a memtable, giving only read-only
+/// access to the underlying memtable.
+#[derive(Debug, Clone)]
+pub struct FrozenMemtable(Arc<MemtableInner>);
+
+impl Deref for FrozenMemtable {
+    type Target = MemtableInner;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A wrapper around a memtable, giving only read-only
+/// access to the underlying memtable.
+#[derive(Debug)]
+pub struct FlushableMemtable {
+    inner: Arc<MemtableInner>,
+    flushed: AtomicBool,
+}
+
+impl Deref for FlushableMemtable {
+    type Target = MemtableInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl From<FrozenMemtable> for FlushableMemtable {
+    fn from(f: FrozenMemtable) -> Self {
+        Self {
+            inner: f.0,
+            flushed: AtomicBool::new(false),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Memtable {
+impl FlushableMemtable {
+    pub fn mark_flushed(&mut self) {
+        self.flushed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .expect("TODO: mark_flushed panicked on CAS");
+    }
+
+    pub fn is_flushed(&mut self) -> bool {
+        self.flushed.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The actual implementation of the Memtable,
+/// wrapper structs merely derefernece to this one.
+#[derive(Debug, Clone)]
+pub struct MemtableInner {
     id: u64,
     set: BTreeSet<Record>,
     limit: usize,
     size_bytes: usize,
+    first_key: Option<Key>,
+    last_key: Option<Key>,
 }
 
-impl Memtable {
+impl MemtableInner {
     pub fn new(id: u64, limit: usize) -> Self {
         let set = BTreeSet::new();
         Self {
@@ -56,6 +129,8 @@ impl Memtable {
             set,
             limit,
             size_bytes: 0,
+            first_key: None,
+            last_key: None,
         }
     }
 
@@ -63,11 +138,17 @@ impl Memtable {
     pub fn append(&mut self, rec: Record) -> AppendOutput {
         // ensure first records is always inserted,
         // even if it would overflow the memtable (which is unlikely)
-        if self.size_bytes + rec.size_of() > self.limit && self.size_bytes != 0 {
+        if self.size_bytes + rec.size_of() > self.limit && self.size_bytes != 0
+        {
             return AppendOutput::Full(Some(rec));
         }
+
+        if self.first_key.is_none() {
+            self.first_key = Some(rec.key.clone())
+        }
+        self.last_key = Some(rec.key.clone());
         self.size_bytes += rec.size_of();
-        self.set.insert(rec);
+        let _insert_success = self.set.insert(rec);
         if self.size_bytes >= self.limit {
             AppendOutput::Full(None)
         } else {
@@ -79,9 +160,25 @@ impl Memtable {
         self.set.last()
     }
 
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_, Record> {
+    pub fn range<K>(&self, start: Bound<K>, end: Bound<K>) -> Range<'_, Record>
+    where
+        K: AsRef<Key>,
+    {
+        let start = start.as_ref().map(|k| k.as_ref());
+        let end = end.as_ref().map(|k| k.as_ref());
         self.set
             .range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
+    }
+
+    pub fn range_cloned(
+        &self,
+        start: Bound<&Key>,
+        end: Bound<&Key>,
+    ) -> BTreeSet<Record> {
+        self.set
+            .range::<Key, (Bound<&Key>, Bound<&Key>)>((start, end))
+            .cloned()
+            .collect()
     }
 
     pub fn full_range(&self) -> Range<'_, Record> {
@@ -93,17 +190,23 @@ impl Memtable {
         ))
     }
 
-    #[instrument(skip(self))]
     pub fn freeze(&mut self, new_id: u64) -> FrozenMemtable {
-        let frozen = std::mem::replace(self, Self::new(new_id, self.limit));
-        FrozenMemtable(frozen)
+        let inner = std::mem::replace(self, Self::new(new_id, self.limit));
+        FrozenMemtable(Arc::new(inner))
     }
 
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns how many records this memtable holds.
     #[inline]
     pub fn count(&self) -> usize {
         self.set.len()
     }
 
+    /// Returns how many raw bytes this memtable holds.
     #[inline]
     pub fn size_bytes(&self) -> usize {
         self.size_bytes
@@ -113,32 +216,24 @@ impl Memtable {
     pub fn limit(&self) -> usize {
         self.limit
     }
-}
 
-#[derive(Debug)]
-pub struct FrozenMemtable(Memtable);
-
-impl FrozenMemtable {
-    pub fn range(&self, start: Bound<&Key>, end: Bound<&Key>) -> Range<'_, Record> {
-        self.0.range(start, end)
-    }
-    pub fn full_range(&self) -> Range<'_, Record> {
-        self.0.full_range()
+    #[inline]
+    pub fn key_range(&self) -> (Option<&Key>, Option<&Key>) {
+        (self.first_key.as_ref(), self.last_key.as_ref())
     }
 
     #[inline]
-    pub fn count(&self) -> usize {
-        self.0.count()
-    }
+    pub fn key_bounds_full(&self) -> crate::Result<(Bound<&Key>, Bound<&Key>)> {
+        let b = match self.key_range() {
+            (Some(k1), Some(k2)) => (Bound::Included(k1), Bound::Included(k2)),
+            (None, _) | (_, None) => {
+                return Err(crate::Error::from(
+                    "`first_key` or `last_key` not set after calling `active_memtable.append(record)`",
+                ));
+            }
+        };
 
-    #[inline]
-    pub fn size_bytes(&self) -> usize {
-        self.0.size_bytes()
-    }
-
-    #[inline]
-    pub fn limit(&self) -> usize {
-        self.0.limit()
+        Ok(b)
     }
 }
 
@@ -147,7 +242,7 @@ mod test {
     use std::ops::Bound;
 
     use crate::{
-        memtable::{AppendOutput, Memtable},
+        memtable::{AppendOutput, MutMemtable},
         record::{Key, Record},
     };
     use pretty_assertions::assert_eq;
@@ -166,12 +261,12 @@ mod test {
         tracing();
         let base = Record {
             key: Key::new(1, 2, 3, 4),
-            payload: vec![0x01, 0x02, 0x03, 0x04].into_boxed_slice(),
+            payload: vec![0x01, 0x02, 0x03, 0x04].into(),
         };
         let max_count = 4;
         let max_size = max_count * base.size_of();
 
-        let mut m = Memtable::new(1, max_size);
+        let mut m = MutMemtable::new(1, max_size);
         for i in 0..(max_count - 1) {
             let k = Key::dummy(i as u64);
             let mut rec = Record {
@@ -182,7 +277,7 @@ mod test {
             let rec_sz = rec.size_of();
 
             assert_eq!(AppendOutput::Ok, m.append(rec));
-            assert_eq!(m.size_bytes, rec_sz * (i + 1))
+            assert_eq!(m.size_bytes(), rec_sz * (i + 1))
         }
 
         // memtable just filled up

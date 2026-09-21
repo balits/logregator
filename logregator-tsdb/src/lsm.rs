@@ -1,272 +1,275 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    cell::RefCell,
+    collections::{VecDeque},
     ops::Bound,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::mpsc,
     time::{SystemTime, UNIX_EPOCH},
     vec::IntoIter as VecIntoIter,
 };
 
-use tracing::instrument;
+use tracing::{error, instrument};
 
 use crate::{
-    codec,
-    manifest::{Manifest, ManifestCodecExt},
-};
-use crate::{codec::RecordCodecExt, manifest::ManifestEntry};
-use crate::{
-    codec::SpecCodec,
-    label::{LabeledIter, StreamRegistry},
-    memtable::{AppendOutput, FrozenMemtable, Memtable},
+    codec::{self, RecordCodecExt, SpecCodec},
+    counter::Counter,
+    io,
+    label::{LabelMap, LabeledIter, StreamRegistry},
+    manifest::ManifestEntry,
+    memtable::{AppendOutput, FrozenMemtable, MutMemtable},
     merge_iter::MergeIter,
     record::{self, Key, Record},
-    sst::{self, SstFileWriter, SstHandle, SstReadError},
+    sst::{self, SstHandle},
 };
-use crate::{label::LabelMap, wal::Wal};
 
 #[derive(Debug)]
-pub struct LsmState<R: RecordCodecExt, L: SpecCodec<LabelMap>, M: ManifestCodecExt<L>> {
-    _basepath: PathBuf,
-
-    active_memtable: Memtable,
-    frozen_memtables: VecDeque<Arc<FrozenMemtable>>,
-    sst_handles: Vec<Rc<SstHandle<R>>>,
-    wal: Wal<R>,
-    manifest: Manifest<M, L>,
-
-    stream_reg: Arc<RwLock<Arc<StreamRegistry>>>,
+pub struct LsmConfig<R, L> {
+    basepath: PathBuf,
+    block_size_limit: Option<usize>,
+    _retention_days: Option<u32>,
+    record_codec: R,
     label_codec: L,
-
-    next_memtable_id: u64,
-    next_stream_id: u64,
-    next_seq_num: u64,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AppendError {
-    #[error("failed to append to lsm-tree: {0}")]
-    CodecError(#[from] codec::CodecError),
+#[derive(Debug)]
+pub struct LsmTree<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
+    config: LsmConfig<R, L>,
+    next_memtable_id: Counter,
+    next_stream_id: Counter,
+    next_seq_num: Counter,
 
-    #[error("failed to append to lsm-tree: label error: {0}")]
-    LabelError(String),
+    memtable: MutMemtable,
+    frozen_memtables: VecDeque<FrozenMemtable>,
+    sst_handles: Vec<SstHandle<R>>,
+    stream_buffer: Vec<ManifestEntry>,
+    stream_reg: Rc<RefCell<StreamRegistry>>,
 
-    #[error("failed to append to lsm-tree: locking failed: {0}")]
-    LockError(String),
+    io_tx: mpsc::Sender<io::IoEvent<R>>,
 }
+
+impl<R, L> LsmTree<R, L>
+where
+    R: RecordCodecExt,
+    L: SpecCodec<LabelMap>,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_uninit(
+        basepath: PathBuf,
+        record_codec: R,
+        label_codec: L,
+        block_size_limit: Option<usize>,
+        memtable: MutMemtable,
+        sst_handles: Vec<SstHandle<R>>,
+        stream_reg: StreamRegistry,
+        next_stream_id: u64,
+        next_seq_num: u64,
+        retention_days: Option<u32>,
+        io_tx: mpsc::Sender<io::IoEvent<R>>,
+    ) -> Self {
+        let next_memtable_id = memtable.id() + 1;
+        let frozen_memtables = VecDeque::new();
+        let stream_buffer = Vec::new();
+        let config = LsmConfig {
+            basepath,
+            record_codec,
+            block_size_limit,
+            label_codec,
+            _retention_days: retention_days,
+        };
+        let stream_reg = Rc::new(RefCell::new(stream_reg));
+
+        Self {
+            memtable,
+            frozen_memtables,
+            sst_handles,
+            stream_reg,
+            next_memtable_id: next_memtable_id.into(),
+            next_stream_id: next_stream_id.into(),
+            next_seq_num: next_seq_num.into(),
+            config,
+            io_tx,
+            stream_buffer,
+        }
+    }
+}
+
+// #[derive(Debug, thiserror::Error)]
+// pub enum AppendError {
+//     #[error("failed to append to lsm-tree: {0}")]
+//     CodecError(#[from] codec::CodecError),
+
+//     #[error("failed to append to lsm-tree: label error: {0}")]
+//     LabelError(String),
+
+//     #[error("failed to append to lsm-tree: locking failed: {0}")]
+//     LockError(String),
+
+//     #[error(
+//         "failed to append to lsm-tree: failed to send IO job to the IO worker: {0}"
+//     )]
+//     IoError(#[from] crate::io::IoError),
+// }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RangeError {
     #[error("faild to range over lsm-tree: {0}")]
-    SstReadError(#[from] sst::SstReadError),
+    SstReadError(#[from] sst::SstError),
 
     #[error("failed to append to lsm-tree: locking failed: {0}")]
     LockError(String),
 }
 
-impl<R, L, M> LsmState<R, L, M>
+impl<R, L> LsmTree<R, L>
 where
     R: RecordCodecExt,
-    L: SpecCodec<LabelMap>,
-    M: ManifestCodecExt<L>,
+    L: SpecCodec<LabelMap> + 'static,
 {
     #[cfg(test)]
-    pub fn new_uninit(
-        basepath: PathBuf,
-        memtable_limit: usize,
-        record_codec: R,
-        label_codec: L,
-        manifest_codec: M,
-        manifest_max_file_size: Option<usize>,
-    ) -> std::io::Result<Self> {
-        let memtable_id = 0;
-        let active_memtable = Memtable::new(memtable_id, memtable_limit);
-        let wal = Wal::new(memtable_id, &basepath, record_codec.clone())?;
-
-        let manifest = Manifest::open(&basepath, manifest_codec, manifest_max_file_size)?;
-
-        let frozen_memtables = VecDeque::new();
-        let sst_handles = Vec::new();
-        let stream_reg = Arc::new(RwLock::new(Arc::new(StreamRegistry::default())));
-
-        Ok(Self {
-            _basepath: basepath,
-            active_memtable,
-            frozen_memtables,
-            sst_handles,
-            wal,
-            manifest,
-            stream_reg,
-            label_codec,
-            next_memtable_id: memtable_id + 1,
-            next_stream_id: 0,
-            next_seq_num: 0,
-        })
+    pub fn append_single(
+        &mut self,
+        payload: &[u8],
+        source_id: u64,
+    ) -> crate::Result<()> {
+        let iter = [payload].into_iter();
+        self.append_batch(iter, source_id)
     }
 
     pub fn append_batch<'a>(
         &mut self,
         payloads: impl Iterator<Item = &'a [u8]>,
         source_id: u64,
-    ) -> Result<bool, (usize, AppendError)> {
-        let mut needs_flush = false;
-        for (i, p) in payloads.enumerate() {
-            needs_flush = self.append_single(p, source_id).map_err(|e| (i, e))?;
-        }
-        Ok(needs_flush)
-    }
+    ) -> crate::Result<()> {
+        for payload in payloads {
+            record::check_payload_size(payload.len())?;
 
-    // returns true if flush is needed
-    #[instrument(skip(self, payload), fields(raw_payload_len = payload.len()), err)]
-    fn append_single(&mut self, payload: &[u8], source_id: u64) -> Result<bool, AppendError> {
-        record::check_payload_size(payload.len())?;
+            let (labelmap, label_bytes_read) =
+                match self.config.label_codec.decode(payload) {
+                    Ok(Some((m, r))) => (Rc::new(m), r),
+                    Ok(None) => {
+                        return Err(codec::CodecError::Other(
+                            "label map codec returned Ok(None)".into(),
+                        )
+                        .into());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
-        let (labelmap, label_bytes_read) = match self.label_codec.decode(payload) {
-            Ok(Some((m, r))) => (Arc::new(m), r),
-            Ok(None) => {
-                return Err(
-                    codec::CodecError::Other("label map codec returned Ok(None)".into()).into(),
-                );
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("failed to make UNIX timestemp")
-            .as_nanos() as u64;
-
-        // Arc RwLock Arc StreamReg
-        // ^^^ :      :
-        // |   ^^^^^^ :
-        // |   |      ^^^
-        // |   |      |
-        // |   |      cheap clones for snapshots
-        // |   |
-        // |   modifying/swapping
-        // |
-        // share between threads
-
-        let stream_id = {
-            let mut write_guard = self
+            let stream_id = self
                 .stream_reg
-                .write()
-                .map_err(|e| AppendError::LockError(e.to_string()))?;
+                .borrow()
+                .get_stream_id_by_labelmap(&labelmap)
+                .copied()
+                .unwrap_or_else(|| self.next_stream_id.inc_and_get());
 
-            match write_guard.get_stream_id_by_labelmap(&labelmap) {
-                Some(stream_id) => {
-                    let existing_map= write_guard.get_labelmap_by_stream(stream_id).ok_or_else(|| {
-                        AppendError::LabelError("inconsisent label state: stream registry contains stream_id but stream registry doesnt".into())})?;
+            // drops the need for the borrow() to live while the later None
+            // branch calls borrow_mut()
+            let prev_stream_id = self
+                .stream_reg
+                .borrow()
+                .get_stream_id_by_labelmap(&labelmap)
+                .copied();
+
+            match prev_stream_id {
+                Some(_) => {
+                    let reg = self.stream_reg.borrow();
+                    let existing_map = reg.get_labelmap_by_stream(&stream_id).ok_or_else(|| {
+                        crate::Error::from("label state error: StreamRegistry.stream_by_labelmap contains stream_id but StreamRegistry.labelmap_by_stream doesnt")
+                    })?;
 
                     if existing_map.as_ref() != labelmap.as_ref() {
-                        return Err(AppendError::LabelError(
-                            "hash collision occured (likelyhood was 2^16/2^65 ~ 1,7×10^-15) and im lazy to resolve it".into(),
+                        return Err(crate::Error::from(
+                            "label state error: hash collision occured (likelyhood was 2^16/2^65 ~ 1,7×10^-15) and I'm lazy to resolve it",
                         ));
                     }
-
-                    *stream_id
                 }
                 None => {
-                    self.next_stream_id += 1;
-                    let stream_id = self.next_stream_id;
-
-                    let mut reg = (**write_guard).clone();
-                    reg.insert(stream_id, labelmap.clone());
-                    *write_guard = Arc::new(reg);
-
-                    // labelmap came from LabelMapCodec, so it must be well formed
-                    let e = ManifestEntry::stream_update(stream_id, labelmap)
+                    self.stream_reg
+                        .borrow_mut()
+                        .insert(stream_id, labelmap.clone());
+                    let stream_update = ManifestEntry::stream_update(stream_id, labelmap.clone())
                         .expect("labelmap was invalid based on ManifestEntry::stream_update(_, _), but it came from LabelMapCodec::decode(_)");
-                    self.manifest.append(&e)?;
-                    stream_id
+                    self.stream_buffer.push(stream_update);
                 }
             }
-        };
 
-        self.next_seq_num += 1;
-        let key = record::Key {
-            source_id,
-            timestamp,
-            sequence_num: self.next_seq_num,
-            stream_id,
-        };
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("failed to make UNIX timestemp")
+                .as_nanos() as u64;
 
-        let rec = Record {
-            key,
-            payload: payload[label_bytes_read..].to_vec().into_boxed_slice(),
-        };
+            let key = record::Key {
+                source_id,
+                timestamp,
+                sequence_num: self.next_seq_num.inc_and_get(),
+                stream_id,
+            };
 
-        // trace!(
-        //     record_size_of = rec.size_of(),
-        //     record_wire_len = rec.wire_len(),
-        //     payload = String::from_utf8_lossy_owned(rec.payload.to_vec())
-        // );
+            let rec = Record {
+                key,
+                payload: payload[label_bytes_read..].into(),
+            };
 
-        self.wal.append(&rec)?;
-        match self.active_memtable.append(rec) {
-            AppendOutput::Ok => Ok(false),
-            AppendOutput::Full(None) => {
-                self.next_memtable_id += 1;
-                let frozen = self.active_memtable.freeze(self.next_memtable_id);
-                self.frozen_memtables.push_back(Arc::new(frozen));
-                Ok(true)
-            }
-            AppendOutput::Full(Some(rec)) => {
-                self.next_memtable_id += 1;
-                let frozen = self.active_memtable.freeze(self.next_memtable_id);
-                self.frozen_memtables.push_back(Arc::new(frozen));
-                let res = self.active_memtable.append(rec);
-                debug_assert_eq!(
-                    AppendOutput::Ok,
-                    res,
-                    "empty memtable should insert the first record, even if it overflows the memory limit"
-                );
-                Ok(true)
+            self.io_tx
+                .send(io::IoEvent::AppendWal(rec.clone()))
+                .map_err(|e| crate::Error::from(format!("{e}")))?;
+
+            if let AppendOutput::Full(partial_rec) = self.memtable.append(rec) {
+                self.issue_flush()?;
+
+                if let Some(r) = partial_rec {
+                    error!("REJECTED KEY: {:?}", r.key);
+                    // debug_assert!(
+                    assert!(
+                        self.memtable.append(r).was_appended(),
+                        "append_batch: empty (frozen-then-replaced) memtable should insert the first record, even if it overflows the memory limit"
+                    );
+                }
             }
         }
+
+        self.io_tx
+            .send(io::IoEvent::FsyncWal)
+            .map_err(|e| crate::Error::from(format!("{e}")))?;
+
+        Ok(())
     }
 
-    pub fn range<'a, I>(
+    #[instrument(skip(self, labels), fields(labels_size_hint = ?labels.size_hint()), err)]
+    pub fn range<I, S>(
         &mut self,
         labels: I,
         start_t: Option<u64>,
         end_t: Option<u64>,
-    ) -> Result<LabeledIter<'_, R, VecIntoIter<MergeIter<'_, R>>>, RangeError>
+    ) -> Result<LabeledIter<'_, R, VecIntoIter<MergeIter<'_, '_, R>>>, RangeError>
     where
-        I: Iterator<Item = (&'a Arc<str>, &'a Arc<str>)>,
+        S: AsRef<str>,
+        I: Iterator<Item=(S, S)>,
     {
         let start_t = start_t.unwrap_or(0);
         let end_t = end_t.unwrap_or(u64::MAX);
 
-        let snapshot = {
-            let read_guard = self
-                .stream_reg
-                .read()
-                .map_err(|e| RangeError::LockError(e.to_string()))?;
-            (*read_guard).clone()
-        };
+        let stream_ids = self.stream_reg.borrow().label_intersection(labels);
 
-        let stream_ids = Self::label_intersection(&snapshot, labels);
-
-        let merge_iters: Result<Vec<MergeIter<'_, R>>, SstReadError> = stream_ids
-            .iter()
+        let merge_iters: Result<Vec<_>, sst::SstError> = stream_ids
+            .into_iter()
             .map(|id| {
-                let start = Bound::Included(&Key {
-                    stream_id: *id,
+                let start = Bound::Included(Key {
+                    stream_id: id,
                     timestamp: start_t,
                     sequence_num: 0,
                     source_id: 0,
                 });
 
-                let end = Bound::Included(&Key {
-                    stream_id: *id,
+                let end = Bound::Included(Key {
+                    stream_id: id,
                     timestamp: end_t,
                     sequence_num: u64::MAX,
                     source_id: u64::MAX,
                 });
 
                 MergeIter::new(
-                    &self.active_memtable,
+                    &self.memtable,
                     &self.frozen_memtables,
                     &self.sst_handles,
                     start,
@@ -277,118 +280,136 @@ where
 
         let merge_iters = merge_iters.map_err(RangeError::SstReadError)?;
 
-        Ok(LabeledIter::new(merge_iters, snapshot))
+        Ok(LabeledIter::new(merge_iters, self.stream_reg.clone()))
     }
 
-    pub fn label_intersection<'a, I>(stream_reg: &StreamRegistry, labels: I) -> HashSet<u64>
-    where
-        I: Iterator<Item = (&'a Arc<str>, &'a Arc<str>)>,
-    {
-        let mut sets: Vec<&HashSet<u64>> = labels
-            .flat_map(|(k, v)| stream_reg.get_streams_by_kv(k.clone(), v.clone()))
-            .collect();
+    pub fn sst_handles(&self) -> &[sst::SstHandle<R>] {
+        &self.sst_handles
+    }
 
-        if sets.is_empty() {
-            return HashSet::new();
-        }
-
-        sets.sort_unstable_by_key(|s| s.len());
-
-        let mut acc = sets[0].clone();
-        for s in &sets[1..] {
-            acc.retain(|id| s.contains(id));
-            if s.is_empty() {
-                break;
+    /// NOTE: one call to to the io task's flush_memtables
+    /// should correspond to exactly one call to drain_sst_queue]
+    pub fn drain_sst_queue(
+        &mut self,
+        flush_results: &mpsc::Receiver<sst::SstHandle<R>>,
+    ) {
+        error!("\t=> lsm.drain_sst_queue() called");
+        for sst in flush_results.try_iter() {
+            error!("draining sst {}", sst.id());
+            if let Some(frozen) = self.frozen_memtables.front()
+                && frozen.id() == sst.id()
+            {
+                error!("\t=> popping sst {}", sst.id());
+                self.frozen_memtables.pop_front();
             }
+
+            self.sst_handles.push(sst);
         }
 
-        acc
+        error!(still_frozen = ?self.frozen_memtables);
     }
 
-    pub fn active_memtable_size_bytes(&self) -> usize {
-        self.active_memtable.size_bytes()
+    pub fn active_memtable(&self) -> &MutMemtable {
+        &self.memtable
+    }
+
+    pub fn frozen_memtables(&self) -> &VecDeque<FrozenMemtable> {
+        &self.frozen_memtables
     }
 
     pub fn all_memtable_size_bytes(&self) -> usize {
-        let mut sum = self.active_memtable.size_bytes();
-        for f in &self.frozen_memtables {
-            sum += f.size_bytes()
-        }
-        sum
+        self.frozen_memtables
+            .iter()
+            .fold(self.memtable.size_bytes(), |acc, f| acc + f.size_bytes())
     }
 
-    pub fn pop_frozen(&mut self) -> Option<Arc<FrozenMemtable>> {
-        self.frozen_memtables.pop_front()
+
+    fn issue_flush(&mut self) -> crate::Result<()> {
+        let frozen = self.memtable.freeze(self.next_memtable_id.inc_and_get());
+        self.frozen_memtables.push_back(frozen.clone());
+
+        let flush_payload = io::FlushMemtablePayload {
+            memtable: frozen.clone().into(),
+            manifest_entries: std::mem::take(&mut self.stream_buffer),
+            block_size_limit: self.config.block_size_limit,
+            dir: self.config.basepath.clone(),
+            record_codec: self.config.record_codec.clone(),
+        };
+
+        self.io_tx
+            .send(io::IoEvent::FlushMemtable(flush_payload))
+            .map_err(|e| crate::Error::from(format!("{e}")))?;
+
+        Ok(())
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum MemtableFlushError {
-    #[error("failed to flush memtable to disk: {0}")]
-    SstWriterCreateError(#[from] sst::SstWriterCreateError),
-
-    #[error("failed to flush memtable to disk: {0}")]
-    SstWriteError(#[from] sst::SstWriteError),
-
-    #[error("failed to flush memtable to disk: {0}")]
-    SstFinalizeError(#[from] sst::SstFinalizeError),
-
-    #[error("failed to flush memtable to disk: failed to append entry to manifest: {0}")]
-    ManifestError(#[from] codec::CodecError),
-}
-
-#[allow(unused)]
-pub fn flush<R, M, L>(
-    memtable: Arc<FrozenMemtable>,
-    manifest: &mut Manifest<M, L>,
-    sst_id: u64,
-    block_limit: Option<usize>,
-    dir: &Path,
-    codec: R,
-) -> Result<SstHandle<R>, MemtableFlushError>
+#[cfg(test)]
+impl<R, L> LsmTree<R, L>
 where
     R: RecordCodecExt,
-    L: SpecCodec<LabelMap>,
-    M: ManifestCodecExt<L>,
+    L: SpecCodec<LabelMap> + 'static,
 {
-    let mut sw = SstFileWriter::new(sst_id, codec, block_limit, Some(dir))?;
-    for rec in memtable.full_range() {
-        sw.write(rec)?;
+    pub fn new_test(
+        basepath: PathBuf,
+        memtable_limit: usize,
+        record_codec: R,
+        label_codec: L,
+        block_size_limit: Option<usize>,
+        retention_days: Option<u32>,
+        io_tx: mpsc::Sender<io::IoEvent<R>>,
+    ) -> std::io::Result<Self> {
+        let next_memtable_id = crate::counter::Counter::default();
+        let memtable =
+            MutMemtable::new(next_memtable_id.current(), memtable_limit);
+        let stream_buffer = Vec::new();
+        let frozen_memtables = VecDeque::new();
+        let sst_handles = Vec::new();
+        let config = LsmConfig {
+            basepath,
+            record_codec,
+            block_size_limit,
+            label_codec,
+            _retention_days: retention_days,
+        };
+        let stream_reg = Rc::new(RefCell::new(StreamRegistry::default()));
+
+        Ok(Self {
+            memtable,
+            frozen_memtables,
+            sst_handles,
+            stream_reg,
+            next_memtable_id,
+            next_stream_id: 0.into(),
+            next_seq_num: 0.into(),
+            config,
+            io_tx,
+            stream_buffer,
+        })
     }
-    manifest.append(&ManifestEntry::SstFlush(sst_id))?;
-    Ok(sw.finalize_file()?)
 }
 
-// pub fn compact<C: RecordCodecExt>(
-//     sstables: &[Rc<SstHandle<C>>]
-// ) {
-//     for sst in sstables {
-//         let created_at = sst.file_handle().as_file().metadata().unwrap().created().unwrap();
-//     }
-// }
 
 #[cfg(test)]
 mod test {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::mpsc};
 
     use pretty_assertions::assert_eq;
 
     use crate::{
         codec::{SpecCodec, WireLen},
         label::{LabelMap, LabelMapCodec},
-        lsm::LsmState,
-        manifest::ManifestCodec,
+        lsm::LsmTree,
         record::{KEY_SIZE, RecordCodec},
     };
 
     fn tracing() {
-        let try_init = tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             // .with_target(true)
             // .with_span_events(FmtSpan::NEW)
             .with_test_writer()
             .try_init();
-        let _ = try_init;
     }
 
     fn data(codec: LabelMapCodec) -> (Box<[u8]>, Box<[u8]>, LabelMap) {
@@ -396,11 +417,7 @@ mod test {
         map.insert("foo".into(), "bar".into());
         map.insert("bar".into(), "baz".into());
         map.insert("baz".into(), "foo".into());
-        let lm = LabelMap {
-            inner: map,
-            fingerprint: 0,
-        };
-
+        let lm = LabelMap::new(map);
         let mut payload_with_labelmap = vec![0; lm.wire_len()];
         let n = codec.encode(&lm, &mut payload_with_labelmap).expect("data");
         assert_eq!(
@@ -424,26 +441,31 @@ mod test {
         tracing();
         let tmpdir = tempfile::TempDir::new().expect("tempdir");
         let label_codec = LabelMapCodec;
-        let (payload_with_labelmap, payload_no_labelmap, _labelmap) = data(label_codec);
+        let (payload_with_labelmap, payload_no_labelmap, _labelmap) =
+            data(label_codec);
 
         let max_count = 4;
-        let record_size_of = KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
+        let record_size_of =
+            KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
         // let record_wire_len = KEY_SIZE + SZ_U32 + payload_no_labelmap.len();
         let memtable_limit = max_count * record_size_of;
         let record_codec = RecordCodec;
-        let manifest_codec = ManifestCodec::new(label_codec);
-        let mut lsm = LsmState::new_uninit(
+
+        let (io_tx, _io_rx) = mpsc::channel();
+        let mut lsm = LsmTree::new_test(
             tmpdir.path().to_path_buf(),
             memtable_limit,
             record_codec,
             label_codec,
-            manifest_codec,
             None,
+            None,
+            io_tx,
         )
         .expect("lsmstate::new");
 
         let mut computed_sz = 0;
-        for i in 0..max_count {
+        let record_count = max_count;
+        for i in 0..record_count {
             lsm.append_single(&payload_with_labelmap, i as u64)
                 .expect("lsm::append");
             computed_sz += record_size_of;
@@ -456,13 +478,13 @@ mod test {
             records_per_memtable,
             max_count,
             computed_sz,
-            lsm.active_memtable_size_bytes(),
+            lsm.active_memtable().size_bytes(),
             lsm.all_memtable_size_bytes(),
             // &lsm.active_memtable,
             // &lsm.frozen_memtables,
         );
-        assert_eq!(lsm.active_memtable_size_bytes(), 0);
-        assert_eq!(lsm.frozen_memtables[0].size_bytes(), computed_sz);
+        assert_eq!(lsm.active_memtable().size_bytes(), 0);
+        assert_eq!(lsm.all_memtable_size_bytes(), computed_sz);
 
         // dbg!(&lsm);
 
@@ -473,6 +495,38 @@ mod test {
         }
         // dbg!(&lsm);
         assert_eq!(lsm.all_memtable_size_bytes(), computed_sz);
+
+        // println!("=> Checking frozen state <=");
+        // let mut j = 0;
+        // while let Some((m, w)) = lsm.pop_frozen() {
+        //     let mut frozen_memtable_cnt = 0;
+        //     dbg!(&m);
+        //     for rec in m.full_range() {
+        //         println!("CHECK_FROZEN: {j}-{frozen_memtable_cnt}\tmemtable\t{rec}");
+        //         frozen_memtable_cnt += 1;
+        //     }
+
+        //     w.flush().expect("CHECK_FROZEN: flush frozen_wal (since theyre not flushed when theyre flushed to save IO)");
+        //     let wr = w.as_reader().expect("CHECK_FROZEN: frozen_wal.as_reader()");
+        //     dbg!(&wr);
+
+        //     let mut frozen_wal_cnt = 0;
+        //     for e in wr {
+        //         let rec = e.expect("CHECK_FROZEN: frozen_wal::framed_reader::next().unwrap()");
+        //         println!("CHECK_FROZEN: {j}-{frozen_wal_cnt}\twal\t{rec}");
+        //         frozen_wal_cnt += 1;
+        //     }
+        //     assert_eq!(
+        //         frozen_memtable_cnt, frozen_wal_cnt,
+        //         "CHECK_FROZEN: expected frozen_memtable and frozen_wal to have the same amount of records"
+        //     );
+
+        //     j += 1;
+        // }
+
+        // this is not actually valid,
+        // i just wanna see the results (:
+        // println!("visited frozen records: {j} out of all {record_count} records");
     }
 
     /// LsmState only freezes the memtables, flushing will
@@ -483,20 +537,23 @@ mod test {
         tracing();
         let tmpdir = tempfile::TempDir::new().expect("tempdir");
         let label_codec = LabelMapCodec;
-        let (payload_with_labelmap, payload_no_labelmap, labelmap) = data(label_codec);
+        let (payload_with_labelmap, payload_no_labelmap, labelmap) =
+            data(label_codec);
 
         let max_count = 4;
-        let record_size_of = KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
+        let record_size_of =
+            KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
         let memtable_limit = max_count * record_size_of;
         let record_codec = RecordCodec;
-        let manifest_codec = ManifestCodec::new(label_codec);
-        let mut lsm = LsmState::new_uninit(
+        let (io_tx, _io_rx) = mpsc::channel();
+        let mut lsm = LsmTree::new_test(
             tmpdir.path().to_path_buf(),
             memtable_limit,
             record_codec,
             label_codec,
-            manifest_codec,
             None,
+            None,
+            io_tx,
         )
         .expect("lsmstate::new");
 
@@ -522,7 +579,7 @@ mod test {
         }
         assert_eq!(
             n, rec_count,
-            "expected iterator to have all records inserted to lsm"
+            "expected merge iterator (only memtables) to have all records inserted to lsm"
         )
     }
 }

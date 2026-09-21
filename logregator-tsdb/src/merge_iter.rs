@@ -1,51 +1,70 @@
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::{BinaryHeap, VecDeque, btree_set::Range},
+    collections::{btree_set::Range, BinaryHeap, VecDeque},
     ops::Bound,
-    rc::Rc,
-    sync::Arc,
 };
 
 use crate::{
     codec::RecordCodecExt,
-    memtable::{FrozenMemtable, Memtable},
+    memtable::{FrozenMemtable, MutMemtable},
     record::{Key, Record},
-    sst::{SstCursor, SstHandle, SstReadError},
+    sst::{SstCursor, SstError, SstHandle},
 };
 
-pub struct MergeIter<'a, C> {
-    memtables: Vec<Range<'a, Record>>,
-    ssts: Vec<SstCursor<C>>,
-    minheap: BinaryHeap<Reverse<HeapItem<'a>>>,
+/// ['m]: lifetime of the memtables
+/// ['s']: lifetime of the sstables
+/// ['b']: lifetime the bound key
+#[derive(Debug)]
+pub struct MergeIter<'m, 's, C> {
+    memtables: Vec<Range<'m, Record>>,
+    cursors: Vec<SstCursor<'s, C>>,
+    minheap: BinaryHeap<Reverse<HeapItem<'s>>>,
 }
 
-impl<'a, C> MergeIter<'a, C>
+impl<'m, 's, C> MergeIter<'m, 's, C>
 where
     C: RecordCodecExt,
+    'm: 's,
 {
     pub fn new(
-        active: &'a Memtable,
-        frozen: &'a VecDeque<Arc<FrozenMemtable>>,
-        handles: &'a [Rc<SstHandle<C>>],
-        start: Bound<&Key>,
-        end: Bound<&Key>,
-    ) -> Result<Self, SstReadError> {
-        let minheap = BinaryHeap::new();
+        active: &'m MutMemtable,
+        frozen: &'m VecDeque<FrozenMemtable>,
+        handles: &'s [SstHandle<C>],
+        start_bound: Bound<Key>,
+        end_bound: Bound<Key>,
+    ) -> Result<Self, SstError> {
+        let frozen_len = frozen.len();
+        let frozen_memtables = frozen
+            .iter()
+            .map(|m| m.range(start_bound.as_ref(), end_bound.as_ref()));
 
-        let mut memtables = Vec::with_capacity(1 + frozen.len());
-        memtables.push(active.range(start, end));
-        memtables.extend(frozen.iter().map(|m| m.range(start, end)));
+        let start_cloned = start_bound.as_ref().cloned();
+        let end_cloned = end_bound.as_ref().cloned();
+        let mut cursors = Vec::with_capacity(handles.len());
 
-        let mut ssts = Vec::with_capacity(handles.len());
         for h in handles {
-            ssts.push(h.cursor()?);
+            if let Bound::Included(k) | Bound::Excluded(k) = start_bound.as_ref()
+                && !h.may_contain_stream_id(k.stream_id) {
+                continue
+            }
+
+            // ugh "hidden" cloning of keys again...
+            match h.cursor(Some((start_bound.clone(), end_bound.clone()))) {
+                Ok(Some(c)) => cursors.push(c),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            };
         }
+
+        let mut memtables = Vec::with_capacity(1 + frozen_len);
+        memtables.push(active.range(start_cloned, end_cloned));
+        memtables.extend(frozen_memtables);
 
         let mut this = Self {
             memtables,
-            ssts,
-            minheap,
+            cursors,
+            minheap: BinaryHeap::new(),
         };
         this.fill_from_all();
         Ok(this)
@@ -55,7 +74,7 @@ where
         for i in 0..self.memtables.len() {
             self.fill_from_single(Source::Memtable(i));
         }
-        for i in 0..self.ssts.len() {
+        for i in 0..self.cursors.len() {
             self.fill_from_single(Source::Sst(i));
         }
     }
@@ -73,8 +92,8 @@ where
                 }
             }
             Source::Sst(idx) => {
-                self.ssts[idx].next();
-                if let Some(rec) = self.ssts[idx].take_current() {
+                self.cursors[idx].next();
+                if let Some(rec) = self.cursors[idx].take_current() {
                     let item = Reverse(HeapItem {
                         inner: Cow::Owned(rec),
                         source,
@@ -89,11 +108,12 @@ where
 // TODO: which one?
 // 1) make Item into Result<&'a Record, SstReadError>
 // 2) swallow errors from ssts silently, maybe logging it
-impl<'a, C> Iterator for MergeIter<'a, C>
+impl<'m, 's, C> Iterator for MergeIter<'m, 's, C>
 where
     C: RecordCodecExt,
+    'm: 's,
 {
-    type Item = Cow<'a, Record>;
+    type Item = Cow<'s, Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.minheap.pop() {
@@ -112,6 +132,7 @@ enum Source {
     Sst(usize),
 }
 
+#[derive(Debug)]
 struct HeapItem<'a> {
     /// actual record
     inner: Cow<'a, Record>,

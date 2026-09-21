@@ -4,11 +4,14 @@ use std::{
     io::{self, Seek},
     marker::PhantomData,
     path::{Path, PathBuf},
-    sync::Arc,
+    rc::Rc,
 };
 
 use crate::{
-    codec::{CodecError, FramedReader, FramedWriter, SZ_U32, SZ_U64, SpecCodec, WireLen},
+    codec::{
+        CodecError, FramedReader, FramedWriter, SZ_U32, SZ_U64, SpecCodec,
+        WireLen,
+    },
     label::{self, LabelMap},
 };
 use serde::{Deserialize, Serialize};
@@ -36,7 +39,81 @@ where
     C: ManifestCodecExt<L>,
     L: SpecCodec<LabelMap>,
 {
-    pub fn open(basepath: &Path, codec: C, max_file_size: Option<usize>) -> io::Result<Self> {
+    /// Tries to open and immedietly snapshot + truncate the manifest file at [basepath] + "/" + [MANIFEST_FILE_NAME].
+    #[instrument(ret, err)]
+    pub fn open_snapshotted(
+        basepath: &Path,
+        codec: C,
+        max_file_size: Option<usize>,
+    ) -> crate::Result<Self> {
+        let mut manifest = Self::open(basepath, codec, max_file_size)?;
+        manifest.snapshot_truncate()?;
+        Ok(manifest)
+
+        // TODO: is this even necessary?
+        //
+        // let manifest_name = OsString::from(MANIFEST_FILE_NAME);
+        // let snapshot_name = OsString::from(MANIFEST_SNAPSHOT_FILE_NAME);
+
+        // let mut manifest_path = None;
+        // let mut snapshot_path = None;
+
+        // for e in std::fs::read_dir(basepath)? {
+        //     let e = e?;
+        //     let meta = e.metadata()?;
+        //     let path = e.path();
+        //     if meta.is_dir() {
+        //         trace!("{} is not a file, skipping", path.display());
+        //         continue;
+        //     }
+
+        //     if let Some(fname) = path.components().next_back().map(|c| c.as_os_str()) {
+        //         if fname == manifest_name.as_os_str() {
+        //             if manifest_path.is_some() {
+        //                 return Err(format!(
+        //                     "mulitple {} found in {}",
+        //                     MANIFEST_FILE_NAME,
+        //                     basepath.display()
+        //                 )
+        //                 .into());
+        //             }
+        //             manifest_path = Some(path);
+        //         } else if fname == snapshot_name {
+        //             if snapshot_path.is_some() {
+        //                 return Err(format!(
+        //                     "mulitple {} found in {}",
+        //                     MANIFEST_SNAPSHOT_FILE_NAME,
+        //                     basepath.display()
+        //                 )
+        //                 .into());
+        //             }
+        //             snapshot_path = Some(path);
+        //         }
+        //     }
+        // }
+
+        // let Some(manifest_path) = manifest_path else {
+        //     return Err(
+        //         format!("no {} found in {}", MANIFEST_FILE_NAME, basepath.display()).into(),
+        //     );
+        // };
+
+        // let Some(snapshot_path) = snapshot_path else {
+        //     return Err(format!(
+        //         "no {} found in {}",
+        //         MANIFEST_SNAPSHOT_FILE_NAME,
+        //         basepath.display()
+        //     )
+        //     .into());
+        // };
+    }
+
+    /// Tries to open the manifest file at [basepath] + "/" + [MANIFEST_FILE_NAME].
+    pub fn open(
+        basepath: &Path,
+        codec: C,
+        max_file_size: Option<usize>,
+    ) -> io::Result<Self> {
         let basepath = basepath.to_path_buf();
         let f = File::options()
             .read(true)
@@ -51,22 +128,44 @@ where
             framed,
             f,
             codec,
-            max_file_size: max_file_size.unwrap_or(MAINFEST_DEFAULT_MAX_FILE_SIZE),
+            max_file_size: max_file_size
+                .unwrap_or(MAINFEST_DEFAULT_MAX_FILE_SIZE),
             _phantom: PhantomData,
         })
     }
 
-    /// returns true if the manifest file filled up and a new snapshot is needed
+    /// Appends an entry to manifest, snapshotting if the the new size
+    /// exceeds the file size limit.
+    #[instrument(skip(self), ret, err)]
     pub fn append(&mut self, e: &ManifestEntry) -> Result<bool, CodecError> {
         self.framed.write(e)?;
-        Ok(self.framed.size_hint() > self.max_file_size)
+        if self.framed.size_hint() > self.max_file_size {
+            self.snapshot_truncate()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    /// creates a snapshot out of the current state of the
+    /// Calls [append] on each entry yielded by the iterator [E].
+    #[instrument(skip(self, entries), ret, err)]
+    pub fn append_many<'e, E>(&mut self, entries: E) -> Result<bool, CodecError>
+    where
+        E: Iterator<Item = &'e ManifestEntry>,
+    {
+        let mut flushed = false;
+        for e in entries {
+            flushed = self.append(e)?;
+        }
+        Ok(flushed)
+    }
+
+    /// Creates a snapshot out of the current state of the
     /// manifest file, merges it with the pre-existing snapshot
     /// file if it exists, then serializes it back to the file as
-    /// json
-    pub fn snapshot(&mut self) -> Result<(), CodecError> {
+    /// json. After snapshotting the manifest file is truncated and fsynced.
+    #[instrument(skip(self), err)]
+    fn snapshot_truncate(&mut self) -> Result<(), CodecError> {
         self.framed.flush()?;
         Snapshot::from_manifest(self)?.write_to(&self.basepath)?;
         self.f.set_len(0)?;
@@ -74,12 +173,17 @@ where
         Ok(())
     }
 
-    fn as_reader(&self) -> io::Result<FramedReader<File, C, ManifestEntry>> {
+    /// Creates a Reader pointed at the manifest by cloning and seekign to the start of the manifest file.
+    pub fn as_reader(
+        &self,
+    ) -> io::Result<FramedReader<File, C, ManifestEntry>> {
         let mut f = self.f.try_clone()?;
         f.seek(io::SeekFrom::Start(0))?;
         Ok(FramedReader::new(f, self.codec.clone()))
     }
 
+    /// syncs the manifest in tests, by first flushing it to disk,
+    /// then calling fsync.
     #[cfg(test)]
     fn sync(&mut self) -> io::Result<()> {
         self.framed.flush()?;
@@ -87,15 +191,14 @@ where
         Ok(())
     }
 
+    /// opens the manifest file in [basepath] and returns a reader pointed at it.
     #[cfg(test)]
     fn new_reader(
-        p: impl AsRef<Path>,
+        basepath: impl AsRef<Path>,
         codec: C,
     ) -> io::Result<FramedReader<File, C, ManifestEntry>> {
-        let basepath = p.as_ref().to_path_buf();
-        let f = OpenOptions::new()
-            .read(true)
-            .open(basepath.join(MANIFEST_FILE_NAME))?;
+        let basepath = basepath.as_ref().join(MANIFEST_FILE_NAME);
+        let f = OpenOptions::new().read(true).open(basepath)?;
         Ok(FramedReader::new(f, codec))
     }
 }
@@ -106,14 +209,20 @@ pub enum SstState {
     Removed,
 }
 
+/// A snapshot of the state of a manifest at a certain time.
+/// It keeps a tally of SSTables and stream_id -> labelmap pairs.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Snapshot {
     pub(crate) sstable_state: HashMap<u64, SstState>,
-    pub(crate) labelmaps: HashMap<u64, Arc<LabelMap>>,
+    pub(crate) labelmaps: HashMap<u64, Rc<LabelMap>>,
 }
 
 impl Snapshot {
-    pub fn from_manifest<C, L>(manifest: &Manifest<C, L>) -> Result<Snapshot, CodecError>
+    /// builds up a Snapshot from the given manifest by reading all of its entries and normalizing them.
+    #[instrument(err)]
+    pub fn from_manifest<C, L>(
+        manifest: &Manifest<C, L>,
+    ) -> Result<Self, CodecError>
     where
         C: ManifestCodecExt<L>,
         L: SpecCodec<LabelMap>,
@@ -125,7 +234,7 @@ impl Snapshot {
         for e in r {
             let entry = e?;
             match entry {
-                ManifestEntry::SstFlush(id) => {
+                ManifestEntry::MemtableFlush(id) => {
                     ssts.insert(id, SstState::Live);
                 }
                 ManifestEntry::Compaction(ids) => {
@@ -148,6 +257,9 @@ impl Snapshot {
         })
     }
 
+    /// Consumes and writes the snapshot into the snapshot filepath [basepath] + [MANIFEST_SNAPSHOT_FILE_NAME].
+    ///  If a previous snapshot existed, it merges the old with the new one, leaving only one, up-to-date snapshot in [basepath].
+    #[instrument(err)]
     pub fn write_to(self, basepath: &Path) -> io::Result<()> {
         let snap_path = basepath.join(MANIFEST_SNAPSHOT_FILE_NAME);
 
@@ -190,7 +302,7 @@ impl Snapshot {
     }
 
     #[cfg(test)]
-    fn open_for_test(basepath: &Path) -> io::Result<Self> {
+    fn open_test(basepath: &Path) -> io::Result<Self> {
         let snap_path = basepath.join(MANIFEST_SNAPSHOT_FILE_NAME);
         let f = OpenOptions::new().read(true).open(&snap_path)?;
         let s = serde_json::from_reader(f)?;
@@ -207,14 +319,14 @@ const MANIFEST_ENTRY_TAG_SZ: usize = 1;
 /// encoding / decoding.  
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEntry {
-    SstFlush(u64),
+    MemtableFlush(u64),
     /// Currently the compaction mechanism (delete all ssts older than N days)  
     /// is not implemented, but in the future this should hold multiple sst ids
     /// that is a Vec<u64> instead of one u64
     Compaction(Vec<u64>),
     StreamUpdate {
         stream_id: u64,
-        labelmap: Arc<LabelMap>,
+        labelmap: Rc<LabelMap>,
     },
 }
 
@@ -223,7 +335,7 @@ impl WireLen for ManifestEntry {
     fn wire_len(&self) -> usize {
         let mut sz = 1; // tag
         match self {
-            Self::SstFlush(_) => {
+            Self::MemtableFlush(_) => {
                 sz += SZ_U64;
             }
             Self::Compaction(v) => {
@@ -243,16 +355,16 @@ impl WireLen for ManifestEntry {
 }
 
 impl ManifestEntry {
-    pub fn tag(&self) -> u8 {
+    fn tag(&self) -> u8 {
         match self {
-            Self::SstFlush(_) => 1,
+            Self::MemtableFlush(_) => 1,
             Self::Compaction(_) => 2,
             Self::StreamUpdate { .. } => 3,
         }
     }
 
     pub fn sst_flush(id: u64) -> Self {
-        Self::SstFlush(id)
+        Self::MemtableFlush(id)
     }
 
     pub fn compaction(ids: Vec<u64>) -> Option<Self> {
@@ -263,7 +375,10 @@ impl ManifestEntry {
         }
     }
 
-    pub fn stream_update(stream_id: u64, labelmap: Arc<LabelMap>) -> Option<Self> {
+    pub fn stream_update(
+        stream_id: u64,
+        labelmap: Rc<LabelMap>,
+    ) -> Option<Self> {
         if labelmap.len() > label::MAX_LABEL_COUNT {
             return None;
         }
@@ -285,7 +400,7 @@ impl ManifestEntry {
 
     pub fn variant_str(&self) -> &str {
         match self {
-            Self::SstFlush(_) => "ManifestEntry::SstFlush",
+            Self::MemtableFlush(_) => "ManifestEntry::SstFlush",
             Self::Compaction(_) => "ManifestEntry::Compaction",
             Self::StreamUpdate { .. } => "ManifestEntry::StreamUpdate",
         }
@@ -306,8 +421,12 @@ impl<L: SpecCodec<LabelMap>> ManifestCodec<L> {
 impl<L: SpecCodec<LabelMap>> ManifestCodecExt<L> for ManifestCodec<L> {}
 
 impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
-    #[instrument(ret, err)]
-    fn encode(&self, item: &ManifestEntry, dst: &mut [u8]) -> Result<usize, CodecError> {
+    //     #[instrument(ret, err)]
+    fn encode(
+        &self,
+        item: &ManifestEntry,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
         if dst.len() < item.wire_len() {
             trace!(
                 "not enough bytes to encode {item:?} into `dst` (got: {}, want: {}, entry variant {})",
@@ -316,17 +435,21 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
                 item.variant_str(),
             );
 
-            return Err(crate::codec::not_enough_bytes(dst.len(), item.wire_len()));
+            return Err(crate::codec::not_enough_bytes(
+                dst.len(),
+                item.wire_len(),
+            ));
         }
         dst[0] = item.tag();
 
-        trace!(manifest_entry_wire_len = item.wire_len());
+        // trace!(manifest_entry_wire_len = item.wire_len());
         match item {
-            ManifestEntry::SstFlush(id) => {
+            ManifestEntry::MemtableFlush(id) => {
                 dst[1..1 + SZ_U64].copy_from_slice(&id.to_be_bytes());
             }
             ManifestEntry::Compaction(ids) => {
-                dst[1..1 + SZ_U32].copy_from_slice(&(ids.len() as u32).to_be_bytes());
+                dst[1..1 + SZ_U32]
+                    .copy_from_slice(&(ids.len() as u32).to_be_bytes());
                 let mut n = 1 + SZ_U32;
                 for id in ids {
                     dst[n..n + SZ_U64].copy_from_slice(&id.to_be_bytes());
@@ -365,8 +488,11 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
         Ok(item.wire_len())
     }
 
-    #[instrument(skip(self, src), ret, err)]
-    fn decode(&self, src: &[u8]) -> Result<Option<(ManifestEntry, usize)>, CodecError> {
+    //     #[instrument(skip(self, src), ret, err)]
+    fn decode(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(ManifestEntry, usize)>, CodecError> {
         if src.len() < MANIFEST_ENTRY_TAG_SZ {
             trace!(
                 "not enough bytes to decode from (got: {}, want: {})",
@@ -382,34 +508,46 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
         let me = match tag {
             1 => {
                 if src.len() < MANIFEST_ENTRY_TAG_SZ + SZ_U64 {
-                    trace!("not enough bytes to decode ManifestEntry::SstFlush(id)'s id");
-                    return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
-                        got: src.len(),
-                        want: MANIFEST_ENTRY_TAG_SZ + SZ_U64,
-                    }));
+                    trace!(
+                        "not enough bytes to decode ManifestEntry::SstFlush(id)'s id"
+                    );
+                    return Err(CodecError::NotEnoughBytes(
+                        crate::codec::NotEnoughBytes {
+                            got: src.len(),
+                            want: MANIFEST_ENTRY_TAG_SZ + SZ_U64,
+                        },
+                    ));
                 }
                 let id = u64::from_be_bytes([
-                    src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8],
+                    src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+                    src[8],
                 ]);
-                ManifestEntry::SstFlush(id)
+                ManifestEntry::MemtableFlush(id)
             }
             2 => {
                 if src.len() < MANIFEST_ENTRY_TAG_SZ + SZ_U32 {
-                    trace!("not enough bytes to decode ManifestEntry::Compaction(ids)'s len");
-                    return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
-                        got: src.len(),
-                        want: MANIFEST_ENTRY_TAG_SZ + SZ_U32,
-                    }));
+                    trace!(
+                        "not enough bytes to decode ManifestEntry::Compaction(ids)'s len"
+                    );
+                    return Err(CodecError::NotEnoughBytes(
+                        crate::codec::NotEnoughBytes {
+                            got: src.len(),
+                            want: MANIFEST_ENTRY_TAG_SZ + SZ_U32,
+                        },
+                    ));
                 }
-                let len = u32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+                let len = u32::from_be_bytes([src[1], src[2], src[3], src[4]])
+                    as usize;
                 if src.len() < MANIFEST_ENTRY_TAG_SZ + SZ_U32 + len * SZ_U64 {
                     trace!(
                         "not enough bytes to decode ManifestEntry::Compaction(ids)'s ids (parsed length * SZ_U64 > src.len())"
                     );
-                    return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
-                        got: src.len(),
-                        want: MANIFEST_ENTRY_TAG_SZ + SZ_U32 + len * SZ_U64,
-                    }));
+                    return Err(CodecError::NotEnoughBytes(
+                        crate::codec::NotEnoughBytes {
+                            got: src.len(),
+                            want: MANIFEST_ENTRY_TAG_SZ + SZ_U32 + len * SZ_U64,
+                        },
+                    ));
                 }
 
                 let n = MANIFEST_ENTRY_TAG_SZ + SZ_U32;
@@ -434,14 +572,17 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
                     trace!(
                         "not enough bytes to decode ManifestEntry::StreamUpdate{{stream_id: _, labelmap: _ }}'s stream_id"
                     );
-                    return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
-                        got: src.len(),
-                        want: MANIFEST_ENTRY_TAG_SZ + SZ_U64,
-                    }));
+                    return Err(CodecError::NotEnoughBytes(
+                        crate::codec::NotEnoughBytes {
+                            got: src.len(),
+                            want: MANIFEST_ENTRY_TAG_SZ + SZ_U64,
+                        },
+                    ));
                 }
 
                 let stream_id = u64::from_be_bytes([
-                    src[1], src[2], src[3], src[4], src[5], src[6], src[7], src[8],
+                    src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+                    src[8],
                 ]);
 
                 if let Some((labelmap, _)) = self
@@ -451,7 +592,7 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
                     // decode() already parses only valid labelmaps
                     ManifestEntry::StreamUpdate {
                         stream_id,
-                        labelmap: Arc::new(labelmap),
+                        labelmap: Rc::new(labelmap),
                     }
                 } else {
                     return Ok(None);
@@ -502,14 +643,14 @@ mod test {
 
         for i in 0..100u64 {
             let op = match i % 3 {
-                0 => ManifestEntry::SstFlush(i),
+                0 => ManifestEntry::MemtableFlush(i),
                 1 => ManifestEntry::Compaction(vec![i]),
                 2 => {
                     let mut map = BTreeMap::new();
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::StreamUpdate {
                         stream_id: 67,
                         labelmap,
@@ -535,14 +676,14 @@ mod test {
         let record_num = 100u64;
         let written: Vec<ManifestEntry> = (0..record_num)
             .map(|i| match i % 3 {
-                0 => ManifestEntry::SstFlush(i),
+                0 => ManifestEntry::MemtableFlush(i),
                 1 => ManifestEntry::Compaction(vec![i]),
                 2 => {
                     let mut map = BTreeMap::new();
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::StreamUpdate {
                         stream_id: 67,
                         labelmap,
@@ -558,15 +699,16 @@ mod test {
         m.sync().unwrap();
         // dbg!(&written);
 
-        let recovered: Vec<ManifestEntry> = Manifest::new_reader(d.path(), codec)
-            .unwrap()
-            .map(|res| {
-                let op = res.expect("recover: failed to decode op");
-                // dbg!(&op);
-                // assert_eq!(i as u32, op.as_u32());
-                op
-            })
-            .collect();
+        let recovered: Vec<ManifestEntry> =
+            Manifest::new_reader(d.path(), codec)
+                .unwrap()
+                .map(|res| {
+                    let op = res.expect("recover: failed to decode op");
+                    // dbg!(&op);
+                    // assert_eq!(i as u32, op.as_u32());
+                    op
+                })
+                .collect();
 
         // dbg!(&recovered);
 
@@ -604,7 +746,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(67, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -630,7 +772,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(67, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -642,12 +784,14 @@ mod test {
         }
         m.sync().expect("sync failed");
 
-        let recovered: Vec<ManifestEntry> = Manifest::new_reader(d.path(), codec)
-            .expect("recovery failed")
-            .map(|r| r.expect("decode failed"))
-            .collect();
+        let recovered: Vec<ManifestEntry> =
+            Manifest::new_reader(d.path(), codec)
+                .expect("recovery failed")
+                .map(|r| r.expect("decode failed"))
+                .collect();
 
-        let expected: Vec<ManifestEntry> = first_batch.into_iter().chain(second_batch).collect();
+        let expected: Vec<ManifestEntry> =
+            first_batch.into_iter().chain(second_batch).collect();
         assert_eq!(
             expected, recovered,
             "appending after a recovery pass must not corrupt or overwrite prior ops"
@@ -673,20 +817,21 @@ mod test {
                     map.insert("foo".into(), format!("{i}").into());
                     map.insert("bar".into(), format!("{i}").into());
                     map.insert("baz".into(), format!("{i}").into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),
             })
             .collect();
-        let mut needs_snapshot = false;
+        let mut had_snapshot = false;
         for rec in &first_batch {
-            needs_snapshot = m.append(rec).expect("append failed");
+            had_snapshot = m.append(rec).expect("append failed");
         }
         m.sync().expect("flush failed");
-        assert!(needs_snapshot, "manifest shouldve filled up");
-        m.snapshot().expect("manifest::snapshot");
-        let s1 = Snapshot::open_for_test(d.path()).expect("Snapshot::open_for_test");
+        assert!(had_snapshot, "manifest shouldve filled up");
+        m.snapshot_truncate().expect("manifest::snapshot");
+        let s1 =
+            Snapshot::open_test(d.path()).expect("Snapshot::open_for_test");
         // dbg!(&s1);
         assert_eq!(
             m.f.metadata().expect("fs::metadata").len(),
@@ -703,7 +848,7 @@ mod test {
                     map.insert("foo".into(), format!("{}", i + 1).into());
                     map.insert("bar".into(), format!("{}", i + 1).into());
                     map.insert("baz".into(), format!("{}", i + 1).into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -711,12 +856,13 @@ mod test {
             .collect();
 
         for rec in &second_batch {
-            needs_snapshot = m.append(rec).expect("append failed");
+            had_snapshot = m.append(rec).expect("append failed");
         }
         m.sync().expect("flush failed");
-        assert!(needs_snapshot, "manifest shouldve filled up");
-        m.snapshot().expect("manifest::snapshot");
-        let s2 = Snapshot::open_for_test(d.path()).expect("Snapshot::open_for_test");
+        assert!(had_snapshot, "manifest shouldve filled up");
+        m.snapshot_truncate().expect("manifest::snapshot");
+        let s2 =
+            Snapshot::open_test(d.path()).expect("Snapshot::open_for_test");
         // dbg!(&s2);
 
         pretty_assertions::assert_ne!(s1, s2);
@@ -739,7 +885,7 @@ mod test {
                     map.insert("foo".into(), format!("{}", i + 1).into());
                     map.insert("bar".into(), format!("{}", i + 1).into());
                     map.insert("baz".into(), format!("{}", i + 1).into());
-                    let labelmap = Arc::new(LabelMap::new(map));
+                    let labelmap = Rc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -747,12 +893,13 @@ mod test {
             .collect();
 
         for rec in &final_batch {
-            needs_snapshot = m.append(rec).expect("append failed");
+            had_snapshot = m.append(rec).expect("append failed");
         }
         m.sync().expect("flush failed");
-        assert!(needs_snapshot, "manifest shouldve filled up");
-        m.snapshot().expect("manifest::snapshot");
-        let s2 = Snapshot::open_for_test(d.path()).expect("Snapshot::open_for_test");
+        assert!(had_snapshot, "manifest shouldve filled up");
+        m.snapshot_truncate().expect("manifest::snapshot");
+        let s2 =
+            Snapshot::open_test(d.path()).expect("Snapshot::open_for_test");
         // dbg!(&s2);
         pretty_assertions::assert_ne!(s1, s2);
     }

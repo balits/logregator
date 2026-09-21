@@ -4,17 +4,38 @@ use std::{
     fmt::Debug,
     io,
     mem::size_of,
+    sync::Arc,
 };
 
 use tracing::trace;
 
 use crate::{codec::*, label};
 
+pub const KEY_SIZE: usize = std::mem::size_of::<Key>();
+pub const PAYLOAD_LEN_SIZE: usize = 4; // vec.len() as u32
+
+/// Min. payload size is 2, since the first byte '0' could signal
+/// the payload got no labels, other than that a payload cannot be empty
+pub const MIN_PAYLOAD_LENGTH: usize = label::LABEL_COUNT_WIRE_LEN + 1;
+pub const MAX_PAYLOAD_LENGTH: usize = 4096;
+
+/// [KEY_SIZE]+ u32 as the payloads length prefix + [MIN_PAYLOAD_LENGTH]
+pub const MIN_RECORD_WIRE_LENGTH: usize =
+    KEY_SIZE + size_of::<u32>() + MIN_PAYLOAD_LENGTH;
+/// [KEY_SIZE]+ u32 as the payloads length prefix + [MAX_PAYLOAD_LENGTH]
+pub const MAX_RECORD_WIRE_LENGTH: usize =
+    KEY_SIZE + size_of::<u32>() + MAX_PAYLOAD_LENGTH;
+pub const AVG_RECORD_WIRE_LENGHT: usize =
+    (MAX_RECORD_WIRE_LENGTH + MIN_PAYLOAD_LENGTH) / 2;
+
+pub const AVG_RECORD_SIZE: usize =
+    KEY_SIZE + (MAX_PAYLOAD_LENGTH + MIN_PAYLOAD_LENGTH) / 2;
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct Record {
     pub key: Key,
-    pub payload: Box<[u8]>,
+    pub payload: Arc<[u8]>,
 }
 
 impl Debug for Record {
@@ -36,19 +57,6 @@ impl std::fmt::Display for Record {
     }
 }
 
-pub const KEY_SIZE: usize = std::mem::size_of::<Key>();
-pub const PAYLOAD_LEN_SIZE: usize = 4; // vec.len() as u32
-
-/// Min. payload size is 2, since the first byte '0' could signal
-/// the payload got no labels, other than that a payload cannot be empty
-pub const MIN_PAYLOAD_LENGTH: usize = label::LABEL_COUNT_SIZE + 1;
-pub const MAX_PAYLOAD_LENGTH: usize = 4096;
-
-/// [KEY_SIZE]+ u32 as the payloads length prefix + [MIN_PAYLOAD_LENGTH]
-pub const MIN_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MIN_PAYLOAD_LENGTH;
-/// [KEY_SIZE]+ u32 as the payloads length prefix + [MAX_PAYLOAD_LENGTH]
-pub const MAX_RECORD_WIRE_LENGTH: usize = KEY_SIZE + size_of::<u32>() + MAX_PAYLOAD_LENGTH;
-
 impl WireLen for Record {
     #[inline]
     fn wire_len(&self) -> usize {
@@ -60,7 +68,7 @@ impl Record {
     /// Returns the memory used by this record in bytes.
     /// This should equal 4 * 8 bytes (key) +  8 + 8 bytes (boxed_slice_ptrs) payload_len bytes.
     #[inline]
-    pub const fn size_of(&self) -> usize {
+    pub fn size_of(&self) -> usize {
         size_of::<Self>() + self.payload.len()
     }
 
@@ -114,8 +122,19 @@ impl WireLen for Key {
     }
 }
 
+impl AsRef<Key> for Key {
+    fn as_ref(&self) -> &Key {
+        self
+    }
+}
+
 impl Key {
-    pub fn new(source_id: u64, timestamp: u64, sequence_num: u64, stream_id: u64) -> Self {
+    pub fn new(
+        source_id: u64,
+        timestamp: u64,
+        sequence_num: u64,
+        stream_id: u64,
+    ) -> Self {
         Self {
             source_id,
             timestamp,
@@ -132,23 +151,28 @@ impl Key {
 
     pub fn from_be_bytes(src: &[u8]) -> Result<Self, CodecError> {
         if src.len() < KEY_SIZE {
-            return Err(CodecError::NotEnoughBytes(crate::codec::NotEnoughBytes {
-                got: src.len(),
-                want: KEY_SIZE,
-            }));
+            return Err(CodecError::NotEnoughBytes(
+                crate::codec::NotEnoughBytes {
+                    got: src.len(),
+                    want: KEY_SIZE,
+                },
+            ));
         }
 
         let source_id = u64::from_be_bytes([
             src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
         ]);
         let timestamp = u64::from_be_bytes([
-            src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+            src[8], src[9], src[10], src[11], src[12], src[13], src[14],
+            src[15],
         ]);
         let sequence_num = u64::from_be_bytes([
-            src[16], src[17], src[18], src[19], src[20], src[21], src[22], src[23],
+            src[16], src[17], src[18], src[19], src[20], src[21], src[22],
+            src[23],
         ]);
         let stream_id = u64::from_be_bytes([
-            src[24], src[25], src[26], src[27], src[28], src[29], src[30], src[31],
+            src[24], src[25], src[26], src[27], src[28], src[29], src[30],
+            src[31],
         ]);
 
         Ok(Key {
@@ -202,7 +226,11 @@ impl SpecCodec<Key> for RecordCodec {
 }
 
 impl SpecCodec<Record> for RecordCodec {
-    fn encode(&self, rec: &Record, dst: &mut [u8]) -> Result<usize, CodecError> {
+    fn encode(
+        &self,
+        rec: &Record,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
         if dst.len() < rec.wire_len() {
             trace!(
                 "not enough bytes to encode into `dst` (got: {}, want: {})",
@@ -212,21 +240,36 @@ impl SpecCodec<Record> for RecordCodec {
             return Err(not_enough_bytes(dst.len(), rec.wire_len()));
         }
 
-        let _ = <Self as SpecCodec<Key>>::encode(self, &rec.key, &mut dst[0..KEY_SIZE])?;
+        let _ = <Self as SpecCodec<Key>>::encode(
+            self,
+            &rec.key,
+            &mut dst[0..KEY_SIZE],
+        )?;
 
-        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&rec.payload.len()) {
-            return Err(invalid_payload_sz(rec.payload.len()));
+        if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH)
+            .contains(&rec.payload.len())
+        {
+            return Err(invalid_payload_sz(
+                rec.payload.len(),
+                MAX_RECORD_WIRE_LENGTH,
+                MIN_RECORD_WIRE_LENGTH,
+            ));
         }
 
         let payload_len = (rec.payload.len() as u32).to_be_bytes();
-        dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE].copy_from_slice(&payload_len);
-        dst[KEY_SIZE + PAYLOAD_LEN_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
+        dst[KEY_SIZE..KEY_SIZE + PAYLOAD_LEN_SIZE]
+            .copy_from_slice(&payload_len);
+        dst[KEY_SIZE + PAYLOAD_LEN_SIZE
+            ..KEY_SIZE + PAYLOAD_LEN_SIZE + rec.payload.len()]
             .copy_from_slice(&rec.payload);
 
         Ok(rec.wire_len())
     }
 
-    fn decode(&self, src: &[u8]) -> Result<Option<(Record, usize)>, CodecError> {
+    fn decode(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(Record, usize)>, CodecError> {
         if src.len() < KEY_SIZE + PAYLOAD_LEN_SIZE {
             trace!(
                 "not enough bytes to decode from (src.len = {}, KEY_SIZE + PAYLOAD_LEN_SIZE = {})",
@@ -255,9 +298,8 @@ impl SpecCodec<Record> for RecordCodec {
             return Ok(None);
         }
 
-        let payload = src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]
-            .to_vec()
-            .into_boxed_slice();
+        let payload =
+            Arc::clone_from_ref(&src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]);
 
         Ok(Some((Record { key, payload }, total)))
     }
@@ -265,7 +307,11 @@ impl SpecCodec<Record> for RecordCodec {
 
 pub fn check_payload_size(payload_len: usize) -> Result<(), CodecError> {
     if !(MIN_PAYLOAD_LENGTH..=MAX_PAYLOAD_LENGTH).contains(&payload_len) {
-        return Err(invalid_payload_sz(payload_len));
+        return Err(invalid_payload_sz(
+            payload_len,
+            MAX_RECORD_WIRE_LENGTH,
+            MIN_RECORD_WIRE_LENGTH,
+        ));
     }
     Ok(())
 }
@@ -282,7 +328,8 @@ mod test {
         let mut bytes = [0u8; 32];
         key.to_be_bytes(&mut bytes);
         assert_eq!(std::mem::size_of_val(&key), bytes.len());
-        let key2 = Key::from_be_bytes(&bytes).expect("failed to parse bytes into Key");
+        let key2 =
+            Key::from_be_bytes(&bytes).expect("failed to parse bytes into Key");
         assert_eq!(key, key2);
     }
 }

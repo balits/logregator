@@ -1,68 +1,166 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
+use std::rc::Rc;
 
+use hashbrown::{Equivalent, HashMap, HashSet};
 use nom::IResult;
 use nom::{bytes::complete::take, number::complete::be_u8};
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{self, CodecError, RecordCodecExt, SZ_U8, SpecCodec, WireLen};
+use crate::codec::{
+    self, CodecError, RecordCodecExt, SpecCodec, WireLen, SZ_U8,
+};
 use crate::merge_iter::MergeIter;
 use crate::record::Record;
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub struct Label(pub Rc<str>, pub Rc<str>);
+
+impl Equivalent<Label> for (&str, &str) {
+    fn equivalent(&self, key: &Label) -> bool {
+        self.0 == key.0.as_ref() && self.1 == key.1.as_ref()
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamRegistry {
     /// Source of truth, stores stream_id -> label_map.
     /// All other label related structs are derived from this one.
-    labelmap_by_stream: HashMap<u64, Arc<LabelMap>>,
+    labelmap_by_stream: HashMap<u64, Rc<LabelMap>>,
 
     /// used for writes, label_map -> stream_id,
     /// for quick hash checking
-    stream_by_labelmap: HashMap<Arc<LabelMap>, u64>,
+    stream_by_labelmap: HashMap<Rc<LabelMap>, u64>,
 
     /// used for reads: given a label, returns all
     /// stream_ids that has any of the given labels
     /// attached to it.
-    kv_index: HashMap<(Arc<str>, Arc<str>), HashSet<u64>>,
+    kv_index: HashMap<Label, HashSet<u64>>,
+}
+
+/// Turns a stream -> labelmap mapping into a StreamRegistry
+/// by inserting items from that mapping into the secondary
+/// maps.
+impl From<HashMap<u64, Rc<LabelMap>>> for StreamRegistry {
+    fn from(labelmap_by_stream: HashMap<u64, Rc<LabelMap>>) -> Self {
+        let mut stream_by_labelmap = HashMap::new();
+        let mut kv_index: HashMap<Label, HashSet<u64>> = HashMap::new();
+
+        for (stream_id, labelmap) in labelmap_by_stream.iter() {
+            stream_by_labelmap.insert(labelmap.clone(), *stream_id);
+
+            for (k, v) in labelmap.iter() {
+                let lref: (&str, &str) = (&k, &v);
+                let label = kv_index.get_mut(&lref);
+                match label {
+                    Some(stream_ids) => {
+                        stream_ids.insert(*stream_id);
+                    }
+                    None => {
+                        let mut stream_ids = HashSet::new();
+                        stream_ids.insert(*stream_id);
+                        kv_index.insert(Label(k, v), stream_ids);
+                    }
+                }
+            }
+        }
+
+        Self {
+            labelmap_by_stream,
+            stream_by_labelmap,
+            kv_index,
+        }
+    }
 }
 
 impl StreamRegistry {
-    pub fn insert(&mut self, stream_id: u64, labelmap: Arc<LabelMap>) {
+    pub fn insert(&mut self, stream_id: u64, labelmap: Rc<LabelMap>) {
         self.labelmap_by_stream.insert(stream_id, labelmap.clone());
         self.stream_by_labelmap.insert(labelmap.clone(), stream_id);
+
         for (k, v) in labelmap.inner.iter() {
-            self.kv_index
-                .entry((k.clone(), v.clone()))
-                .or_default()
-                .insert(stream_id);
+            let lref: (&str, &str) = (k, v);
+            let label = self.kv_index.get_mut(&lref);
+            match label {
+                Some(stream_ids) => {
+                    stream_ids.insert(stream_id);
+                }
+                None => {
+                    let mut stream_ids = HashSet::new();
+                    stream_ids.insert(stream_id);
+                    self.kv_index
+                        .insert(Label(k.clone(), v.clone()), stream_ids);
+                }
+            }
         }
     }
 
-    pub fn get_stream_id_by_labelmap(&self, labelmap: &LabelMap) -> Option<&u64> {
+    pub fn get_stream_id_by_labelmap(
+        &self,
+        labelmap: &LabelMap,
+    ) -> Option<&u64> {
         self.stream_by_labelmap.get(labelmap)
     }
 
-    pub fn get_labelmap_by_stream(&self, stream_id: &u64) -> Option<&Arc<LabelMap>> {
+    pub fn get_labelmap_by_stream(
+        &self,
+        stream_id: &u64,
+    ) -> Option<&Rc<LabelMap>> {
         self.labelmap_by_stream.get(stream_id)
     }
 
-    pub fn get_labelmap_by_stream_cloned(&self, stream_id: &u64) -> Option<Arc<LabelMap>> {
+    pub fn get_labelmap_by_stream_cloned(
+        &self,
+        stream_id: &u64,
+    ) -> Option<Rc<LabelMap>> {
         self.labelmap_by_stream.get(stream_id).cloned()
     }
 
-    pub fn get_streams_by_kv(&self, k: Arc<str>, v: Arc<str>) -> Option<&HashSet<u64>> {
-        self.kv_index.get(&(k, v))
+    pub fn get_streams_by_kv(&self, kv: (&str, &str)) -> Option<&HashSet<u64>> {
+        self.kv_index.get(&kv)
+    }
+
+    pub fn label_intersection<I, S>(&self, labels: I) -> HashSet<u64>
+    where
+        I: Iterator<Item = (S, S)>,
+        S: AsRef<str>,
+    {
+        let mut sets: Vec<HashSet<u64>> = labels
+            .flat_map(|(k, v)| {
+                self.kv_index.get(&(k.as_ref(), v.as_ref())).cloned()
+            })
+            .collect();
+
+        match sets.len() {
+            0 => HashSet::new(),
+            1 => sets.swap_remove(0),
+            _ => {
+                sets.sort_unstable_by_key(|s| s.len());
+                let mut iter = sets.into_iter();
+                let mut acc = iter.next().unwrap();
+
+                for s in iter {
+                    acc.retain(|id| s.contains(id));
+                    if acc.is_empty() {
+                        break;
+                    }
+                }
+
+                acc
+            }
+        }
     }
 }
 
 /// stores labels -> stream_id
 /// Its a wrapper over HashMap<S, S> where s is currently a String
-/// but i might replace it with Arc<str> for cheap copies.
+/// but i might replace it with Rc<str> for cheap copies.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LabelMap {
-    pub(crate) inner: BTreeMap<Arc<str>, Arc<str>>,
+    pub(crate) inner: BTreeMap<Rc<str>, Rc<str>>,
     pub(crate) fingerprint: u64,
 }
 
@@ -87,7 +185,7 @@ impl WireLen for LabelMap {
     /// # Format
     ///
     /// ```not_rust
-    /// [length prefix for eachthe labels: u32]
+    /// [length prefix for each labels: u32]
     /// [label_key_str_len_prefix: u32, that many bytes: [u8]]
     /// [label_value_str_len_prefix: u32, that many bytes: [u8]]
     /// ```
@@ -103,15 +201,16 @@ impl WireLen for LabelMap {
 }
 
 impl LabelMap {
-    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &Arc<str>)> {
-        self.inner.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (Rc<str>, Rc<str>)> {
+        self.inner.iter().map(|(k, v)| (k.clone(), v.clone()))
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    pub fn new(map: BTreeMap<Arc<str>, Arc<str>>) -> Self {
+    pub fn new(map: BTreeMap<Rc<str>, Rc<str>>) -> Self {
         let mut hasher = DefaultHasher::new();
 
         for (k, v) in &map {
@@ -148,13 +247,16 @@ pub struct LabelMapCodec;
 pub const MIN_STR_SIZE: usize = 1;
 pub const MAX_STR_SIZE: usize = u8::MAX as usize;
 pub const MAX_LABEL_COUNT: usize = u8::MAX as usize;
-pub const LABEL_COUNT_SIZE: usize = size_of::<u8>();
+pub const LABEL_COUNT_WIRE_LEN: usize = size_of::<u8>();
 
 fn take_lp_str(src: &[u8]) -> IResult<&[u8], &str> {
     let (input, len) = be_u8(src)?;
     let (input, str_bs) = take(len)(input)?;
     let s = std::str::from_utf8(str_bs).map_err(|_| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::MapRes))
+        nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::MapRes,
+        ))
     })?;
     Ok((input, s))
 }
@@ -165,14 +267,14 @@ fn parse_label_map(src: &[u8]) -> IResult<&[u8], LabelMap> {
     let label_count = label_count as usize;
     // trace!(label_count);
 
-    let mut map: BTreeMap<Arc<str>, Arc<str>> = BTreeMap::new();
+    let mut map: BTreeMap<Rc<str>, Rc<str>> = BTreeMap::new();
     for _ in 0..label_count {
         let (_input, k) = take_lp_str(remainder)?;
         remainder = _input;
         let (_input, v) = take_lp_str(remainder)?;
         remainder = _input;
         // trace!("inserting {k} => {v}");
-        map.insert(Arc::from(k), Arc::from(v));
+        map.insert(Rc::from(k), Rc::from(v));
     }
 
     let labelmap = LabelMap::new(map);
@@ -181,7 +283,10 @@ fn parse_label_map(src: &[u8]) -> IResult<&[u8], LabelMap> {
 }
 
 impl SpecCodec<LabelMap> for LabelMapCodec {
-    fn decode(&self, src: &[u8]) -> Result<Option<(LabelMap, usize)>, CodecError> {
+    fn decode(
+        &self,
+        src: &[u8],
+    ) -> Result<Option<(LabelMap, usize)>, CodecError> {
         let (remaining, map) = parse_label_map(src).map_err(|e| {
             CodecError::Other(format!(
                 "nom parsing error: failed to parse key-value pairs for label map: {e}"
@@ -192,7 +297,11 @@ impl SpecCodec<LabelMap> for LabelMapCodec {
         Ok(Some((map, read)))
     }
 
-    fn encode(&self, item: &LabelMap, dst: &mut [u8]) -> Result<usize, CodecError> {
+    fn encode(
+        &self,
+        item: &LabelMap,
+        dst: &mut [u8],
+    ) -> Result<usize, CodecError> {
         if item.inner.len() > MAX_LABEL_COUNT {
             return Err(CodecError::Other(format!(
                 "too many items in labelmap, got = {} > max = {}",
@@ -230,12 +339,14 @@ impl SpecCodec<LabelMap> for LabelMapCodec {
         let mut start = 1;
 
         for (k, v) in &item.inner {
-            dst[start..start + 1].copy_from_slice(&(k.len() as u8).to_be_bytes());
+            dst[start..start + 1]
+                .copy_from_slice(&(k.len() as u8).to_be_bytes());
             start += 1;
             dst[start..start + k.len()].copy_from_slice(k.as_bytes());
             start += k.len();
 
-            dst[start..start + 1].copy_from_slice(&(v.len() as u8).to_be_bytes());
+            dst[start..start + 1]
+                .copy_from_slice(&(v.len() as u8).to_be_bytes());
             start += 1;
             dst[start..start + v.len()].copy_from_slice(v.as_bytes());
             start += v.len();
@@ -245,47 +356,59 @@ impl SpecCodec<LabelMap> for LabelMapCodec {
     }
 }
 
-pub struct LabeledIter<'a, C, M: Iterator<Item = MergeIter<'a, C>>> {
-    inner: M,
-    stream_registry: Arc<StreamRegistry>,
-    curr: Option<MergeIter<'a, C>>,
+/// Iterator over a range of keys, possibly spanning
+/// multiple Memtables and SSTables. It (roughly) yields
+/// `(LabelMap, Record)`, and uses its `stream_registry` to
+/// pair records to [LabelMap].
+#[derive(Debug)]
+pub struct LabeledIter<'l, C, M> {
+    // this is not safe and also not Send or Sync...
+    stream_registry: Rc<RefCell<StreamRegistry>>,
+    iters: M,
+    current: Option<MergeIter<'l, 'l, C>>,
 }
 
-impl<'a, C, M> LabeledIter<'a, C, M>
+impl<'l, C, M> LabeledIter<'l, C, M>
 where
-    M: Iterator<Item = MergeIter<'a, C>>,
+    M: Iterator<Item = MergeIter<'l, 'l, C>> + Debug,
+    C: Debug,
 {
-    pub fn new<I>(i: I, stream_registry: Arc<StreamRegistry>) -> Self
+    pub fn new<I>(i: I, stream_registry: Rc<RefCell<StreamRegistry>>) -> Self
     where
         I: IntoIterator<IntoIter = M>,
     {
-        Self {
-            inner: i.into_iter(),
+        let me = Self {
+            iters: i.into_iter(),
             stream_registry,
-            curr: None,
-        }
+            current: None,
+        };
+        // dbg!(&me);
+        me
     }
 }
 
-impl<'a, C, M> Iterator for LabeledIter<'a, C, M>
+impl<'l, C, M> Iterator for LabeledIter<'l, C, M>
 where
     C: RecordCodecExt,
-    M: Iterator<Item = MergeIter<'a, C>>,
+    M: Iterator<Item = MergeIter<'l, 'l, C>>,
 {
-    type Item = (Option<Arc<LabelMap>>, Cow<'a, Record>);
+    type Item = (Option<Rc<LabelMap>>, Cow<'l, Record>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.curr.is_none() {
-            self.curr = self.inner.next();
-            self.curr.as_ref()?;
+        if self.current.is_none() {
+            self.current = self.iters.next();
+            self.current.as_ref()?;
         }
 
-        match self.curr.as_mut() {
+        match self.current.as_mut() {
             Some(mr) => match mr.next() {
                 Some(rec) => {
-                    let labelmap = self
+                    let labelmap: Option<Rc<LabelMap>> = self
                         .stream_registry
-                        .get_labelmap_by_stream_cloned(&rec.as_ref().key.stream_id);
+                        .borrow()
+                        .get_labelmap_by_stream_cloned(
+                            &rec.as_ref().key.stream_id,
+                        );
                     Some((labelmap, rec))
                 }
                 None => None,
@@ -361,17 +484,18 @@ mod test {
             "expected to write the full maps wire length into destintation buffer"
         );
 
-        let (labelmap2, read) = codec.decode(&buf).expect("decode").expect("option");
+        let (labelmap2, read) =
+            codec.decode(&buf).expect("decode").expect("option");
         assert_eq!(n, read, "expected to read the full input bytes lenght");
         dbg!(&labelmap2);
         assert_eq!(labelmap.inner, labelmap2.inner);
     }
 
+    #[ignore = "testing differences between Rc::from and unsafe { Rc::from_raw(*str)}"]
     #[allow(unused)]
-    #[ignore = "testing differences between Arc::from and unsafe { Arc::from_raw(*str)}"]
     fn test() {
         let b = b"foo";
         let s = std::str::from_utf8(b).unwrap();
-        let _arc: Arc<str> = std::sync::Arc::from(s);
+        let _arc: Rc<str> = std::rc::Rc::from(s);
     }
 }
