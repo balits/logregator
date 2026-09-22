@@ -3,24 +3,23 @@
 #![allow(unused)]
 // use std::sync::mpmc;
 
-use std::{marker::PhantomData, num::NonZeroUsize, sync::mpmc};
+use std::{marker::PhantomData, num::NonZeroUsize, rc::Rc, sync::mpmc};
 
 use futures::sink::SinkExt;
+use logregator_tsdb::{codec::RecordCodecExt, label::LabeledIter};
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
 };
 use tokio_stream::StreamExt;
-use tokio_util::{
-    codec::{Framed, FramedRead, FramedWrite},
-    io::CopyToBytes,
-};
+use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
 use bytes::{Bytes, BytesMut};
-use tracing::{error, instrument, trace, warn};
+use tracing::{error, info, instrument, trace, warn};
 
 #[instrument(skip_all, err)]
 async fn task_per_conn(
+    localset: tokio::task::LocalSet,
     addr: std::net::SocketAddr,
     req_sender: mpmc::Sender<Request>,
     resp_recv: mpmc::Receiver<Response>,
@@ -40,7 +39,7 @@ async fn task_per_conn(
         let req_sender = req_sender.clone();
         let resp_recv = resp_recv.clone();
 
-        tokio::spawn(async move {
+        localset.spawn_local(async move {
             if let Err(e) =
                 conn_loop(fread, fwrite, req_sender, resp_recv).await
             {
@@ -101,9 +100,84 @@ async fn conn_loop(
     Ok(())
 }
 
-struct Request {
-    kind: RequestKind,
-    payload: BytesOffset,
+async fn lsm_loop<'lsm, R, L>(
+    lsm: &'lsm mut logregator_tsdb::lsm::LsmTree<R, L>,
+    mut req_recv: tokio::sync::mpsc::Receiver<Request>,
+    resp_sender: tokio::sync::mpsc::Sender<Response>,
+    recv_buf_size: usize,
+    labeled_iter_buf: usize,
+) where
+    'lsm: 'static,
+    R: logregator_tsdb::codec::RecordCodecExt + 'lsm,
+    L: logregator_tsdb::codec::SpecCodec<logregator_tsdb::label::LabelMap>
+        + 'lsm,
+{
+    assert_ne!(recv_buf_size, 0, "net: recv_buf_size must be non-zero");
+    assert_ne!(
+        labeled_iter_buf, 0,
+        "net: labeled_iter_buf must be non-zero"
+    );
+
+    let mut recv_buf = Vec::with_capacity(recv_buf_size);
+
+    loop {
+        if req_recv.recv_many(&mut recv_buf, recv_buf_size).await == 0 {
+            info!("request queue closed and empty");
+            return;
+        }
+
+        for r in recv_buf.drain(..) {
+            match r {
+                Request::AppendBatch(bytes_offset) => todo!(),
+                Request::Range {
+                    labels,
+                    start_time,
+                    end_time,
+                } => {
+                    let label_iter = labels
+                        .iter()
+                        .map(|(k, v)| (k.as_utf8_str(), v.as_utf8_str()));
+
+                    match lsm.range(label_iter, start_time, end_time) {
+                        Ok(iter) => {
+                            let type_erased_iter: BoxedLabeledIter =
+                                Box::new(iter.map(|(l, r)| {
+                                    // r has 4 u64 and an Arc<[u8]>, i think its safe to
+                                    // clone until further profiling shows it isnt
+                                    (l, r.into_owned())
+                                }));
+
+                            resp_sender.send(Response::Range(type_erased_iter));
+                        }
+                        Err(e) => error!("{e}"),
+                    }
+                }
+            };
+        }
+    }
+}
+
+struct BytesUtf8(Bytes);
+
+impl BytesUtf8 {
+    fn from_bytes(src: Bytes) -> Result<Self, std::str::Utf8Error> {
+        let _ = std::str::from_utf8(&src)?;
+        Ok(Self(src))
+    }
+
+    fn as_utf8_str(&self) -> &str {
+        std::str::from_utf8(self.0.as_ref())
+            .expect("net: BytesUtf8 should always be valid utf8, since theres only 1, utf8-proof way to contstruct it")
+    }
+}
+
+enum Request {
+    AppendBatch(BytesOffset),
+    Range {
+        labels: Vec<(BytesUtf8, BytesUtf8)>,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+    },
 }
 
 struct BytesOffset {
@@ -111,6 +185,7 @@ struct BytesOffset {
     offsets: Vec<NonZeroUsize>,
 }
 
+#[repr(u8)]
 enum RequestKind {
     AppendBatch,
     /// Range is a kind of request where the bytes
@@ -142,15 +217,16 @@ impl RequestCodec {
     /// > logregator-tsdb/src/codec.rs later
     fn parse_lp_str(src: &[u8]) -> nom::IResult<&[u8], &str> {
         let (input, len) = nom::number::complete::be_u8(src)?;
-        let x = nom::Error;
 
-        if !(logregator_tsdb::label::MIN_STR_LEN
-            ..logregator_tsdb::label::MIN_STR_LEN)
-            .contains(len)
+        let len = len as usize;
+
+        if !(logregator_tsdb::label::MIN_STR_SIZE
+            ..logregator_tsdb::label::MIN_STR_SIZE)
+            .contains(&len)
         {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 input,
-                nom::error::ErrorKind::MapRes,
+                nom::error::ErrorKind::LengthValue, // LengthValue?
             )));
         }
 
@@ -207,16 +283,30 @@ impl tokio_util::codec::Decoder for RequestCodec {
 
         match tag {
             0 => {
-                todo!("impl decode for Response::AppendBatch")
+                todo!("impl decode for Request::AppendBatch")
             }
             1 => {
-                todo!("impl decode for Response::Range")
+                todo!("impl decode for Request::Range")
             }
-            _ => Err(todo!("create return type for unknown tag in Response")),
+            _ => Err(NetError::Codec(format!(
+                "decode: unknown tag {tag} for Request"
+            ))),
         }
     }
 }
-enum Response {}
+
+type BoxedLabeledIter = Box<
+    dyn Iterator<
+            Item = (
+                Option<Rc<logregator_tsdb::label::LabelMap>>,
+                logregator_tsdb::record::Record,
+            ),
+        > + 'static,
+>;
+
+enum Response {
+    Range(BoxedLabeledIter),
+}
 
 struct ResponseCodec {}
 
@@ -242,6 +332,9 @@ enum NetError {
 
     #[error("net error: response channels reciever side disconnected")]
     ResponseRecvDisconnected(),
+
+    #[error("net error: codec failed: {0}")]
+    Codec(String),
 }
 
 /// this yields raw payloads from the underlying batch

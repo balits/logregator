@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{VecDeque},
+    collections::VecDeque,
     ops::Bound,
     path::PathBuf,
     rc::Rc,
@@ -236,15 +236,18 @@ where
     }
 
     #[instrument(skip(self, labels), fields(labels_size_hint = ?labels.size_hint()), err)]
-    pub fn range<I, S>(
-        &mut self,
+    pub fn range<'lsm, I, S>(
+        &'lsm self,
         labels: I,
         start_t: Option<u64>,
         end_t: Option<u64>,
-    ) -> Result<LabeledIter<'_, R, VecIntoIter<MergeIter<'_, '_, R>>>, RangeError>
+    ) -> Result<
+        LabeledIter<'lsm, R, VecIntoIter<MergeIter<'lsm, 'lsm, R>>>,
+        RangeError,
+    >
     where
         S: AsRef<str>,
-        I: Iterator<Item=(S, S)>,
+        I: Iterator<Item = (S, S)>,
     {
         let start_t = start_t.unwrap_or(0);
         let end_t = end_t.unwrap_or(u64::MAX);
@@ -323,7 +326,6 @@ where
             .fold(self.memtable.size_bytes(), |acc, f| acc + f.size_bytes())
     }
 
-
     fn issue_flush(&mut self) -> crate::Result<()> {
         let frozen = self.memtable.freeze(self.next_memtable_id.inc_and_get());
         self.frozen_memtables.push_back(frozen.clone());
@@ -388,7 +390,6 @@ where
         })
     }
 }
-
 
 #[cfg(test)]
 mod test {
