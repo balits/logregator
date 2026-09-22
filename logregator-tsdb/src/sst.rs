@@ -844,6 +844,8 @@ where
                         return;
                     }
 
+                    todo!("if not self.is_error() then update block_idx and update_current");
+
                     if !self.is_error() {
                         trace!(
                             "inner cursor is empty, advancing to the next one"
@@ -877,7 +879,7 @@ where
             let Ok(bc) = self.block_cursor.as_mut() else {
                 return;
             };
-            bc.next()
+            bc.next();
             bc.current()
         };
 
@@ -886,14 +888,15 @@ where
 
         match current {
             Ok(Some(rec)) => {
-                trace!("inner cursor no longer yields records");
-
-                if bc.is_error() {
-                    trace!("inner cursor is empty, advancing to the next one");
-                    // self.block_idx += 1;
-                    // self.update_current();
-                }
-                trace!("next record is {rec:?}")
+                // trace!("inner cursor no longer yields records");
+                // if bc.is_error() {
+                //     trace!("inner cursor is empty, advancing to the next one");
+                //     // self.block_idx += 1;
+                //     // self.update_current();
+                // }
+                // trace!("next record is {rec:?}")
+                //
+                todo!("cursor::_next -> match current -> Ok(Some(ref record))")
             }
             Ok(None) => {
                 trace!("after advance: block_cursor.current() returned Ok(None), not enough bytes to decode a Record")
