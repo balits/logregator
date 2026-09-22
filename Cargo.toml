@@ -21,6 +21,8 @@ tokio = {version = "1.52.3", features = ["full"]}
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = "0.3"
 tempfile = "3.27"
+thiserror = "2.0.18"
+nom = "8.0.0"
 
 [profile.release]
 debug = true
