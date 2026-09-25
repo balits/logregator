@@ -217,6 +217,7 @@ enum RequestKind {
     Range,
 }
 
+#[derive(Clone, Copy)]
 struct RequestCodec {}
 
 impl RequestCodec {
@@ -322,6 +323,7 @@ enum Response {
     Range(BoxedLabeledIter),
 }
 
+#[derive(Clone, Copy)]
 struct ResponseCodec {}
 
 impl tokio_util::codec::Encoder<Response> for ResponseCodec {
@@ -342,7 +344,10 @@ enum NetError {
     Io(Arc<std::io::Error>),
 
     #[error("net error: failed to send request through std::mpmc channel: {0}")]
-    RequestSend(#[from] mpmc::SendError<Request>),
+    RequestStdSend(#[from] mpmc::SendError<Request>),
+
+    #[error("net error: failed to send request through flume channel: {0}")]
+    RequestFlumeSend(#[from] flume::SendError<Request>),
 
     #[error("net error: response channels reciever side disconnected")]
     ResponseRecvDisconnected(),
@@ -409,31 +414,40 @@ impl<'a> Iterator for AppendBatchIter<'a> {
 
 // other stuff
 mod shard {
+    use futures::sink::SinkExt;
     use logregator_tsdb::{
         codec::{RecordCodecExt, SpecCodec},
         label::LabelMap,
-        lsm::LsmTree,
+        lsm::{LsmTree, LsmTreeOptions},
     };
-    use std::num::NonZeroU64;
-    use tokio::runtime::LocalOptions;
+    use std::{
+        num::{NonZeroU64, NonZeroUsize},
+        sync::Arc,
+    };
+    use tokio::{
+        io::{ReadHalf, WriteHalf},
+        net::{TcpSocket, TcpStream},
+        runtime::LocalOptions,
+    };
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::{FramedRead, FramedWrite};
+    use tracing::{error, trace, warn};
 
     use crate::NetError;
-
-    struct ShardID(usize);
 
     struct LoadBalandcer {
         num_shards: NonZeroU64,
     }
 
     impl LoadBalandcer {
-        pub unsafe fn new(num_shards: u64) -> Self {
-            debug_assert!(num_shards > 0, "net: num_shards cannot be zero");
-            debug_assert!(
-                num_shards > usize::MAX as u64,
-                "net: num_shards: u64 cannot exceed usize::MAX (so it can be cast as usize)"
-            );
-            let num_shards = unsafe { NonZeroU64::new_unchecked(num_shards) };
-            Self { num_shards }
+        pub fn new(num_shards: NonZeroU64) -> Option<Self> {
+            if num_shards.get() > usize::MAX as u64 {
+                error!(
+                    "net: num_shards: u64 cannot exceed usize::MAX (so it can be cast as usize)"
+                );
+                return None;
+            }
+            Some(Self { num_shards })
         }
 
         pub fn hash_to_shard(&self, source_id: u64) -> ShardID {
@@ -442,48 +456,163 @@ mod shard {
         }
     }
 
-    struct Shard<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    struct ShardID(usize);
+
+    struct ShardOptions {
         id: ShardID,
-        lsm: LsmTree<R, L>,
-        listener: tokio::net::TcpListener,
+        addr: std::net::SocketAddr,
+        tcp_backlog_size: u32,
+
+        request_codec: crate::RequestCodec,
+        response_codec: crate::ResponseCodec,
+
+        request_sender: flume::Sender<crate::Request>,
+        request_recv: flume::Receiver<crate::Request>,
+
+        response_sender: flume::Sender<crate::Response>,
+        response_recv: flume::Receiver<crate::Response>,
+
+        io_sender: flume::Sender<()>,
+        io_recv: flume::Sender<()>,
     }
 
-    impl<R: RecordCodecExt, L: SpecCodec<LabelMap>> Shard<R, L> {
+    struct Shard<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
+        shard_options: ShardOptions,
+        lsm: LsmTree<R, L>,
+    }
+
+    impl<R, L> Shard<R, L>
+    where
+        R: RecordCodecExt + 'static,
+        L: SpecCodec<LabelMap> + 'static,
+    {
         pub fn new(
-            id: ShardID,
-            addr: std::net::SocketAddr,
-            local_runtime_options: Option<tokio::runtime::LocalOptions>,
+            shard_options: ShardOptions,
+            lsm_options: LsmTreeOptions<R, L>,
+            rt_options: tokio::runtime::LocalOptions,
         ) -> Result<Self, NetError> {
-            // move all these stuff into a config struct,
-            //
-            // let lsm = LsmTree::new_uninit(
-            //     basepath,
-            //     record_codec,
-            //     label_codec,
-            //     block_size_limit,
-            //     memtable,
-            //     sst_handles,
-            //     stream_reg,
-            //     next_stream_id,
-            //     next_seq_num,
-            //     retention_days,
-            //     io_tx
-            // );
+            let lsm = LsmTree::new(lsm_options);
             let lsm: LsmTree<R, L> =
                 todo!("Need a lsm::Config struct to initialize the LsmTree");
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .name(format!("tokio-logregator-runtime-shard-{}", id.0))
-                .build_local(
-                    local_runtime_options.unwrap_or(LocalOptions::default()),
-                )?;
+            Ok(Self { shard_options, lsm })
+        }
 
+        pub fn id(&self) -> ShardID {
+            self.shard_options.id
+        }
+
+        pub fn run(mut self) -> std::io::Result<()> {
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseport(true)?;
-            socket.bind(addr)?;
-            let listener = socket.listen(512)?;
-            Ok(Self { id, lsm, listener })
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .name(format!(
+                    "tokio-logregator-runtime-shard-{}",
+                    self.shard_options.id.0
+                ))
+                .build_local(tokio::runtime::LocalOptions::default())?;
+
+            rt.block_on(async move {
+                self.do_run(socket);
+            });
+
+            Ok(())
+        }
+
+        async fn do_run(self, socket: TcpSocket) -> Result<(), NetError> {
+            let listener =
+                socket.listen(self.shard_options.tcp_backlog_size)?;
+
+            let request_codec = self.shard_options.request_codec;
+            let response_codec = self.shard_options.response_codec;
+
+            loop {
+                let (conn, _addr) = listener.accept().await?;
+
+                let (readhalf, writehalf) = tokio::io::split(conn);
+
+                let mut fread = FramedRead::new(readhalf, request_codec);
+                let mut fwrite = FramedWrite::new(writehalf, response_codec);
+
+                let request_sender = self.shard_options.request_sender.clone();
+                let request_recv = self.shard_options.request_recv.clone();
+
+                let response_sender =
+                    self.shard_options.response_sender.clone();
+                let response_recv = self.shard_options.response_recv.clone();
+
+                let conn_handler = tokio::task::spawn_local(async {
+                    if let Err(e) = Self::handle_connection(
+                        fread,
+                        fwrite,
+                        request_sender,
+                        request_recv,
+                        response_sender,
+                        response_recv,
+                    )
+                    .await
+                    {
+                        error!("connection loop errored: {e}");
+                    }
+                })
+                .await;
+            }
+        }
+
+        async fn handle_connection(
+            mut fread: FramedRead<ReadHalf<TcpStream>, crate::RequestCodec>,
+            mut fwrite: FramedWrite<WriteHalf<TcpStream>, crate::ResponseCodec>,
+
+            request_sender: flume::Sender<crate::Request>,
+            request_recv: flume::Receiver<crate::Request>,
+
+            response_sender: flume::Sender<crate::Response>,
+            response_recv: flume::Receiver<crate::Response>,
+        ) -> Result<(), NetError> {
+            let resp: crate::Response = todo!();
+
+            tokio::select! {
+                req = fread.next() => {
+                    let req = match req{
+                        Some(Ok(r)) => r,
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            warn!("framed read closed");
+                            return Ok(());
+                        },
+                    };
+
+                    match request_sender.send_async(req).await {
+                        Ok(_) =>  {
+                            trace!("request read + sent through channel");
+                        },
+                        Err(e) => {
+                            warn!("request could not be sent through channel, error = {:?}", &e);
+                            return Err(e.into())
+                        },
+                    }
+                },
+
+                response = response_recv.recv_async() => {
+                    match response {
+                        Ok(r) => {
+                            fwrite.send(resp).await.inspect_err(|e| {
+                                warn!("response could not be written to TcpStream")
+                            })?;
+                        },
+                        Err(flume::RecvError::Disconnected) => {
+                            warn!("flume response_recv channel disconnected");
+                            return Err(NetError::ResponseRecvDisconnected())
+                        },
+
+                };
+                }
+            };
+
+            Ok(())
         }
     }
 }
