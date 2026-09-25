@@ -24,7 +24,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct LsmConfig<R, L> {
+pub(crate) struct LsmConfig<R, L> {
     basepath: PathBuf,
     block_size_limit: Option<usize>,
     _retention_days: Option<u32>,
@@ -48,12 +48,55 @@ pub struct LsmTree<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
     io_tx: mpsc::Sender<io::IoEvent<R>>,
 }
 
+pub struct LsmTreeOptions<R, L> {
+    basepath: PathBuf,
+    record_codec: R,
+    label_codec: L,
+    block_size_limit: Option<usize>,
+    memtable: MutMemtable,
+    sst_handles: Vec<SstHandle<R>>,
+    stream_reg: StreamRegistry,
+    next_stream_id: u64,
+    next_seq_num: u64,
+    retention_days: Option<u32>,
+    io_tx: mpsc::Sender<io::IoEvent<R>>,
+}
+
 impl<R, L> LsmTree<R, L>
 where
     R: RecordCodecExt,
     L: SpecCodec<LabelMap>,
 {
+    pub fn new(opts: LsmTreeOptions<R, L>) -> Self {
+        let next_memtable_id = opts.memtable.id() + 1;
+        let frozen_memtables = VecDeque::new();
+        let stream_buffer = Vec::new();
+        let config = LsmConfig {
+            basepath: opts.basepath,
+            record_codec: opts.record_codec,
+            block_size_limit: opts.block_size_limit,
+            label_codec: opts.label_codec,
+            _retention_days: opts.retention_days,
+        };
+        let stream_reg = Rc::new(RefCell::new(opts.stream_reg));
+
+        Self {
+            memtable: opts.memtable,
+            frozen_memtables,
+            sst_handles: opts.sst_handles,
+            stream_reg,
+            next_memtable_id: next_memtable_id.into(),
+            next_stream_id: opts.next_stream_id.into(),
+            next_seq_num: opts.next_seq_num.into(),
+            config,
+            io_tx: opts.io_tx,
+            stream_buffer,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[deprecated]
     pub fn new_uninit(
         basepath: PathBuf,
         record_codec: R,
