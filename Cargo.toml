@@ -11,6 +11,7 @@ resolver = "3"
 logregator-core = { path = "logregator-core" }
 logregator-tools = { path = "logregator-tools" }
 logregator-tsdb = { path = "logregator-tsdb" }
+flume = "0.12.0"
 anyhow = "1.0.102"
 bytes = "1"
 clap = { version = "4.6.1", features = ["derive"] }

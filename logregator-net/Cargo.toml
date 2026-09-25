@@ -8,6 +8,7 @@ logregator-tsdb = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 nom = { workspace = true }
+flume = { workspace = true }
 tokio-util = { version = "0.7.19", features = ["codec"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }

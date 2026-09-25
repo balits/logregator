@@ -3,10 +3,17 @@
 #![allow(unused)]
 // use std::sync::mpmc;
 
-use std::{marker::PhantomData, num::NonZeroUsize, rc::Rc, sync::mpmc};
+use std::{
+    marker::PhantomData,
+    num::{NonZeroU64, NonZeroUsize},
+    rc::Rc,
+    sync::{Arc, mpmc},
+};
 
 use futures::sink::SinkExt;
-use logregator_tsdb::{codec::RecordCodecExt, label::LabeledIter};
+use logregator_tsdb::{
+    codec::RecordCodecExt, label::LabeledIter, lsm::LsmTree,
+};
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
@@ -28,6 +35,9 @@ async fn task_per_conn(
 
     loop {
         let (conn, _addr) = socket.accept().await?;
+        // these are Arc<Mutex<_>>-es, wouldnt a signle Framed<TcpStream, Codec> be more efficient?
+        // well yeah but then i couldnt separate my Request and Response enums, as a single
+        // Framec<_, Codec> takes only a single codec
         let (readhalf, writehalf) = tokio::io::split(conn);
 
         let request_codec = RequestCodec {};
@@ -175,9 +185,13 @@ enum Request {
     AppendBatch(BytesOffset),
     Range {
         labels: Vec<(BytesUtf8, BytesUtf8)>,
-        start_time: Option<u64>,
-        end_time: Option<u64>,
+        start_time: u64,
+        end_time: u64,
     },
+}
+
+impl Request {
+    pub fn encode_into(&self, dst: &mut [u8]) {}
 }
 
 struct BytesOffset {
@@ -325,7 +339,7 @@ impl tokio_util::codec::Encoder<Response> for ResponseCodec {
 #[derive(thiserror::Error, Debug)]
 enum NetError {
     #[error("net error: std::io:error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(Arc<std::io::Error>),
 
     #[error("net error: failed to send request through std::mpmc channel: {0}")]
     RequestSend(#[from] mpmc::SendError<Request>),
@@ -335,6 +349,12 @@ enum NetError {
 
     #[error("net error: codec failed: {0}")]
     Codec(String),
+}
+
+impl From<std::io::Error> for NetError {
+    fn from(e: std::io::Error) -> Self {
+        NetError::Io(Arc::new(e))
+    }
 }
 
 /// this yields raw payloads from the underlying batch
@@ -383,6 +403,87 @@ impl<'a> Iterator for AppendBatchIter<'a> {
                 Some(slice)
             }
             None => None,
+        }
+    }
+}
+
+// other stuff
+mod shard {
+    use logregator_tsdb::{
+        codec::{RecordCodecExt, SpecCodec},
+        label::LabelMap,
+        lsm::LsmTree,
+    };
+    use std::num::NonZeroU64;
+    use tokio::runtime::LocalOptions;
+
+    use crate::NetError;
+
+    struct ShardID(usize);
+
+    struct LoadBalandcer {
+        num_shards: NonZeroU64,
+    }
+
+    impl LoadBalandcer {
+        pub unsafe fn new(num_shards: u64) -> Self {
+            debug_assert!(num_shards > 0, "net: num_shards cannot be zero");
+            debug_assert!(
+                num_shards > usize::MAX as u64,
+                "net: num_shards: u64 cannot exceed usize::MAX (so it can be cast as usize)"
+            );
+            let num_shards = unsafe { NonZeroU64::new_unchecked(num_shards) };
+            Self { num_shards }
+        }
+
+        pub fn hash_to_shard(&self, source_id: u64) -> ShardID {
+            // new() already checked that num_shards is <= usize::MAX, so this cast is ok
+            ShardID(source_id.rem_euclid(self.num_shards.get()) as usize)
+        }
+    }
+
+    struct Shard<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
+        id: ShardID,
+        lsm: LsmTree<R, L>,
+        listener: tokio::net::TcpListener,
+    }
+
+    impl<R: RecordCodecExt, L: SpecCodec<LabelMap>> Shard<R, L> {
+        pub fn new(
+            id: ShardID,
+            addr: std::net::SocketAddr,
+            local_runtime_options: Option<tokio::runtime::LocalOptions>,
+        ) -> Result<Self, NetError> {
+            // move all these stuff into a config struct,
+            //
+            // let lsm = LsmTree::new_uninit(
+            //     basepath,
+            //     record_codec,
+            //     label_codec,
+            //     block_size_limit,
+            //     memtable,
+            //     sst_handles,
+            //     stream_reg,
+            //     next_stream_id,
+            //     next_seq_num,
+            //     retention_days,
+            //     io_tx
+            // );
+            let lsm: LsmTree<R, L> =
+                todo!("Need a lsm::Config struct to initialize the LsmTree");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .name(format!("tokio-logregator-runtime-shard-{}", id.0))
+                .build_local(
+                    local_runtime_options.unwrap_or(LocalOptions::default()),
+                )?;
+
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.set_reuseport(true)?;
+            socket.bind(addr)?;
+            let listener = socket.listen(512)?;
+            Ok(Self { id, lsm, listener })
         }
     }
 }

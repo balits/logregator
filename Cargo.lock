@@ -1093,6 +1093,7 @@ name = "logregator-net"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flume",
  "futures",
  "logregator-tsdb",
  "nom 8.0.0",
