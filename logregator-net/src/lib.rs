@@ -6,13 +6,17 @@
 use std::{
     marker::PhantomData,
     num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, mpmc},
+    thread,
 };
 
 use futures::sink::SinkExt;
 use logregator_tsdb::{
-    codec::RecordCodecExt, label::LabeledIter, lsm::LsmTree,
+    codec::{RecordCodecExt, SpecCodec},
+    label::{LabelMap, LabeledIter},
+    lsm::{LsmTree, RecoverOptions},
 };
 use tokio::{
     io::{ReadHalf, WriteHalf},
@@ -150,8 +154,8 @@ async fn lsm_loop<'lsm, R, L>(
 
                     match lsm.range(label_iter, start_time, end_time) {
                         Ok(iter) => {
-                            let type_erased_iter: BoxedLabeledIter =
-                                Box::new(iter.map(|(l, r)| {
+                            let type_erased_iter: ArcedLabeledIter =
+                                Arc::new(iter.map(|(l, r)| {
                                     // r has 4 u64 and an Arc<[u8]>, i think its safe to
                                     // clone until further profiling shows it isnt
                                     (l, r.into_owned())
@@ -167,26 +171,26 @@ async fn lsm_loop<'lsm, R, L>(
     }
 }
 
-struct BytesUtf8(Bytes);
+pub struct BytesUtf8(Bytes);
 
 impl BytesUtf8 {
-    fn from_bytes(src: Bytes) -> Result<Self, std::str::Utf8Error> {
+    pub fn from_bytes(src: Bytes) -> Result<Self, std::str::Utf8Error> {
         let _ = std::str::from_utf8(&src)?;
         Ok(Self(src))
     }
 
-    fn as_utf8_str(&self) -> &str {
+    pub fn as_utf8_str(&self) -> &str {
         std::str::from_utf8(self.0.as_ref())
             .expect("net: BytesUtf8 should always be valid utf8, since theres only 1, utf8-proof way to contstruct it")
     }
 }
 
-enum Request {
+pub enum Request {
     AppendBatch(BytesOffset),
     Range {
         labels: Vec<(BytesUtf8, BytesUtf8)>,
-        start_time: u64,
-        end_time: u64,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
     },
 }
 
@@ -194,7 +198,7 @@ impl Request {
     pub fn encode_into(&self, dst: &mut [u8]) {}
 }
 
-struct BytesOffset {
+pub struct BytesOffset {
     raw: bytes::Bytes,
     offsets: Vec<NonZeroUsize>,
 }
@@ -217,7 +221,7 @@ enum RequestKind {
     Range,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct RequestCodec {}
 
 impl RequestCodec {
@@ -310,20 +314,25 @@ impl tokio_util::codec::Decoder for RequestCodec {
     }
 }
 
-type BoxedLabeledIter = Box<
+type ArcedLabeledIter = Arc<
     dyn Iterator<
             Item = (
-                Option<Rc<logregator_tsdb::label::LabelMap>>,
+                Option<Arc<logregator_tsdb::label::LabelMap>>,
                 logregator_tsdb::record::Record,
             ),
         > + 'static,
 >;
 
 enum Response {
-    Range(BoxedLabeledIter),
+    Range(ArcedLabeledIter),
 }
 
-#[derive(Clone, Copy)]
+// FIXME: if LabelMap and Record is Send,
+// and LabeledIter is Send, then Arc<dyn Iterator<Item = (LabelMap, Record)>>
+// should be send also, no?
+unsafe impl Send for Response {}
+
+#[derive(Debug, Clone, Copy)]
 struct ResponseCodec {}
 
 impl tokio_util::codec::Encoder<Response> for ResponseCodec {
@@ -339,7 +348,10 @@ impl tokio_util::codec::Encoder<Response> for ResponseCodec {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum NetError {
+pub enum NetError {
+    #[error("net error: some other error occured: 0")]
+    Message(String),
+
     #[error("net error: std::io:error: {0}")]
     Io(Arc<std::io::Error>),
 
@@ -412,15 +424,91 @@ impl<'a> Iterator for AppendBatchIter<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NetOptions {
+    addr: std::net::SocketAddr,
+    tcp_backlog_size: u32,
+    num_shards: NonZeroU64,
+    request_codec: RequestCodec,
+    response_codec: ResponseCodec,
+    request_channel_bound: Option<usize>,
+    response_channel_bound: Option<usize>,
+    io_channel_bound: Option<usize>,
+}
+
+impl NetOptions {
+    #[cfg(test)]
+    pub fn new_test_options(num_shards: NonZeroU64) -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        Self {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 6767),
+            tcp_backlog_size: 64,
+            num_shards,
+            request_codec: RequestCodec {},
+            response_codec: ResponseCodec {},
+            request_channel_bound: None,
+            response_channel_bound: None,
+            io_channel_bound: None,
+        }
+    }
+
+    pub fn new_from_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Self> {
+        unimplemented!("open + parse config file for NetOptions (json / toml)")
+    }
+}
+
+pub fn create_shard<R, L>(
+    shard_id: shard::ShardID,
+    lb: Arc<shard::LoadBalancer>,
+    net_options: Arc<NetOptions>,
+    lsm_recover_opts: RecoverOptions<R, L>,
+) -> Result<shard::Shard<R, L>, NetError>
+where
+    R: RecordCodecExt + Sync + Send + 'static,
+    L: SpecCodec<LabelMap> + Sync + Send + 'static,
+{
+    assert!(
+        shard_id.0 < lb.num_shards_usize(),
+        "spawn shard must be < `num_shards`"
+    );
+
+    // let net_options =
+    //     NetOptions::new_from_file(net_options_path).map_err(|e| {
+    //         NetError::Message(format!(
+    //             "failed to open/parse logregator-net options from path {}: {}",
+    //             net_options_path.display(),
+    //             e
+    //         ))
+    //     })?;
+
+    let shard_parts = shard::create_shard_parts(&net_options);
+
+    let shard = shard::Shard::new(
+        shard_id,
+        net_options.clone(),
+        &lsm_recover_opts,
+        shard_parts,
+        lb.clone(),
+    )
+    .expect("failed to create `Shard` instance for thread: {thread_name}");
+
+    Ok(shard)
+}
+
 // other stuff
 mod shard {
     use futures::sink::SinkExt;
     use logregator_tsdb::{
         codec::{RecordCodecExt, SpecCodec},
         label::LabelMap,
-        lsm::{LsmTree, LsmTreeOptions},
+        lsm::{LsmTree, LsmTreeOptions, RecoverOptions},
     };
     use std::{
+        fmt::Debug,
+        net::Ipv4Addr,
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
     };
@@ -431,15 +519,16 @@ mod shard {
     };
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, FramedWrite};
-    use tracing::{error, trace, warn};
+    use tracing::{error, info, instrument, trace, warn};
 
     use crate::NetError;
 
-    struct LoadBalandcer {
+    #[derive(Debug, Clone)]
+    pub struct LoadBalancer {
         num_shards: NonZeroU64,
     }
 
-    impl LoadBalandcer {
+    impl LoadBalancer {
         pub fn new(num_shards: NonZeroU64) -> Option<Self> {
             if num_shards.get() > usize::MAX as u64 {
                 error!(
@@ -451,19 +540,30 @@ mod shard {
         }
 
         pub fn hash_to_shard(&self, source_id: u64) -> ShardID {
-            // new() already checked that num_shards is <= usize::MAX, so this cast is ok
-            ShardID(source_id.rem_euclid(self.num_shards.get()) as usize)
+            // # SAFETY
+            //
+            // new() already checked that num_shards is <= usize::MAX, so this cast is fine
+            ShardID(source_id.rem_euclid(self.num_shards().get()) as usize)
+        }
+
+        #[inline]
+        pub fn num_shards(&self) -> NonZeroU64 {
+            self.num_shards
+        }
+
+        #[inline]
+        pub fn num_shards_usize(&self) -> usize {
+            // # SAFETY
+            //
+            // new() already checked that num_shards is <= usize::MAX, so this cast is fine
+            self.num_shards.get() as usize
         }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    struct ShardID(usize);
+    pub struct ShardID(pub usize);
 
-    struct ShardOptions {
-        id: ShardID,
-        addr: std::net::SocketAddr,
-        tcp_backlog_size: u32,
-
+    pub struct ShardParts<R> {
         request_codec: crate::RequestCodec,
         response_codec: crate::ResponseCodec,
 
@@ -473,13 +573,60 @@ mod shard {
         response_sender: flume::Sender<crate::Response>,
         response_recv: flume::Receiver<crate::Response>,
 
-        io_sender: flume::Sender<()>,
-        io_recv: flume::Sender<()>,
+        io_sender: flume::Sender<logregator_tsdb::io::IoEvent<R>>,
+        io_recv: flume::Receiver<logregator_tsdb::io::IoEvent<R>>,
     }
 
-    struct Shard<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
-        shard_options: ShardOptions,
+    pub fn read_shard_options() {}
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_shard_parts<R>(options: &crate::NetOptions) -> ShardParts<R> {
+        let (request_sender, request_recv) = match options.request_channel_bound
+        {
+            Some(bound) => flume::bounded(bound),
+            None => flume::unbounded(),
+        };
+
+        let (response_sender, response_recv) =
+            match options.response_channel_bound {
+                Some(bound) => flume::bounded(bound),
+                None => flume::unbounded(),
+            };
+
+        let (io_sender, io_recv) = match options.io_channel_bound {
+            Some(bound) => flume::bounded(bound),
+            None => flume::unbounded(),
+        };
+
+        ShardParts {
+            request_codec: options.request_codec,
+            response_codec: options.response_codec,
+            request_sender,
+            request_recv,
+            response_sender,
+            response_recv,
+            io_sender,
+            io_recv,
+        }
+    }
+
+    use crate::NetOptions;
+
+    pub struct Shard<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
+        id: ShardID,
+        net_options: Arc<NetOptions>,
+        parts: ShardParts<R>,
+        lb: Arc<LoadBalancer>,
         lsm: LsmTree<R, L>,
+    }
+
+    impl<R: RecordCodecExt, L: SpecCodec<LabelMap>> Debug for Shard<R, L> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Shard")
+                .field("shard_id", &self.id)
+                .field("addr", &self.net_options.addr)
+                .finish_non_exhaustive()
+        }
     }
 
     impl<R, L> Shard<R, L>
@@ -488,46 +635,55 @@ mod shard {
         L: SpecCodec<LabelMap> + 'static,
     {
         pub fn new(
-            shard_options: ShardOptions,
-            lsm_options: LsmTreeOptions<R, L>,
-            rt_options: tokio::runtime::LocalOptions,
+            id: ShardID,
+            net_options: Arc<NetOptions>,
+            lsm_recover_options: &RecoverOptions<R, L>,
+            parts: ShardParts<R>,
+            lb: Arc<LoadBalancer>,
         ) -> Result<Self, NetError> {
-            let lsm = LsmTree::new(lsm_options);
-            let lsm: LsmTree<R, L> =
-                todo!("Need a lsm::Config struct to initialize the LsmTree");
+            let lsm =
+                LsmTree::recover(lsm_recover_options, parts.io_sender.clone())
+                    .expect("failed to recover lsm tree");
 
-            Ok(Self { shard_options, lsm })
+            Ok(Self {
+                id,
+                net_options,
+                lsm,
+                parts,
+                lb,
+            })
         }
 
+        #[inline]
         pub fn id(&self) -> ShardID {
-            self.shard_options.id
+            self.id
         }
 
+        #[instrument()]
         pub fn run(mut self) -> std::io::Result<()> {
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseport(true)?;
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
-                .name(format!(
-                    "tokio-logregator-runtime-shard-{}",
-                    self.shard_options.id.0
-                ))
+                .name(format!("tokio-logregator-runtime-shard-{}", self.id.0))
                 .build_local(tokio::runtime::LocalOptions::default())?;
 
             rt.block_on(async move {
-                self.do_run(socket);
+                match self.do_run(socket).await {
+                    Ok(()) => info!("Shard::run exited successfully"),
+                    Err(err) => error!("Shard::run exited with error: {err}"),
+                }
             });
 
             Ok(())
         }
 
         async fn do_run(self, socket: TcpSocket) -> Result<(), NetError> {
-            let listener =
-                socket.listen(self.shard_options.tcp_backlog_size)?;
+            let listener = socket.listen(self.net_options.tcp_backlog_size)?;
 
-            let request_codec = self.shard_options.request_codec;
-            let response_codec = self.shard_options.response_codec;
+            let request_codec = self.net_options.request_codec;
+            let response_codec = self.net_options.response_codec;
 
             loop {
                 let (conn, _addr) = listener.accept().await?;
@@ -537,12 +693,11 @@ mod shard {
                 let mut fread = FramedRead::new(readhalf, request_codec);
                 let mut fwrite = FramedWrite::new(writehalf, response_codec);
 
-                let request_sender = self.shard_options.request_sender.clone();
-                let request_recv = self.shard_options.request_recv.clone();
+                let request_sender = self.parts.request_sender.clone();
+                let request_recv = self.parts.request_recv.clone();
 
-                let response_sender =
-                    self.shard_options.response_sender.clone();
-                let response_recv = self.shard_options.response_recv.clone();
+                let response_sender = self.parts.response_sender.clone();
+                let response_recv = self.parts.response_recv.clone();
 
                 let conn_handler = tokio::task::spawn_local(async {
                     if let Err(e) = Self::handle_connection(
@@ -614,5 +769,76 @@ mod shard {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{env::temp_dir, num::NonZeroU64, sync::Arc};
+
+    use tracing::error;
+
+    use crate::{
+        NetOptions,
+        shard::{LoadBalancer, Shard, ShardID},
+    };
+
+    fn tracing() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            // .with_target(true)
+            // .with_span_events(FmtSpan::NEW)
+            .with_test_writer()
+            .try_init();
+    }
+
+    type TestShard = Shard<
+        logregator_tsdb::record::RecordCodec,
+        logregator_tsdb::label::LabelMapCodec,
+    >;
+
+    #[tokio::test]
+    async fn rt_spawn_shards() {
+        let num_shards = NonZeroU64::new(1).unwrap();
+        let lb = Arc::new(
+            LoadBalancer::new(num_shards).expect("[test_err]: load balancer"),
+        );
+
+        let net_options = Arc::new(NetOptions::new_test_options(num_shards));
+
+        let handles: Vec<_> = (0..num_shards.get())
+            .map(|shard_id| {
+                let basepath = tempfile::Builder::new()
+                    .prefix("test_spawn_shard_single")
+                    .tempdir()
+                    .expect("[test_err]: tempfile");
+
+                #[cfg(test)]
+                let lsm_recover_opts =
+                    logregator_tsdb::lsm::recover_options_for_test(
+                        basepath.path().to_path_buf(),
+                    );
+
+                let shard_id = ShardID(shard_id as usize);
+
+                let shard = super::create_shard(
+                    shard_id,
+                    lb.clone(),
+                    net_options.clone(),
+                    lsm_recover_opts,
+                )
+                .expect("[test_err]: Shard");
+
+                std::thread::spawn(move || {
+                    shard.run();
+                })
+            })
+            .collect();
+
+        handles.into_iter().enumerate().for_each(|(i, h)| {
+            let err = format!("failed to join handle {}", i);
+            h.join()
+                .unwrap_or_else(|e| error!("failed to join handle-{i}: {e:?}"));
+        });
     }
 }
