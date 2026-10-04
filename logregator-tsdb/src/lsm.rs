@@ -1,26 +1,27 @@
 use std::{
-    cell::RefCell,
     collections::VecDeque,
     ops::Bound,
     path::PathBuf,
-    rc::Rc,
-    sync::mpsc,
+    sync::{Arc, RwLock, mpsc},
     time::{SystemTime, UNIX_EPOCH},
     vec::IntoIter as VecIntoIter,
 };
 
 use tracing::{error, instrument};
 
+// #[cfg(test)]
+// use crate::label;
 use crate::{
     codec::{self, RecordCodecExt, SpecCodec},
     counter::Counter,
     io,
-    label::{LabelMap, LabeledIter, StreamRegistry},
-    manifest::ManifestEntry,
-    memtable::{AppendOutput, FrozenMemtable, MutMemtable},
+    label::{self, LabelMap, LabeledIter, StreamRegistry},
+    manifest::{self, Manifest, ManifestEntry},
+    memtable::{self, AppendOutput, FrozenMemtable, MutMemtable},
     merge_iter::MergeIter,
     record::{self, Key, Record},
     sst::{self, SstHandle},
+    wal::Wal,
 };
 
 #[derive(Debug)]
@@ -43,7 +44,10 @@ pub struct LsmTree<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
     frozen_memtables: VecDeque<FrozenMemtable>,
     sst_handles: Vec<SstHandle<R>>,
     stream_buffer: Vec<ManifestEntry>,
-    stream_reg: Rc<RefCell<StreamRegistry>>,
+
+    /// Nooooooo shared mutable state noooooooooo!!!
+    /// );
+    stream_reg: Arc<RwLock<StreamRegistry>>,
 
     io_tx: mpsc::Sender<io::IoEvent<R>>,
 }
@@ -62,11 +66,92 @@ pub struct LsmTreeOptions<R, L> {
     io_tx: mpsc::Sender<io::IoEvent<R>>,
 }
 
+#[allow(unused)]
+pub struct RecoverOptions<R, L, M> {
+    pub basepath: PathBuf,
+    pub record_codec: R,
+    pub label_codec: L,
+    pub manifest_codec: M,
+    pub block_size_limit: Option<usize>,
+    pub next_stream_id: u64,
+    pub next_seq_num: u64,
+    pub retention_days: Option<u32>,
+    pub max_manifest_file_size: Option<usize>,
+    pub max_memtable_size: Option<usize>,
+    // should be an extra field on `recover()`
+    // io_tx: flume::Sender<io::IoEvent<R>>,
+}
+
+pub type TestRecoverOptions = RecoverOptions<
+    record::RecordCodec,
+    label::LabelMapCodec,
+    manifest::ManifestCodec<label::LabelMapCodec>,
+>;
+// #[cfg(test)]
+pub fn recover_options_for_test(basepath: PathBuf) -> TestRecoverOptions {
+    let record_codec = record::RecordCodec {};
+    let label_codec = label::LabelMapCodec {};
+    let manifest_codec = manifest::ManifestCodec::new(label_codec);
+
+    TestRecoverOptions {
+        basepath,
+        record_codec,
+        label_codec,
+        manifest_codec,
+        block_size_limit: None,
+        next_stream_id: 0,
+        next_seq_num: 0,
+        retention_days: None,
+        max_manifest_file_size: None,
+        max_memtable_size: None,
+    }
+}
+
 impl<R, L> LsmTree<R, L>
 where
     R: RecordCodecExt,
     L: SpecCodec<LabelMap>,
 {
+    #[instrument(skip_all, err)]
+    #[allow(unused_variables)]
+    pub fn recover<M: manifest::ManifestCodecExt<L>>(
+        recover_opts: &RecoverOptions<R, L, M>,
+        io_tx: flume::Sender<io::IoEvent<R>>,
+    ) -> crate::Result<Self> {
+        // again, most codecs are stateless ZST-s, so clone is a no-op
+
+        let manifest = Manifest::open_snapshotted(
+            &recover_opts.basepath,
+            recover_opts.manifest_codec.clone(),
+            recover_opts.max_manifest_file_size,
+        )?;
+
+        let wal = Wal::recover(
+            &recover_opts.basepath,
+            recover_opts.record_codec.clone(),
+        )?;
+
+        // currently Wal looks like a single `basepath/WAL` file,
+        // rather than separate files per memtables flushed like `basepath/WAL_<memtable_id>`
+        let next_memtable_id = 0;
+
+        let mut memtable =
+            MutMemtable::new(next_memtable_id, recover_opts.max_memtable_size);
+
+        for record in wal.as_reader()? {
+            let record = record?;
+            if let AppendOutput::Full(_) = memtable.append(record) {
+                todo!(
+                    "handle overflow of memtable (save frozen ones, return them or already enqueue them into the io channel?)"
+                );
+            }
+        }
+
+        unimplemented!(
+            "create a new LsmTree by recovering possibly existing files"
+        )
+    }
+
     pub fn new(opts: LsmTreeOptions<R, L>) -> Self {
         let next_memtable_id = opts.memtable.id() + 1;
         let frozen_memtables = VecDeque::new();
@@ -78,7 +163,7 @@ where
             label_codec: opts.label_codec,
             _retention_days: opts.retention_days,
         };
-        let stream_reg = Rc::new(RefCell::new(opts.stream_reg));
+        let stream_reg = Arc::new(RwLock::new(opts.stream_reg));
 
         Self {
             memtable: opts.memtable,
@@ -120,7 +205,7 @@ where
             label_codec,
             _retention_days: retention_days,
         };
-        let stream_reg = Rc::new(RefCell::new(stream_reg));
+        let stream_reg = Arc::new(RwLock::new(stream_reg));
 
         Self {
             memtable,
@@ -188,7 +273,7 @@ where
 
             let (labelmap, label_bytes_read) =
                 match self.config.label_codec.decode(payload) {
-                    Ok(Some((m, r))) => (Rc::new(m), r),
+                    Ok(Some((m, r))) => (Arc::new(m), r),
                     Ok(None) => {
                         return Err(codec::CodecError::Other(
                             "label map codec returned Ok(None)".into(),
@@ -198,43 +283,60 @@ where
                     Err(e) => return Err(e.into()),
                 };
 
-            let stream_id = self
-                .stream_reg
-                .borrow()
-                .get_stream_id_by_labelmap(&labelmap)
-                .copied()
-                .unwrap_or_else(|| self.next_stream_id.inc_and_get());
+            let stream_id = {
+                let read_guard = self
+                    .stream_reg
+                    .read()
+                    .expect("failed to read-lock StreamRegistry in LsmTree::append_batch");
 
-            // drops the need for the borrow() to live while the later None
-            // branch calls borrow_mut()
-            let prev_stream_id = self
-                .stream_reg
-                .borrow()
-                .get_stream_id_by_labelmap(&labelmap)
-                .copied();
+                let stream_id = read_guard
+                    .get_stream_id_by_labelmap(&labelmap)
+                    .copied()
+                    .unwrap_or_else(|| self.next_stream_id.inc_and_get());
 
-            match prev_stream_id {
-                Some(_) => {
-                    let reg = self.stream_reg.borrow();
-                    let existing_map = reg.get_labelmap_by_stream(&stream_id).ok_or_else(|| {
-                        crate::Error::from("label state error: StreamRegistry.stream_by_labelmap contains stream_id but StreamRegistry.labelmap_by_stream doesnt")
-                    })?;
+                // not since using RwLock:
+                //
+                // drops the need for the borrow() to live while the later None
+                // branch calls borrow_mut()
+                let prev_stream_id =
+                    read_guard.get_stream_id_by_labelmap(&labelmap).copied();
 
-                    if existing_map.as_ref() != labelmap.as_ref() {
-                        return Err(crate::Error::from(
-                            "label state error: hash collision occured (likelyhood was 2^16/2^65 ~ 1,7×10^-15) and I'm lazy to resolve it",
-                        ));
+                // (stream_id, prev_stream_id)
+
+                match prev_stream_id {
+                    Some(_) => {
+                        let existing_map = read_guard
+                            .get_labelmap_by_stream_ref(&stream_id)
+                            .ok_or_else(|| {
+                                crate::Error::from(
+                                    "label state error: StreamRegistry.stream_by_labelmap \
+                                    contains stream_id but StreamRegistry.labelmap_by_stream doesnt")
+                            })?;
+
+                        if existing_map != labelmap.as_ref() {
+                            return Err(crate::Error::from(
+                                "label state error: hash collision occured \
+                                (likelyhood was 2^16/2^65 ~ 1,7×10^-15 and I'm lazy to resolve it)",
+                            ));
+                        }
                     }
-                }
-                None => {
-                    self.stream_reg
-                        .borrow_mut()
-                        .insert(stream_id, labelmap.clone());
-                    let stream_update = ManifestEntry::stream_update(stream_id, labelmap.clone())
-                        .expect("labelmap was invalid based on ManifestEntry::stream_update(_, _), but it came from LabelMapCodec::decode(_)");
-                    self.stream_buffer.push(stream_update);
-                }
-            }
+                    None => {
+                        drop(read_guard);
+                        self
+                            .stream_reg
+                            .write()
+                            .expect("failed to write-lock StreamRegistry in LsmTree::append_batch")
+                            .insert(stream_id, labelmap.clone());
+
+                        let stream_update = ManifestEntry::stream_update(stream_id, labelmap.clone())
+                            .expect("labelmap was invalid based on ManifestEntry::stream_update(_, _), but it came from LabelMapCodec::decode(_)");
+
+                        self.stream_buffer.push(stream_update);
+                    }
+                };
+
+                stream_id
+            };
 
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -295,7 +397,13 @@ where
         let start_t = start_t.unwrap_or(0);
         let end_t = end_t.unwrap_or(u64::MAX);
 
-        let stream_ids = self.stream_reg.borrow().label_intersection(labels);
+        let stream_ids = self
+            .stream_reg
+            .read()
+            .expect(
+                "failed to read-lock StreamRegistry in LsmTree::append_batch",
+            )
+            .label_intersection(labels);
 
         let merge_iters: Result<Vec<_>, sst::SstError> = stream_ids
             .into_iter()
@@ -405,8 +513,10 @@ where
         io_tx: mpsc::Sender<io::IoEvent<R>>,
     ) -> std::io::Result<Self> {
         let next_memtable_id = crate::counter::Counter::default();
-        let memtable =
-            MutMemtable::new(next_memtable_id.current(), memtable_limit);
+        let memtable = MutMemtable::with_size_limit(
+            next_memtable_id.current(),
+            memtable_limit,
+        );
         let stream_buffer = Vec::new();
         let frozen_memtables = VecDeque::new();
         let sst_handles = Vec::new();
@@ -417,7 +527,7 @@ where
             label_codec,
             _retention_days: retention_days,
         };
-        let stream_reg = Rc::new(RefCell::new(StreamRegistry::default()));
+        let stream_reg = Arc::new(RwLock::new(StreamRegistry::default()));
 
         Ok(Self {
             memtable,

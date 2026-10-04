@@ -4,7 +4,7 @@ use std::{
     io::{self, Seek},
     marker::PhantomData,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::Arc,
 };
 
 use crate::{
@@ -21,6 +21,7 @@ pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 pub const MANIFEST_SNAPSHOT_FILE_NAME: &str = "MANIFEST.snapshot";
 pub const MAINFEST_DEFAULT_MAX_FILE_SIZE: usize = 20 * 1028;
 
+// TODO: this doesnt seem like a usefeull super trait
 pub trait ManifestCodecExt<L>: SpecCodec<ManifestEntry> {}
 
 /// TODO: should the methods return io::Error or CodecError::Io(io::Error)
@@ -39,7 +40,7 @@ where
     C: ManifestCodecExt<L>,
     L: SpecCodec<LabelMap>,
 {
-    /// Tries to open and immedietly snapshot + truncate the manifest file at [basepath] + "/" + [MANIFEST_FILE_NAME].
+    /// Tries to open and immedietly snapshot + truncate the manifest file at `basepath/MANIFEST_FILE_NAME`
     #[instrument(ret, err)]
     pub fn open_snapshotted(
         basepath: &Path,
@@ -108,7 +109,7 @@ where
         // };
     }
 
-    /// Tries to open the manifest file at [basepath] + "/" + [MANIFEST_FILE_NAME].
+    /// Tries to open the manifest file at `basepath/MANIFEST_FILE_NAME`.
     pub fn open(
         basepath: &Path,
         codec: C,
@@ -214,7 +215,7 @@ pub enum SstState {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Snapshot {
     pub(crate) sstable_state: HashMap<u64, SstState>,
-    pub(crate) labelmaps: HashMap<u64, Rc<LabelMap>>,
+    pub(crate) labelmaps: HashMap<u64, Arc<LabelMap>>,
 }
 
 impl Snapshot {
@@ -326,7 +327,7 @@ pub enum ManifestEntry {
     Compaction(Vec<u64>),
     StreamUpdate {
         stream_id: u64,
-        labelmap: Rc<LabelMap>,
+        labelmap: Arc<LabelMap>,
     },
 }
 
@@ -377,7 +378,7 @@ impl ManifestEntry {
 
     pub fn stream_update(
         stream_id: u64,
-        labelmap: Rc<LabelMap>,
+        labelmap: Arc<LabelMap>,
     ) -> Option<Self> {
         if labelmap.len() > label::MAX_LABEL_COUNT {
             return None;
@@ -592,7 +593,7 @@ impl<L: SpecCodec<LabelMap>> SpecCodec<ManifestEntry> for ManifestCodec<L> {
                     // decode() already parses only valid labelmaps
                     ManifestEntry::StreamUpdate {
                         stream_id,
-                        labelmap: Rc::new(labelmap),
+                        labelmap: Arc::new(labelmap),
                     }
                 } else {
                     return Ok(None);
@@ -650,7 +651,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::StreamUpdate {
                         stream_id: 67,
                         labelmap,
@@ -683,7 +684,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::StreamUpdate {
                         stream_id: 67,
                         labelmap,
@@ -746,7 +747,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(67, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -772,7 +773,7 @@ mod test {
                     map.insert("foo".into(), "barbar".into());
                     map.insert("bar".into(), "bazbaz".into());
                     map.insert("baz".into(), "foofoo".into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(67, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -817,7 +818,7 @@ mod test {
                     map.insert("foo".into(), format!("{i}").into());
                     map.insert("bar".into(), format!("{i}").into());
                     map.insert("baz".into(), format!("{i}").into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -848,7 +849,7 @@ mod test {
                     map.insert("foo".into(), format!("{}", i + 1).into());
                     map.insert("bar".into(), format!("{}", i + 1).into());
                     map.insert("baz".into(), format!("{}", i + 1).into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),
@@ -885,7 +886,7 @@ mod test {
                     map.insert("foo".into(), format!("{}", i + 1).into());
                     map.insert("bar".into(), format!("{}", i + 1).into());
                     map.insert("baz".into(), format!("{}", i + 1).into());
-                    let labelmap = Rc::new(LabelMap::new(map));
+                    let labelmap = Arc::new(LabelMap::new(map));
                     ManifestEntry::stream_update(i, labelmap).unwrap()
                 }
                 _ => unreachable!(),

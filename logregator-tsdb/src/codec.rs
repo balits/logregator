@@ -231,6 +231,8 @@ pub struct FramedWriter<W: Write, C: SpecCodec<I>, I: WireLen> {
     buf: Vec<u8>,
     codec: C,
     bytes_written: usize,
+    // on_write: Option<fn(&I)>, instead of a field
+    // make a new write_with<F>() function with a callback
     _phantom: PhantomData<I>,
 }
 
@@ -240,6 +242,8 @@ where
     C: SpecCodec<I>,
     I: WireLen + std::fmt::Debug,
 {
+    /// Returns a FramedWriter with the given writer and codec,
+    /// but without an `on_write` hook, for such hook, see [with_write_hook]
     pub fn new(w: W, c: C) -> Self {
         Self {
             inner: BufWriter::new(w),
@@ -257,6 +261,7 @@ where
         self.bytes_written
     }
 
+    /// Writes [item] to the underlying (buffered) writer `W`.
     #[instrument(ret, err)]
     pub fn write(&mut self, item: &I) -> Result<(), CodecError> {
         self.buf.clear();
@@ -265,6 +270,26 @@ where
         let n = self.codec.encode(item, &mut self.buf)?;
         self.inner.write_all(&self.buf).map_err(CodecError::from)?;
         self.bytes_written += n;
+
+        Ok(())
+    }
+
+    /// Writes [item] to the underlying (buffered) writer `W`,
+    /// calling the hook `f` before actual writing happends.
+    #[instrument(skip(hook), ret, err)]
+    pub fn write_with<F>(&mut self, item: &I, hook: F) -> Result<(), CodecError>
+    where
+        F: FnOnce(&I, &[u8]),
+    {
+        self.buf.clear();
+        self.buf.resize(item.wire_len(), 0);
+        let n = self.codec.encode(item, &mut self.buf)?;
+
+        hook(item, &self.buf);
+
+        self.inner.write_all(&self.buf).map_err(CodecError::from)?;
+        self.bytes_written += n;
+
         Ok(())
     }
 
@@ -299,8 +324,8 @@ where
 mod test {
     use super::*;
     use crate::record::{
-        Key, Record, RecordCodec, KEY_SIZE, MAX_PAYLOAD_LENGTH,
-        MIN_PAYLOAD_LENGTH, PAYLOAD_LEN_SIZE,
+        KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH,
+        PAYLOAD_LEN_SIZE, Record, RecordCodec,
     };
     use proptest::prelude::*;
     use std::io::Cursor;

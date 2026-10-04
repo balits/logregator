@@ -1,9 +1,8 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use hashbrown::{Equivalent, HashMap, HashSet};
 use nom::IResult;
@@ -11,13 +10,13 @@ use nom::{bytes::complete::take, number::complete::be_u8};
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    self, CodecError, RecordCodecExt, SpecCodec, WireLen, SZ_U8,
+    self, CodecError, RecordCodecExt, SZ_U8, SpecCodec, WireLen,
 };
 use crate::merge_iter::MergeIter;
 use crate::record::Record;
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
-pub struct Label(pub Rc<str>, pub Rc<str>);
+pub struct Label(pub Arc<str>, pub Arc<str>);
 
 impl Equivalent<Label> for (&str, &str) {
     fn equivalent(&self, key: &Label) -> bool {
@@ -29,11 +28,11 @@ impl Equivalent<Label> for (&str, &str) {
 pub struct StreamRegistry {
     /// Source of truth, stores stream_id -> label_map.
     /// All other label related structs are derived from this one.
-    labelmap_by_stream: HashMap<u64, Rc<LabelMap>>,
+    labelmap_by_stream: HashMap<u64, Arc<LabelMap>>,
 
     /// used for writes, label_map -> stream_id,
     /// for quick hash checking
-    stream_by_labelmap: HashMap<Rc<LabelMap>, u64>,
+    stream_by_labelmap: HashMap<Arc<LabelMap>, u64>,
 
     /// used for reads: given a label, returns all
     /// stream_ids that has any of the given labels
@@ -44,8 +43,8 @@ pub struct StreamRegistry {
 /// Turns a stream -> labelmap mapping into a StreamRegistry
 /// by inserting items from that mapping into the secondary
 /// maps.
-impl From<HashMap<u64, Rc<LabelMap>>> for StreamRegistry {
-    fn from(labelmap_by_stream: HashMap<u64, Rc<LabelMap>>) -> Self {
+impl From<HashMap<u64, Arc<LabelMap>>> for StreamRegistry {
+    fn from(labelmap_by_stream: HashMap<u64, Arc<LabelMap>>) -> Self {
         let mut stream_by_labelmap = HashMap::new();
         let mut kv_index: HashMap<Label, HashSet<u64>> = HashMap::new();
 
@@ -77,7 +76,7 @@ impl From<HashMap<u64, Rc<LabelMap>>> for StreamRegistry {
 }
 
 impl StreamRegistry {
-    pub fn insert(&mut self, stream_id: u64, labelmap: Rc<LabelMap>) {
+    pub fn insert(&mut self, stream_id: u64, labelmap: Arc<LabelMap>) {
         self.labelmap_by_stream.insert(stream_id, labelmap.clone());
         self.stream_by_labelmap.insert(labelmap.clone(), stream_id);
 
@@ -105,17 +104,19 @@ impl StreamRegistry {
         self.stream_by_labelmap.get(labelmap)
     }
 
-    pub fn get_labelmap_by_stream(
+    pub fn get_labelmap_by_stream_ref(
         &self,
         stream_id: &u64,
-    ) -> Option<&Rc<LabelMap>> {
-        self.labelmap_by_stream.get(stream_id)
+    ) -> Option<&LabelMap> {
+        self.labelmap_by_stream
+            .get(stream_id)
+            .map(|map| map.as_ref())
     }
 
     pub fn get_labelmap_by_stream_cloned(
         &self,
         stream_id: &u64,
-    ) -> Option<Rc<LabelMap>> {
+    ) -> Option<Arc<LabelMap>> {
         self.labelmap_by_stream.get(stream_id).cloned()
     }
 
@@ -123,6 +124,8 @@ impl StreamRegistry {
         self.kv_index.get(&kv)
     }
 
+    /// Given a list of labels, returns the intersection of all
+    /// stream_ids that contain any subset of the given labels.
     pub fn label_intersection<I, S>(&self, labels: I) -> HashSet<u64>
     where
         I: Iterator<Item = (S, S)>,
@@ -155,14 +158,22 @@ impl StreamRegistry {
     }
 }
 
-/// stores labels -> stream_id
-/// Its a wrapper over HashMap<S, S> where s is currently a String
-/// but i might replace it with Rc<str> for cheap copies.
+/// A unique set/map of labels, usually asociated with only one `stream_id`
+///
+/// # TODO
+///
+/// replace `Map<Arc<str>, Arc<str>>` with `Set<Label>`, since
+/// `Label` is just `(Arc<str>, Arc<str>)`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LabelMap {
-    pub(crate) inner: BTreeMap<Rc<str>, Rc<str>>,
+    pub(crate) inner: BTreeMap<Arc<str>, Arc<str>>,
     pub(crate) fingerprint: u64,
 }
+
+// FIXME: if LabelMap only exposes &self through its methods
+// and theres no other way of mutating with its internal state,
+// this should be safe right?
+unsafe impl Send for LabelMap {}
 
 impl Hash for LabelMap {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -201,7 +212,7 @@ impl WireLen for LabelMap {
 }
 
 impl LabelMap {
-    pub fn iter(&self) -> impl Iterator<Item = (Rc<str>, Rc<str>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (Arc<str>, Arc<str>)> {
         self.inner.iter().map(|(k, v)| (k.clone(), v.clone()))
     }
 
@@ -210,7 +221,7 @@ impl LabelMap {
         self.inner.len()
     }
 
-    pub fn new(map: BTreeMap<Rc<str>, Rc<str>>) -> Self {
+    pub fn new(map: BTreeMap<Arc<str>, Arc<str>>) -> Self {
         let mut hasher = DefaultHasher::new();
 
         for (k, v) in &map {
@@ -267,14 +278,14 @@ fn parse_label_map(src: &[u8]) -> IResult<&[u8], LabelMap> {
     let label_count = label_count as usize;
     // trace!(label_count);
 
-    let mut map: BTreeMap<Rc<str>, Rc<str>> = BTreeMap::new();
+    let mut map = BTreeMap::new();
     for _ in 0..label_count {
         let (_input, k) = take_lp_str(remainder)?;
         remainder = _input;
         let (_input, v) = take_lp_str(remainder)?;
         remainder = _input;
         // trace!("inserting {k} => {v}");
-        map.insert(Rc::from(k), Rc::from(v));
+        map.insert(Arc::from(k), Arc::from(v));
     }
 
     let labelmap = LabelMap::new(map);
@@ -363,17 +374,28 @@ impl SpecCodec<LabelMap> for LabelMapCodec {
 #[derive(Debug)]
 pub struct LabeledIter<'l, C, M> {
     // this is not safe and also not Send or Sync...
-    stream_registry: Rc<RefCell<StreamRegistry>>,
+    //
+    // Well now it is, but we added the one thing i wanted
+    // to avoid in the whole lsm desing...
+    //
+    // ... a lock ...
+    stream_registry: Arc<RwLock<StreamRegistry>>,
     iters: M,
     current: Option<MergeIter<'l, 'l, C>>,
 }
+
+// FIXME
+//
+// this is probably unsafe, there is no guarding the merge iter(s)
+// or the labelmaps internal BTreeMaps, theres just a couply of Arcs
+unsafe impl<C: Send, M: Send> Send for LabeledIter<'_, C, M> {}
 
 impl<'l, C, M> LabeledIter<'l, C, M>
 where
     M: Iterator<Item = MergeIter<'l, 'l, C>> + Debug,
     C: Debug,
 {
-    pub fn new<I>(i: I, stream_registry: Rc<RefCell<StreamRegistry>>) -> Self
+    pub fn new<I>(i: I, stream_registry: Arc<RwLock<StreamRegistry>>) -> Self
     where
         I: IntoIterator<IntoIter = M>,
     {
@@ -392,7 +414,7 @@ where
     C: RecordCodecExt,
     M: Iterator<Item = MergeIter<'l, 'l, C>>,
 {
-    type Item = (Option<Rc<LabelMap>>, Cow<'l, Record>);
+    type Item = (Option<Arc<LabelMap>>, Cow<'l, Record>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current.is_none() {
@@ -403,9 +425,10 @@ where
         match self.current.as_mut() {
             Some(mr) => match mr.next() {
                 Some(rec) => {
-                    let labelmap: Option<Rc<LabelMap>> = self
+                    let labelmap = self
                         .stream_registry
-                        .borrow()
+                        .read()
+                        .expect("failed to read-lock StreamRegistry from LabeledIter")
                         .get_labelmap_by_stream_cloned(
                             &rec.as_ref().key.stream_id,
                         );
@@ -494,8 +517,9 @@ mod test {
     #[ignore = "testing differences between Rc::from and unsafe { Rc::from_raw(*str)}"]
     #[allow(unused)]
     fn test() {
+        use std::rc::Rc;
         let b = b"foo";
         let s = std::str::from_utf8(b).unwrap();
-        let _arc: Rc<str> = std::rc::Rc::from(s);
+        let _arc: Rc<str> = Rc::from(s);
     }
 }

@@ -112,7 +112,8 @@ mod test {
         // TODO: we could get this from the MANIFEST, by finding the sstable with the highest id and incrementing it
         // as no other memtable has been persisted to disk at that point
         let next_memtable_id = 0;
-        let memtable = MutMemtable::new(next_memtable_id, memtable_size_limit);
+        let memtable =
+            MutMemtable::with_size_limit(next_memtable_id, memtable_size_limit);
 
         info!("2) RECOVER manifest");
         let mut manifest = Manifest::open(

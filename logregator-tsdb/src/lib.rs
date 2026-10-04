@@ -27,9 +27,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// For more details, see [ErrorImpl]
 ///
-// TODO: when we see how frontends actualy consume errors from this crate,
-// maybe it will be time to revisit module level errors of how they wrap
-// std::io::Error into Arcs
+/// TODO: when we see how frontends actualy consume errors from this crate,
+/// maybe it will be time to revisit module level errors of how they wrap
+/// std::io::Error into Arcs
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct Error {

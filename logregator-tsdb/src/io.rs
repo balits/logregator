@@ -63,6 +63,8 @@ pub enum IoEvent<R> {
     FlushMemtable(FlushMemtablePayload<R>),
 }
 
+unsafe impl<R: Send> Send for IoEvent<R> {}
+
 #[derive(Debug)]
 pub struct FlushMemtablePayload<R> {
     pub memtable: FlushableMemtable,

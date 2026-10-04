@@ -5,31 +5,83 @@ use std::{fs::File, io};
 
 use tracing::instrument;
 
+use crate::codec;
 use crate::{
-    codec::{CodecError, FramedReader, FramedWriter, SpecCodec},
+    codec::{
+        CodecError, FramedReader, FramedWriter, RecordCodecExt, SpecCodec,
+    },
     record::Record,
 };
 
-pub const WAL_FILE_NAME: &str = "WAL";
+pub const WAL_FILENAME_FORMAT: &str = "{:010}.active.wal";
+pub const FROZEN_WAL_FILENAME_FORMAT: &str = "{:010}.frozen.wal";
 
 #[derive(Debug)]
-pub struct Wal<C: SpecCodec<Record>> {
+enum Crc32State {
+    Checksum(u32),
+    Hasher(crc32fast::Hasher),
+}
+
+impl Crc32State {
+    // ???
+    pub fn new_hasher() -> Self {
+        Self::Hasher(crc32fast::Hasher::new())
+    }
+}
+
+/// An append-only log file which corresponds to exactly one [Memtable].
+#[derive(Debug)]
+pub struct Wal<C: RecordCodecExt> {
+    /// The WAL data directory under which all active and frozen and WALs go.
     basepath: PathBuf,
+
+    /// Framed writer of records into the WAL
+    /// TODO: add a small wrapper `enum WalEntry { Record(Record), Checksum(..) }`
     framed: FramedWriter<File, C, Record>,
+
+    /// File handle to the WAL
     f: File,
+
+    /// ID which comes from the [Memtable] that produced
+    /// this WAL to be flushed. One [Memtable] always corresponds to one WAL
+    ///
+    /// - [Memtable](crate::memtable::MemtableInner)
+    id: u64,
+
+    /// codec that works on both [Record], [Key] and [WalEntry]
     codec: C,
+
+    /// The crc32 hasher state, either being an actual Hasher, or the finished
+    /// checksum. Reading the checksum from the [Wal] file is as easy as
+    /// reading the last 4 bytes
+    crc32_state: Crc32State,
+    // /// Optional hasher used to calculate the integrety of this Wal,
+    // /// through the [FramedWriter]'s `on_write` hook.
+    // ///
+    // /// # Invariant
+    // ///
+    // /// At any given time, only one of `running_checksum` and `finished_checksum`
+    // /// is set to `Some(_)`. The lifecyle of an acitve wal is that it starts with
+    // /// a `Some(_)` hasher, then once its filled up, hashers is finalized,
+    // /// and the result is set to `finished_checksum`, leaving `None` behind in the
+    // /// hasher.
+    // ///
+    // ///
+    // /// - [FramedWriter](crate::codec::FramedWriter)
+    // checksum_hasher: Option<crc32fast::Hasher>,
+
+    // /// finished checksum calculated with `checksum_hasher`.
+    // ///
+    // finished_checksum: Option<u32>,
 }
 
 pub fn format_wal_filename(basepath: &Path) -> PathBuf {
-    basepath.join(WAL_FILE_NAME)
+    basepath.join(WAL_FILENAME_FORMAT)
 }
 
-impl<C> Wal<C>
-where
-    C: SpecCodec<Record>,
-{
+impl<C: RecordCodecExt> Wal<C> {
     #[instrument(ret, err)]
-    pub fn open_latest(basepath: &Path, codec: C) -> crate::Result<Self> {
+    pub fn open_active(basepath: &Path, codec: C) -> crate::Result<Self> {
         // let wal_ext = OsString::from(WAL_FILE_EXT);
         // let mut active_wal: Option<(PathBuf, u64)> = None;
 
@@ -83,45 +135,107 @@ where
         //     }
         // }
 
+        todo!(
+            "uncomment the previous lines and use the following strategy: \
+            use the `.active.wal` and `.frozen.wal` extensions to find
+            the only active wal (error on multiple active wals), then
+            the following code should be fine, and the ID could be parsed from
+            the active filename.
+        "
+        );
+
         let f = open_read_append(format_wal_filename(basepath))?;
+        let id: u64 = todo!("parse active wal filename for ID");
+        let integrity: Crc32State =
+            todo!("replay records to rebuild the crc32 hashers state");
 
         let fw = FramedWriter::new(f.try_clone()?, codec.clone());
         let w = Self {
             basepath: basepath.to_path_buf(),
             framed: fw,
             f,
+            id,
+            crc32_state,
             codec,
         };
 
         Ok(w)
     }
 
+    #[deprecated(note = "use open_empty() or open_active()")]
     pub fn new(basepath: &Path, codec: C) -> io::Result<Self> {
+        panic!(
+            "new() is deprecated, as it has no idea about a memtable_id parameter"
+        );
+
         let f = open_read_append(format_wal_filename(basepath))?;
         let framed = FramedWriter::new(f.try_clone()?, codec.clone());
+
         Ok(Self {
             basepath: basepath.to_path_buf(),
             framed,
             f,
+            id: 0, // already panics, doesnt matter
+            crc32_state: Crc32State::Checksum(0), // already panics, doesnt matter
+            codec,
+        })
+    }
+
+    /// Opens a new empty but active wal file from the given `memtable_id`.
+    pub fn open_empty(
+        basepath: &Path,
+        memtable_id: u64,
+        codec: C,
+    ) -> io::Result<Self> {
+        let f = open_read_append(format_wal_filename(basepath))?;
+
+        let crc32_state = Crc32State::new_hasher();
+
+        let framed = FramedWriter::new(f.try_clone()?, codec.clone());
+
+        Ok(Self {
+            basepath: basepath.to_path_buf(),
+            framed,
+            f,
+            id: memtable_id,
+            crc32_state,
             codec,
         })
     }
 
     #[instrument(level = "trace", skip(self), ret, err)]
     pub fn append(&mut self, rec: &Record) -> Result<(), CodecError> {
-        self.framed.write(rec)?;
+        self.framed.write_with(rec, |_, record_bytes| {
+            if let Crc32State::Hasher(hasher) = &mut self.crc32_state {
+                hasher.update(record_bytes);
+            }
+        })?;
+
         Ok(())
     }
 
     #[instrument(level = "trace", skip(self))]
-    pub fn flush_inner(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         self.framed.flush()?;
+
+        todo!(
+            "move out of self.crc32_state somehow. \
+                (1) if its a hasher, finalize it and replace it with a Crc32State::Checksum \
+                (2) if its a checksum, just copy it back"
+        );
+
+        // let crc = &mut self.crc32_state;
+        // if let Crc32State::Hasher(hasher) = crc {
+        //     let checksum = hasher.finalize();
+        //     std::mem::replace(crc, Crc32State::Checksum(checksum));
+        // }
+
         Ok(())
     }
 
     #[instrument(ret, err)]
     pub fn fsyncdata(&mut self) -> io::Result<()> {
-        self.framed.flush()?;
+        self.flush()?;
         self.f.sync_data()?;
         Ok(())
     }
@@ -169,6 +283,26 @@ fn open_read_append(path: impl AsRef<Path>) -> io::Result<File> {
         .open(path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalEntry {
+    Record(Record),
+    Checksum(u32),
+}
+
+impl codec::WireLen for WalEntry {
+    fn wire_len(&self) -> usize {
+        1 + match self {
+            WalEntry::Record(r) => r.wire_len(),
+            WalEntry::Checksum(c) => size_of_val(c),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalEntryCodec<R: RecordCodecExt> {
+    record_codec: R,
+}
+
 #[cfg(test)]
 mod test {
 
@@ -196,7 +330,7 @@ mod test {
             };
             w.append(&rec).expect("wal append failed");
         }
-        w.flush_inner().expect("flush failed");
+        w.flush().expect("flush failed");
     }
 
     #[test]
@@ -218,7 +352,7 @@ mod test {
         for rec in &written {
             w.append(rec).expect("wal append failed");
         }
-        w.flush_inner().expect("fsync failed");
+        w.flush().expect("fsync failed");
         let wal_path = format_wal_filename(&w.basepath);
 
         let recovered: Vec<Record> = Wal::test_recover(&wal_path, codec)
@@ -271,7 +405,7 @@ mod test {
         for rec in &first_batch {
             w.append(rec).expect("append failed");
         }
-        w.flush_inner().expect("flush failed");
+        w.flush().expect("flush failed");
 
         let wal_file_path = format_wal_filename(&w.basepath);
         // Recover once: this seeks a shared fd back to 0 in the current
@@ -289,7 +423,7 @@ mod test {
         for rec in &second_batch {
             w.append(rec).expect("append failed");
         }
-        w.flush_inner().expect("flush failed");
+        w.flush().expect("flush failed");
 
         let recovered: Vec<Record> = Wal::test_recover(&wal_file_path, codec)
             .expect("recovery failed")

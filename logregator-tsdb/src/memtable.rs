@@ -1,12 +1,15 @@
 use std::{
-    collections::{btree_set::Range, BTreeSet},
+    collections::{BTreeSet, btree_set::Range},
     ops::{Bound, Deref, DerefMut},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use tracing::instrument;
 
 use crate::record::{Key, Record};
+
+/// 16 Mb, is this sane?
+pub const DEFAULT_MEMTABLE_SIZE: usize = 16 * 10 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppendOutput {
@@ -51,8 +54,18 @@ impl DerefMut for MutMemtable {
 }
 
 impl MutMemtable {
-    pub fn new(id: u64, limit: usize) -> Self {
-        Self(MemtableInner::new(id, limit))
+    #[deprecated(
+        note = "use new() with an optional size limit, which defaults to `DEFAULT_MEMTABLE_SIZE`"
+    )]
+    pub fn with_size_limit(id: u64, limit: usize) -> Self {
+        Self(MemtableInner::with_size_limit(id, limit))
+    }
+
+    pub fn new(id: u64, limit: Option<usize>) -> Self {
+        Self(MemtableInner::with_size_limit(
+            id,
+            limit.unwrap_or(DEFAULT_MEMTABLE_SIZE),
+        ))
     }
 }
 
@@ -113,16 +126,34 @@ impl FlushableMemtable {
 /// wrapper structs merely derefernece to this one.
 #[derive(Debug, Clone)]
 pub struct MemtableInner {
+    /// Unique ID of assigned to each memtable.
     id: u64,
+
+    /// Set of records ordered by [record.key](crate::record::Key).
     set: BTreeSet<Record>,
+
+    /// Soft limit on the inmemory size of the memtable in bytes.
+    ///
+    /// Given an empty memtable, the first record always gets inserted,
+    /// no matter if it makes the memtable exceed its limit.
+    ///
+    /// However, a memtable with already existing records (meaning a non-zero
+    /// `limit`) refuses to insert records that would make `size_bytes` exceed
+    /// `limit`
     limit: usize,
+
+    /// Current size of the memtable in bytes
     size_bytes: usize,
+
+    /// Optional first key found in this memtable.
     first_key: Option<Key>,
+
+    /// Optional last key found in this memtable.
     last_key: Option<Key>,
 }
 
 impl MemtableInner {
-    pub fn new(id: u64, limit: usize) -> Self {
+    pub fn with_size_limit(id: u64, limit: usize) -> Self {
         let set = BTreeSet::new();
         Self {
             id,
@@ -191,7 +222,8 @@ impl MemtableInner {
     }
 
     pub fn freeze(&mut self, new_id: u64) -> FrozenMemtable {
-        let inner = std::mem::replace(self, Self::new(new_id, self.limit));
+        let inner =
+            std::mem::replace(self, Self::with_size_limit(new_id, self.limit));
         FrozenMemtable(Arc::new(inner))
     }
 
@@ -266,7 +298,7 @@ mod test {
         let max_count = 4;
         let max_size = max_count * base.size_of();
 
-        let mut m = MutMemtable::new(1, max_size);
+        let mut m = MutMemtable::with_size_limit(1, max_size);
         for i in 0..(max_count - 1) {
             let k = Key::dummy(i as u64);
             let mut rec = Record {
