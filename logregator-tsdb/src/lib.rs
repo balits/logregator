@@ -9,6 +9,7 @@ pub mod label;
 pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
+mod positional_file;
 pub mod record;
 pub mod sst;
 pub mod wal;
@@ -63,6 +64,9 @@ pub enum ErrorImpl {
 
     #[error("lsm error (io-thread): {0}")]
     IoThreadError(#[from] io::IoError),
+
+    #[error("lsm error: {0}")]
+    WalError(#[from] wal::WalError),
 }
 
 // sadly i gotta do this manually ):
@@ -116,14 +120,20 @@ impl From<io::IoError> for Error {
     }
 }
 
+impl From<wal::WalError> for Error {
+    fn from(e: wal::WalError) -> Self {
+        ErrorImpl::from(e).into()
+    }
+}
+
 // these are some common errors that keep reoccuring,
 // so i just moved them the crate root
 
 #[derive(thiserror::Error, Debug, Clone)]
 #[error("checksum mismatch {original:#x} (stored) != {computed:#x} (computed)")]
 pub struct ChecksumMismatch {
-    original: u32,
-    computed: u32,
+    pub original: u32,
+    pub computed: u32,
 }
 
 /// small module for debugging informations

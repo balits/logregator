@@ -191,7 +191,8 @@ impl Key {
     }
 }
 
-/// More concretely, it implements both [SpecCodec<Record>] and [SpecCodec<Key>]
+/// Unified codec that works over both [Record] and [Key], implementing the
+/// [RecordCodecExt] extension trait.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordCodec;
 

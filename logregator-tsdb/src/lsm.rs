@@ -2,12 +2,12 @@ use std::{
     collections::VecDeque,
     ops::Bound,
     path::PathBuf,
-    sync::{Arc, RwLock, mpsc},
+    sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
     vec::IntoIter as VecIntoIter,
 };
 
-use tracing::{error, instrument};
+use tracing::{error, instrument, trace};
 
 // #[cfg(test)]
 // use crate::label;
@@ -17,11 +17,11 @@ use crate::{
     io,
     label::{self, LabelMap, LabeledIter, StreamRegistry},
     manifest::{self, Manifest, ManifestEntry},
-    memtable::{self, AppendOutput, FrozenMemtable, MutMemtable},
+    memtable::{AppendOutput, FrozenMemtable, MutMemtable},
     merge_iter::MergeIter,
     record::{self, Key, Record},
     sst::{self, SstHandle},
-    wal::Wal,
+    wal::ActiveWal,
 };
 
 #[derive(Debug)]
@@ -49,7 +49,7 @@ pub struct LsmTree<R: RecordCodecExt, L: SpecCodec<LabelMap>> {
     /// );
     stream_reg: Arc<RwLock<StreamRegistry>>,
 
-    io_tx: mpsc::Sender<io::IoEvent<R>>,
+    io_tx: flume::Sender<io::IoEvent<R>>,
 }
 
 pub struct LsmTreeOptions<R, L> {
@@ -63,9 +63,11 @@ pub struct LsmTreeOptions<R, L> {
     next_stream_id: u64,
     next_seq_num: u64,
     retention_days: Option<u32>,
-    io_tx: mpsc::Sender<io::IoEvent<R>>,
+    // io_tx: flume::Sender<io::IoEvent<R>>,
 }
 
+/// Used to group together related fields
+/// when recovering an existing lsm tree.
 #[allow(unused)]
 pub struct RecoverOptions<R, L, M> {
     pub basepath: PathBuf,
@@ -77,7 +79,7 @@ pub struct RecoverOptions<R, L, M> {
     pub next_seq_num: u64,
     pub retention_days: Option<u32>,
     pub max_manifest_file_size: Option<usize>,
-    pub max_memtable_size: Option<usize>,
+    pub memtable_limit: Option<usize>,
     // should be an extra field on `recover()`
     // io_tx: flume::Sender<io::IoEvent<R>>,
 }
@@ -103,22 +105,22 @@ pub fn recover_options_for_test(basepath: PathBuf) -> TestRecoverOptions {
         next_seq_num: 0,
         retention_days: None,
         max_manifest_file_size: None,
-        max_memtable_size: None,
+        memtable_limit: None,
     }
 }
 
 impl<R, L> LsmTree<R, L>
 where
-    R: RecordCodecExt,
-    L: SpecCodec<LabelMap>,
+    R: RecordCodecExt + 'static,
+    L: SpecCodec<LabelMap> + 'static,
 {
     #[instrument(skip_all, err)]
     #[allow(unused_variables)]
     pub fn recover<M: manifest::ManifestCodecExt<L>>(
         recover_opts: &RecoverOptions<R, L, M>,
         io_tx: flume::Sender<io::IoEvent<R>>,
-    ) -> crate::Result<Self> {
-        // again, most codecs are stateless ZST-s, so clone is a no-op
+    ) -> crate::Result<(Self, Manifest<M, L>, ActiveWal<R>)> {
+        use crate::wal::{IntegrityError, WalEntry, WalError};
 
         let manifest = Manifest::open_snapshotted(
             &recover_opts.basepath,
@@ -126,33 +128,157 @@ where
             recover_opts.max_manifest_file_size,
         )?;
 
-        let wal = Wal::recover(
-            &recover_opts.basepath,
-            recover_opts.record_codec.clone(),
-        )?;
-
-        // currently Wal looks like a single `basepath/WAL` file,
-        // rather than separate files per memtables flushed like `basepath/WAL_<memtable_id>`
         let next_memtable_id = 0;
 
-        let mut memtable =
-            MutMemtable::new(next_memtable_id, recover_opts.max_memtable_size);
-
-        for record in wal.as_reader()? {
-            let record = record?;
-            if let AppendOutput::Full(_) = memtable.append(record) {
-                todo!(
-                    "handle overflow of memtable (save frozen ones, return them or already enqueue them into the io channel?)"
+        let active_wal = match ActiveWal::open_active(
+            &recover_opts.basepath,
+            recover_opts.record_codec.clone(),
+        )? {
+            Some(w) => w,
+            None => {
+                let w = ActiveWal::create_active(
+                    &recover_opts.basepath,
+                    next_memtable_id,
+                    recover_opts.record_codec.clone(),
+                )?;
+                assert!(
+                    w.is_some(),
+                    "tsdb: attempted to create ActiveWal after opening one returned None, but create also returned None"
                 );
+                w.unwrap()
+            }
+        };
+
+        let mut lsm = {
+            let next_memtable_id = crate::counter::Counter::default();
+            let memtable = MutMemtable::new(
+                next_memtable_id.current(),
+                recover_opts.memtable_limit,
+            );
+            let stream_buffer = Vec::new();
+            let frozen_memtables = VecDeque::new();
+            let sst_handles = Vec::new();
+            let config = LsmConfig {
+                basepath: recover_opts.basepath.clone(),
+                record_codec: recover_opts.record_codec.clone(),
+                block_size_limit: recover_opts.block_size_limit,
+                label_codec: recover_opts.label_codec.clone(),
+                _retention_days: recover_opts.retention_days,
+            };
+            let stream_reg = Arc::new(RwLock::new(StreamRegistry::default()));
+
+            Self {
+                memtable,
+                frozen_memtables,
+                sst_handles,
+                stream_reg,
+                next_memtable_id,
+                next_stream_id: 0.into(),
+                next_seq_num: 0.into(),
+                config,
+                io_tx,
+                stream_buffer,
+            }
+        };
+
+        // open_active already check the active wals invariant (only checksum entry at the end)
+        // but this is just for peace of mind.
+        let mut checksum_found = false;
+        for e in active_wal.new_reader() {
+            let entry = e?;
+
+            match entry {
+                WalEntry::Record(rec) => {
+                    if checksum_found {
+                        return Err(WalError::Integrity(
+                            IntegrityError::MultipleChecksums,
+                        )
+                        .into());
+                    }
+
+                    if let AppendOutput::Full(partial_rec) =
+                        lsm.memtable.append(rec)
+                    {
+                        unimplemented!(
+                            "Recovering active wal resulted in memtable being filled up.\
+                            This could only happen in the memtable that produced the \
+                            last active wal had a size limit larger than the current memtables
+                            size limit.
+                            What to do: enqueue 1 memtable flush + reset the active wal? 
+                            "
+                        );
+                        // lsm.issue_flush()?;
+                    }
+                }
+                WalEntry::Checksum(c) => {
+                    if checksum_found {
+                        return Err(WalError::Integrity(
+                            IntegrityError::MultipleChecksums,
+                        )
+                        .into());
+                    }
+                    checksum_found = true
+                }
+            };
+        }
+
+        let sst_dir_path = lsm.config.basepath.join(sst::SST_DIR_NAME);
+
+        // its not developed yet, but sstables should live inside
+        // `<lsm_basepath>/SST_DIR_NAME/<current_days_directory>/`.
+        //
+        // This would make pruning old sstables super duper easy,
+        // as we would just delete folders that are older than today - retention days
+        for e in std::fs::read_dir(&sst_dir_path)? {
+            let day_dir = e?;
+            let meta = day_dir.metadata()?;
+            if meta.is_file() {
+                todo!(
+                    "immediate file found in sst direcotry, but it should contain only 'day' directories"
+                )
+            }
+
+            let path = day_dir.path();
+            let Some(day_fmt) =
+                &path.components().next_back().map(|c| c.as_os_str())
+            else {
+                todo!("handle wrongly formatted day_dir in sst_dir");
+            };
+
+            if !sst::valid_daydir_path(day_fmt) {
+                todo!(
+                    "invalid daydir path found in sst directory. Log/delete + continue OR return with error?"
+                )
+            }
+
+            for e in std::fs::read_dir(&path)? {
+                let sst_entry = e?;
+                let meta = sst_entry.metadata()?;
+                if meta.is_dir() {
+                    todo!(
+                        "directory found in sst_dir/<day_dir>/, but it should only contain sstable files \
+                        should we log/delete + continue OR return with error?
+                        "
+                    )
+                }
+                let path = sst_entry.path();
+
+                let handle = sst::SstHandle::open_path(
+                    path,
+                    lsm.config.record_codec.clone(),
+                )?;
+
+                lsm.sst_handles.push(handle)
             }
         }
 
-        unimplemented!(
-            "create a new LsmTree by recovering possibly existing files"
-        )
+        Ok((lsm, manifest, active_wal))
     }
 
-    pub fn new(opts: LsmTreeOptions<R, L>) -> Self {
+    pub fn new(
+        opts: LsmTreeOptions<R, L>,
+        io_tx: flume::Sender<io::IoEvent<R>>,
+    ) -> Self {
         let next_memtable_id = opts.memtable.id() + 1;
         let frozen_memtables = VecDeque::new();
         let stream_buffer = Vec::new();
@@ -174,7 +300,7 @@ where
             next_stream_id: opts.next_stream_id.into(),
             next_seq_num: opts.next_seq_num.into(),
             config,
-            io_tx: opts.io_tx,
+            io_tx,
             stream_buffer,
         }
     }
@@ -193,7 +319,7 @@ where
         next_stream_id: u64,
         next_seq_num: u64,
         retention_days: Option<u32>,
-        io_tx: mpsc::Sender<io::IoEvent<R>>,
+        io_tx: flume::Sender<io::IoEvent<R>>,
     ) -> Self {
         let next_memtable_id = memtable.id() + 1;
         let frozen_memtables = VecDeque::new();
@@ -441,26 +567,34 @@ where
         &self.sst_handles
     }
 
-    /// NOTE: one call to to the io task's flush_memtables
+    /// Drains newly created [SstHandle]s from the
+    /// channel handle, and removes the corresponding
+    /// [FrozenMemtable] from the inner queue. Since
+    /// [issue_flush] enqueues + sends the frozen memtables
+    /// in the same order, this ensures that no frozen
+    /// memtables are gonna be left dangling in the queue.
+    ///
+    /// # NOTE
+    /// one call to to the io task's flush_memtables
     /// should correspond to exactly one call to drain_sst_queue]
     pub fn drain_sst_queue(
         &mut self,
-        flush_results: &mpsc::Receiver<sst::SstHandle<R>>,
+        flush_results: &flume::Receiver<sst::SstHandle<R>>,
     ) {
-        error!("\t=> lsm.drain_sst_queue() called");
+        trace!("lsm.drain_sst_queue() called");
         for sst in flush_results.try_iter() {
             error!("draining sst {}", sst.id());
             if let Some(frozen) = self.frozen_memtables.front()
                 && frozen.id() == sst.id()
             {
-                error!("\t=> popping sst {}", sst.id());
+                trace!("popping sst {}", sst.id());
                 self.frozen_memtables.pop_front();
             }
 
             self.sst_handles.push(sst);
         }
 
-        error!(still_frozen = ?self.frozen_memtables);
+        trace!(still_frozen = ?self.frozen_memtables);
     }
 
     pub fn active_memtable(&self) -> &MutMemtable {
@@ -477,6 +611,12 @@ where
             .fold(self.memtable.size_bytes(), |acc, f| acc + f.size_bytes())
     }
 
+    /// Freezes and replaces the current memtable, and sends
+    /// a [FlushMemtable] message through the IO channel (which should
+    /// be consumed and the memtable should be flushed and
+    /// turned into an SSTable).
+    ///
+    /// - [FlushMemtable](crate::io::IoEvent::FlushMemtable)
     fn issue_flush(&mut self) -> crate::Result<()> {
         let frozen = self.memtable.freeze(self.next_memtable_id.inc_and_get());
         self.frozen_memtables.push_back(frozen.clone());
@@ -510,13 +650,11 @@ where
         label_codec: L,
         block_size_limit: Option<usize>,
         retention_days: Option<u32>,
-        io_tx: mpsc::Sender<io::IoEvent<R>>,
+        io_tx: flume::Sender<io::IoEvent<R>>,
     ) -> std::io::Result<Self> {
         let next_memtable_id = crate::counter::Counter::default();
-        let memtable = MutMemtable::with_size_limit(
-            next_memtable_id.current(),
-            memtable_limit,
-        );
+        let memtable =
+            MutMemtable::new(next_memtable_id.current(), Some(memtable_limit));
         let stream_buffer = Vec::new();
         let frozen_memtables = VecDeque::new();
         let sst_handles = Vec::new();
@@ -546,14 +684,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{collections::BTreeMap, sync::mpsc};
+    use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
 
     use crate::{
         codec::{SpecCodec, WireLen},
-        label::{LabelMap, LabelMapCodec},
+        label::{LabelMap, LabelMapCodec, StreamRegistry},
         lsm::LsmTree,
+        manifest,
+        memtable::MutMemtable,
         record::{KEY_SIZE, RecordCodec},
     };
 
@@ -605,7 +745,7 @@ mod test {
         let memtable_limit = max_count * record_size_of;
         let record_codec = RecordCodec;
 
-        let (io_tx, _io_rx) = mpsc::channel();
+        let (io_tx, _io_rx) = flume::unbounded();
         let mut lsm = LsmTree::new_test(
             tmpdir.path().to_path_buf(),
             memtable_limit,
@@ -699,7 +839,7 @@ mod test {
             KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
         let memtable_limit = max_count * record_size_of;
         let record_codec = RecordCodec;
-        let (io_tx, _io_rx) = mpsc::channel();
+        let (io_tx, _io_rx) = flume::unbounded();
         let mut lsm = LsmTree::new_test(
             tmpdir.path().to_path_buf(),
             memtable_limit,
@@ -735,5 +875,79 @@ mod test {
             n, rec_count,
             "expected merge iterator (only memtables) to have all records inserted to lsm"
         )
+    }
+
+    #[test]
+    fn recover() {
+        tracing();
+        let tmpdir = tempfile::TempDir::new().expect("tempdir");
+        let label_codec = LabelMapCodec;
+        let manifest_codec = manifest::ManifestCodec::new(label_codec.clone());
+        let record_codec = RecordCodec;
+
+        let (payload_with_labelmap, payload_no_labelmap, _labelmap) =
+            data(label_codec);
+        let max_count = 4;
+        let record_size_of =
+            KEY_SIZE + size_of::<Box<[u8]>>() + payload_no_labelmap.len();
+        // let record_wire_len = KEY_SIZE + SZ_U32 + payload_no_labelmap.len();
+        let memtable_limit = Some(max_count * record_size_of);
+        let block_size_limit = None;
+
+        let records_per_memtable =
+            memtable_limit.map(|l| l.div_ceil(record_size_of)).unwrap();
+
+        let recover_opts = super::RecoverOptions {
+            basepath: tmpdir.path().to_path_buf(),
+            record_codec: record_codec.clone(),
+            label_codec: label_codec.clone(),
+            manifest_codec: manifest_codec.clone(),
+            block_size_limit,
+            next_stream_id: 0, // not important here
+            next_seq_num: 0,   // not imoprtant here
+            retention_days: None,
+            max_manifest_file_size: None,
+            memtable_limit,
+        };
+
+        let new_opts = super::LsmTreeOptions {
+            basepath: tmpdir.path().to_path_buf(),
+            record_codec: record_codec.clone(),
+            label_codec: label_codec.clone(),
+            block_size_limit,
+            memtable: MutMemtable::new(1, memtable_limit),
+            sst_handles: vec![],
+            stream_reg: StreamRegistry::default(),
+            next_stream_id: 0,
+            next_seq_num: 0,
+            retention_days: None,
+        };
+
+        let (io_tx, _io_rx) = flume::unbounded();
+        {
+            let mut lsm = LsmTree::new(new_opts, io_tx.clone());
+
+            let mut computed_sz = 0;
+            let record_count = max_count;
+            for i in 0..record_count {
+                lsm.append_single(&payload_with_labelmap, i as u64)
+                    .expect("lsm::append");
+                computed_sz += record_size_of;
+            }
+
+            assert_eq!(lsm.active_memtable().size_bytes(), 0);
+            assert_eq!(lsm.all_memtable_size_bytes(), computed_sz);
+
+            for i in 0..max_count * 2 {
+                lsm.append_single(&payload_with_labelmap, i as u64)
+                    .expect("lsm::append");
+                computed_sz += record_size_of;
+            }
+
+            assert_eq!(lsm.all_memtable_size_bytes(), computed_sz);
+        }
+
+        let (lsm, _, _) = LsmTree::recover(&recover_opts, io_tx.clone())
+            .expect("lsm::recover");
     }
 }

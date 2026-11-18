@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
 };
 
-use tracing::{instrument, span, trace, Level};
+use tracing::{Level, instrument, span, trace};
 
 use crate::{
     block::{
@@ -16,7 +16,7 @@ use crate::{
     },
     bloom::{self, BloomFilter, BloomFilterCodec},
     codec::{self, CodecError, RecordCodecExt, SpecCodec, WireLen},
-    record::{Key, Record, KEY_SIZE},
+    record::{KEY_SIZE, Key, Record},
 };
 
 /// we can tweak this, but it cannot exceed u32::MAX,
@@ -28,8 +28,26 @@ pub const MAX_SST_SIZE: usize = (u32::MAX / 2) as usize; // 2GB
 pub const SST_FOOTER_SIZE: usize = size_of::<u32>() * 3;
 pub const MIN_SST_SIZE: usize = SST_FOOTER_SIZE;
 
+/// used as `<lsm_basepath>/SST_DIR_NAME`
+pub const SST_DIR_NAME: &str = "sst";
+pub const SST_EXT: &str = "sst";
+
 pub fn format_sst_filename(id: u64) -> String {
-    format!("{id:020}.sst")
+    format!("{id:020}.{SST_EXT}")
+}
+
+/// Formats today to as its expected in the sst directory.
+///
+/// (Year-month-day format (ISO 8601). Same as %Y-%m-%d.
+/// src: https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
+pub fn format_today_dir_path() -> String {
+    chrono::Utc::now().format("%F").to_string()
+}
+
+pub fn valid_daydir_path(_: &std::ffi::OsStr) -> bool {
+    todo!(
+        "do some research on str -> formatted day | formatted day -> Option<str>"
+    )
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -58,7 +76,9 @@ pub enum SstError {
     )]
     SstFilledUp,
 
-    #[error("sst error: invalid SSTable size: min = {min}, max = {max}, got = {got}")]
+    #[error(
+        "sst error: invalid SSTable size: min = {min}, max = {max}, got = {got}"
+    )]
     InvalidSstSize { min: usize, max: usize, got: u64 },
 
     #[error(
@@ -713,11 +733,11 @@ where
         match bounds.0.as_ref() {
             Bound::Included(k) => {
                 trace!("block_cursor > seeking to key");
-                cursor.seek(&k);
+                cursor.seek(k);
             }
             Bound::Excluded(k) => {
                 trace!("block_cursor > seeking to past the key (once)");
-                cursor.seek(&k);
+                cursor.seek(k);
                 if Some(k) == cursor.current_record().map(|r| &r.key) {
                     cursor.next();
                 }
@@ -840,11 +860,15 @@ where
             match c.current() {
                 Ok(Some(rec)) => {
                     if !c.is_error() {
-                        trace!("after advance: inner cursor no longer yields records");
+                        trace!(
+                            "after advance: inner cursor no longer yields records"
+                        );
                         return;
                     }
 
-                    todo!("if not self.is_error() then update block_idx and update_current");
+                    todo!(
+                        "if not self.is_error() then update block_idx and update_current"
+                    );
 
                     if !self.is_error() {
                         trace!(
@@ -856,7 +880,9 @@ where
                     trace!("next record is {rec:?}")
                 }
                 Ok(None) => {
-                    trace!("after advance: block_cursor.current() returned Ok(None), not enough bytes to decode a Record")
+                    trace!(
+                        "after advance: block_cursor.current() returned Ok(None), not enough bytes to decode a Record"
+                    )
                 }
                 Err(_) => todo!(),
             };
@@ -899,7 +925,9 @@ where
                 todo!("cursor::_next -> match current -> Ok(Some(ref record))")
             }
             Ok(None) => {
-                trace!("after advance: block_cursor.current() returned Ok(None), not enough bytes to decode a Record")
+                trace!(
+                    "after advance: block_cursor.current() returned Ok(None), not enough bytes to decode a Record"
+                )
             }
             Err(e) => {}
         }

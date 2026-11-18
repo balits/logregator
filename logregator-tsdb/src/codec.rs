@@ -186,6 +186,7 @@ where
 {
     type Item = Result<I, CodecError>;
 
+    #[instrument(name = "framed_reader_next")]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.codec.decode(&self.buf[self.start..self.end]) {
@@ -212,16 +213,16 @@ where
 
 impl<R, C, I> Debug for FramedReader<R, C, I>
 where
-    R: io::Read + Debug,
-    C: SpecCodec<I> + Debug,
+    R: io::Read,
+    C: SpecCodec<I>,
     I: WireLen,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FramedReader<R, C>")
-            .field("buf", &format_args!("[0..{}]", self.buf.len()))
-            .field("start", &self.start)
-            .field("end", &self.end)
-            .field("codec", &self.codec)
+        f.debug_struct("FramedReader")
+            // .field("buf", &format_args!("[0..{}]", self.buf.len()))
+            // .field("start", &self.start)
+            // .field("end", &self.end)
+            // .field("codec", &self.codec)
             .finish_non_exhaustive()
     }
 }

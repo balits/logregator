@@ -48,6 +48,9 @@ use crate::{
     record::Record,
 };
 
+/// used as `<lsm_basepath>/WAL_DIR_NAME`
+pub const WAL_DIR_NAME: &str = "wal";
+
 /// File extension to be used for active WAL file names.
 const ACTIVE_EXT: &str = "active";
 
@@ -196,10 +199,9 @@ impl<R: RecordCodecExt> ActiveWal<R> {
     /// returning a [FrozenWal], if the Wal wasnt flushed already (indicated
     /// by the checksum state still not being `Finalized`).
     ///
-    /// If by some secret scary way an active states inner state is altered,
-    /// for example with unsafe raw ptr magic, then calling flush might not
-    /// actually result in the file flushed and `fsyncdata`-d.
-    pub fn flush(self) -> crate::Result<Option<FrozenWal<R>>> {
+    /// If the checksum state was finalized, a [WalError::ChecksumFinalizedBeforeFlush]
+    /// is returned
+    pub fn flush(self) -> crate::Result<FrozenWal<R>> {
         let Self { mut inner, mut fw } = self;
 
         // # SAFETY
@@ -237,9 +239,9 @@ impl<R: RecordCodecExt> ActiveWal<R> {
                 std::fs::rename(old_active_name, new_frozen_name)?;
                 inner.file.sync_data()?;
 
-                Ok(Some(FrozenWal { inner }))
+                Ok(FrozenWal { inner })
             }
-            None => Ok(None),
+            None => Err(WalError::ChecksumFinalizedBeforeFlush.into()),
         }
     }
 
@@ -797,6 +799,11 @@ pub enum WalError {
 
     #[error("wal error: invalid frozen wal state, cause = {cause:?}")]
     InvalidFrozenState { cause: Option<String> },
+
+    #[error(
+        "wal error: flush failed as the checksum_state was already finalized"
+    )]
+    ChecksumFinalizedBeforeFlush,
 }
 
 /// Error for checking the integrity of a Wal, currently it has 3 variants,
@@ -806,27 +813,27 @@ pub enum WalError {
 #[derive(Debug, thiserror::Error)]
 pub enum IntegrityError {
     /// Stored checksum did not match replayed checksum
-    #[error("wal integrity error: {0}")]
+    #[error("integrity error: {0}")]
     ChecksumMismatch(#[from] crate::ChecksumMismatch),
 
     /// Multiple checksums where found, but a valid
     /// Wal only has one checksum entry (at the end of the file)
     #[error(
-        "wal integrity error: multiple checksums found \
+        "integrity error: multiple checksums found \
         (only 1 could be set at the end of a frozen wal, and none in an active wal)"
     )]
     MultipleChecksums,
 
     /// Checksum was found at an invalid (non-trailing) position
     #[error(
-        "wal integrity error: checksum found somewhere other then the files end"
+        "integrity error: checksum found somewhere other then the files end"
     )]
     InvalidChecksumPosition,
 
     /// Checksum not found entirely, this is only an error for a frozen Wal,
     /// as active Wals can continue appends, up until it needs to be flushed,
     /// when the checksum should be appended last
-    #[error("wal integrity error: checksum not found")]
+    #[error("integrity error: checksum not found")]
     ChecksumNotFound,
 }
 
@@ -1045,7 +1052,7 @@ mod test {
         for r in &records {
             w.append(r).expect("wal append failed");
         }
-        let frozen = w.flush().expect("flush -> Err").expect("flush -> None");
+        let frozen = w.flush().expect("flush -> Err");
 
         let mut frozen_entries = vec![];
         let mut checksum_found = false;
@@ -1125,7 +1132,7 @@ mod test {
         for r in &records {
             w.append(r).expect("wal append failed");
         }
-        let frozen = w.flush().expect("flush -> Err").expect("flush -> None");
+        let frozen = w.flush().expect("flush -> Err");
 
         let mut frozen_entries = vec![];
         for e in frozen.new_reader().enumerate() {
