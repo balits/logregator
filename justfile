@@ -15,9 +15,8 @@ test_all: tsdb::test
 
 
 lint_all: tsdb::lint
-    @echo "JUST RECIPE SHOULD BE REPLACED \\
-    WITH cargo clippy --workspace, once other crates are pruned"
-    # cargo clippy --workspace --all-targets --all-features -- -D warnings
+    @echo "JUST RECIPE SHOULD BE REPLACED WITH cargo clippy  once other crates are pruned"
+    # CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 fmt_check_all:
     cargo fmt --check

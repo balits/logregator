@@ -23,12 +23,13 @@ Issue: **#6** · branch: `ci/tsdb-tests` · base: `main`
 - [x] Add `.github/workflows/tsdb.yml`: `cargo fmt --all --check`, `cargo test -p logregator-tsdb`, `cargo check -p logregator-tsdb --all-targets`.
 - [x] Add `.github/PULL_REQUEST_TEMPLATE.md`.
 - [x] Enable branch protection on `main`: require PR + green checks.
-- [ ] Exit: all later PRs target `main`.
+- [x] Exit: all later PRs target `main`.
 
 ## PR 1 — SST write / reopen roundtrip
 
 Issue: **#7**, also closes **#3** · branch: `fix/tsdb-sst-roundtrip`
 
+- [x] Deny warnings using clippy in CI.
 - [ ] Bloom encode: slice each field into its own destination range, use `dst[20..20 + item.bitmap.len()]` (safe for oversized `dst`), add a byte-exact test. The fix is already in the working tree — commit it.
 - [ ] Bloom wire doc says `bitmap_len: u64` but encodes `u32` (`bloom.rs:113-116`) — already fixed in working tree.
 - [ ] Guard `BloomFilter::new(0, _)` division by zero (`bloom.rs:39-48,78`, assert already in working tree) and validate decoded `n_bits`/`n_hashes` against bitmap length (`bloom.rs:141-165`).

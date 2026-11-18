@@ -468,7 +468,6 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
- "zerocopy",
 ]
 
 [[package]]
