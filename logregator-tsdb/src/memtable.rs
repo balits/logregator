@@ -298,7 +298,7 @@ mod test {
         let max_count = 4;
         let max_size = max_count * base.size_of();
 
-        let mut m = MutMemtable::with_size_limit(1, max_size);
+        let mut m = MutMemtable::new(1, Some(max_size));
         for i in 0..(max_count - 1) {
             let k = Key::dummy(i as u64);
             let mut rec = Record {

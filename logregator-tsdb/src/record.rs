@@ -299,10 +299,15 @@ impl SpecCodec<Record> for RecordCodec {
             return Ok(None);
         }
 
-        let payload =
-            Arc::clone_from_ref(&src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]);
+        let payload = Box::from(&src[KEY_SIZE + PAYLOAD_LEN_SIZE..total]);
 
-        Ok(Some((Record { key, payload }, total)))
+        Ok(Some((
+            Record {
+                key,
+                payload: Arc::from(payload),
+            },
+            total,
+        )))
     }
 }
 

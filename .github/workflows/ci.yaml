@@ -1,0 +1,46 @@
+name: Workspace CI/CD pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test suite ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+        toolchain: [stable]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-${{ matrix.os }}-${{ matrix.toolchain }}"
+
+      - uses: extractions/setup-just@v4
+
+      - name: Check formatting
+        run: just fmt_check_all
+
+      - name: Run tests
+        run: just test_all
+
+      - name: Lint with clippy
+        run: just lint_all
+          

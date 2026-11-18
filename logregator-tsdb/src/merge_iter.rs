@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::{btree_set::Range, BinaryHeap, VecDeque},
+    collections::{BinaryHeap, VecDeque, btree_set::Range},
     ops::Bound,
 };
 
@@ -44,9 +44,11 @@ where
         let mut cursors = Vec::with_capacity(handles.len());
 
         for h in handles {
-            if let Bound::Included(k) | Bound::Excluded(k) = start_bound.as_ref()
-                && !h.may_contain_stream_id(k.stream_id) {
-                continue
+            if let Bound::Included(k) | Bound::Excluded(k) =
+                start_bound.as_ref()
+                && !h.may_contain_stream_id(k.stream_id)
+            {
+                continue;
             }
 
             // ugh "hidden" cloning of keys again...

@@ -8,7 +8,8 @@ use crate::codec::{self, SpecCodec, WireLen};
 
 /// this should not be a problem, as sst::MAX_SST_SIZE is already u32::MAX too
 const MAX_BITMAP_SIZE: usize = u32::MAX as usize;
-const NUM_CONV_ERR: &str = "BloomFilter: failed to convert between u64 and usize";
+const NUM_CONV_ERR: &str =
+    "BloomFilter: failed to convert between u64 and usize";
 
 /// this is used to do double hashing with a fixed polynomial, or something
 fn hash_with_salt(data: &[u8], salt: &[u8]) -> u64 {
@@ -75,10 +76,9 @@ impl BloomFilter {
         let h2 = hash_with_salt(&bytes, Self::SALT2);
 
         (0..self.n_hashes)
-            .map(|i| h1.wrapping_add(i.wrapping_mul(h2))  % self.n_bits)
+            .map(|i| h1.wrapping_add(i.wrapping_mul(h2)) % self.n_bits)
             .collect()
     }
-
 
     //-------------------------------------------------
     // So i know i have SpecCodec<I> everywhere
@@ -88,10 +88,12 @@ impl BloomFilter {
     // filters wire representation is not gonna change.
     //-------------------------------------------------
 
-
     /// Allocates a new intermediary buffer, encodes `self` into it
     /// using `BloomFilterCodec` and writes the buffers content to `w`.
-    pub fn encode(&self, mut w: impl std::io::Write) -> Result<(), codec::CodecError> {
+    pub fn encode(
+        &self,
+        mut w: impl std::io::Write,
+    ) -> Result<(), codec::CodecError> {
         let codec = BloomFilterCodec;
         let mut buf = vec![0; self.wire_len()];
         codec.encode(self, &mut buf)?;
@@ -103,10 +105,10 @@ impl BloomFilter {
 impl WireLen for BloomFilter {
     #[inline]
     fn wire_len(&self) -> usize {
-        size_of_val(&self.n_bits) +
-        size_of_val(&self.n_hashes) + 
-        size_of::<u32>() + // len prefix 
-        self.bitmap.len()
+        size_of_val(&self.n_bits)
+            + size_of_val(&self.n_hashes)
+            + size_of::<u32>()
+            + self.bitmap.len()
     }
 }
 
@@ -116,7 +118,6 @@ impl WireLen for BloomFilter {
 /// ```
 #[derive(Debug, Clone)]
 pub struct BloomFilterCodec;
-
 
 impl SpecCodec<BloomFilter> for BloomFilterCodec {
     fn encode(
@@ -130,7 +131,11 @@ impl SpecCodec<BloomFilter> for BloomFilterCodec {
         dst.copy_from_slice(&(item.n_bits.to_be_bytes()));
         dst.copy_from_slice(&(item.n_hashes.to_be_bytes()));
         if item.bitmap.len() > MAX_BITMAP_SIZE {
-            return Err(codec::invalid_payload_sz(item.bitmap.len(), MAX_BITMAP_SIZE, 0));            
+            return Err(codec::invalid_payload_sz(
+                item.bitmap.len(),
+                MAX_BITMAP_SIZE,
+                0,
+            ));
         }
         dst.copy_from_slice(&((item.bitmap.len() as u32).to_be_bytes()));
         dst.copy_from_slice(&item.bitmap);
@@ -143,24 +148,27 @@ impl SpecCodec<BloomFilter> for BloomFilterCodec {
         src: &[u8],
     ) -> Result<Option<(BloomFilter, usize)>, crate::codec::CodecError> {
         fn nom_decode(input: &[u8]) -> nom::IResult<&[u8], BloomFilter> {
-            let (input, n_bits) = nom::number::complete::be_u64(input)?; 
-            let (input, n_hashes) = nom::number::complete::be_u64(input)?; 
+            let (input, n_bits) = nom::number::complete::be_u64(input)?;
+            let (input, n_hashes) = nom::number::complete::be_u64(input)?;
 
-            let (input, bitmap_len) = nom::number::complete::be_u32(input)?; 
-            let (input, bitmap) = nom::bytes::complete::take(bitmap_len)(input)?;
+            let (input, bitmap_len) = nom::number::complete::be_u32(input)?;
+            let (input, bitmap) =
+                nom::bytes::complete::take(bitmap_len)(input)?;
 
             let bloom = BloomFilter {
                 n_bits,
                 n_hashes,
-                bitmap: bitmap.to_vec()
+                bitmap: bitmap.to_vec(),
             };
 
             Ok((input, bloom))
         }
 
-        let (remaining, bloom) = nom_decode(src).map_err(|e|
-            codec::other(format!("nom parsing error: failed to decode bloom filter: {e}"))
-        )?;
+        let (remaining, bloom) = nom_decode(src).map_err(|e| {
+            codec::other(format!(
+                "nom parsing error: failed to decode bloom filter: {e}"
+            ))
+        })?;
         let read = src.len() - remaining.len();
         Ok(Some((bloom, read)))
     }

@@ -13,7 +13,9 @@
 //!   seeks the original file held by the Wal, making subsequent writes result
 //!   in a corrupted state on disk.
 //!
-//! ```rust
+//! Illustration only (pseudo-code; not valid Rust). Tracked in
+//! https://github.com/balits/logregator/issues/11
+//! ```ignore
 //! # fn main() {
 //! // => this works <=
 //!
@@ -30,7 +32,7 @@
 //!
 //! let formatted_path_bad = format!(format_str, id, foo_ext, bar_ext);
 //!
-//! //! #}
+//! #}
 //! ```
 
 use std::fmt::Debug;

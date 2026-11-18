@@ -136,3 +136,8 @@ cargo xtask bench
 
 Criterion microbenchmarks for the storage engine and codec are in `logregator-core/benches/`,
 and in `logregator-tsdb/benches` (WIP).
+
+## JUSTFILES
+I used the just command line runner for aliasing and composing frequently used commands.
+Each subcrate should have their own `justfile`, which should then be included into the root `justfile` as a module.
+Then subcrate-specific commands could be called by prefixing them with the module name, for example like `just tsdb::run_cool_command`.
