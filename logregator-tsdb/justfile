@@ -1,0 +1,21 @@
+default: fmt test check 
+
+# format everything!!!
+[group("tsdb")]
+fmt:
+	cargo fmt -p logregator-tsdb
+
+# run all tests
+[group("tsdb")]
+test:
+	cargo test -p logregator-tsdb
+
+# check the crate for all targets
+[group("tsdb")]
+check:
+	cargo check -p logregator-tsdb --all-targets
+
+# clip the clippy (= lint)
+[group("tsdb")]
+lint:
+	cargo clippy -p logregator-tsdb --all-targets --all-features -- -D warnings

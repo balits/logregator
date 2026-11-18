@@ -9,9 +9,9 @@ use tracing::{instrument, trace};
 use std::fmt::Debug;
 
 use crate::{
-    codec::{InvalidSize, SpecCodec, WireLen, SZ_U16, SZ_U32},
-    record::{MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH},
     ChecksumMismatch,
+    codec::{InvalidSize, SZ_U16, SZ_U32, SpecCodec, WireLen},
+    record::{MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH},
 };
 
 /// couple times larger than 4KB page cache
@@ -78,9 +78,7 @@ impl Block {
             data_len + self.offset_segment_len() + num_of_records_size;
         trace!(
             total_size,
-            data_len,
-            offset_segment_len,
-            num_of_records_size
+            data_len, offset_segment_len, num_of_records_size
         );
 
         if total_size > MAX_BLOCK_SIZE {
@@ -402,7 +400,7 @@ use std::rc::Rc;
 
 use crate::{
     codec::{self, CodecError, RecordCodecExt},
-    record::{Key, Record, KEY_SIZE},
+    record::{KEY_SIZE, Key, Record},
 };
 
 /// A cursor-like iterator over a Block
