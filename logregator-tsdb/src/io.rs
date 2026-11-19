@@ -1,4 +1,4 @@
-use std::{fmt::Debug, path::PathBuf};
+use std::{fmt::Debug, num::NonZeroUsize, path::PathBuf};
 
 use tracing::instrument;
 
@@ -32,7 +32,13 @@ where
     let (range_start, range_end) = memtable.key_bounds_full()?;
 
     let id = memtable.id();
-    let record_count = memtable.count();
+    let record_count = match NonZeroUsize::new(memtable.count()) {
+        None => {
+            todo!("invalid record_count: memtable has 0 records");
+        }
+        Some(record_count) => record_count,
+    };
+
     let mut sw = SstFileWriter::new(
         id,
         record_codec,

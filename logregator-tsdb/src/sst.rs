@@ -1,7 +1,17 @@
+//! SSTable binary layout:
+//! ```not_rust
+//! [...blocks]                   # each block contains records and their offsets
+//! [...block_metadata]           # each metadata contains the blocks offset plus first and last keys
+//! [bloom_filter]                # answers "does this SST contain any records for stream_id X"
+//! [block_metadata_start_offset] # where 'block_metadata' starts
+//! [bloom_filter_start_offset]   # where 'bloom_filter' starts
+//! ```
+
 use std::{
     fmt::Debug,
     fs::{File, OpenOptions},
     io,
+    num::NonZeroUsize,
     ops::Bound,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
@@ -15,7 +25,7 @@ use crate::{
         self, Block, BlockCursor, BlockWriter, InvalidBlockLimit, WriteOutput,
     },
     bloom::{self, BloomFilter, BloomFilterCodec},
-    codec::{self, CodecError, RecordCodecExt, SpecCodec, WireLen},
+    codec::{self, CodecError, RecordCodecExt, SZ_U32, SpecCodec, WireLen},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -86,10 +96,6 @@ pub enum SstError {
     )]
     BlockIdxOutOfBounds { idx: usize, len: usize },
 
-    // #[error(
-    //     "sst error: bound {bound:?} does not exist in the current SSTable"
-    // )]
-    // BoundNotExist { bound: Bound<Key> },
     #[error(
         "sst read error: bound {bound_kind:?} with stream_id {stream_id} not found"
     )]
@@ -160,11 +166,12 @@ where
         writer: W,
         codec: C,
         block_limit: Option<usize>,
-        record_count: usize,
+        record_count: NonZeroUsize,
     ) -> Result<Self, InvalidBlockLimit> {
         let block_writer = BlockWriter::new(codec.clone(), block_limit)?;
         let block_limit = block_writer.limit();
-        let bloom = BloomFilter::new(record_count, 0.01);
+        let bloom = BloomFilter::new(record_count.get(), 0.01)
+            .expect("n and fpr are both positive non-zero");
         let state = WriterState {
             writer,
             block_bytes_written: 0,
@@ -384,7 +391,7 @@ where
         codec: C,
         block_limit: Option<usize>,
         path_prefix: Option<&Path>,
-        record_count: usize,
+        record_count: NonZeroUsize,
     ) -> Result<Self, SstError> {
         let fh = SstFileHandle::open(
             id,
@@ -1114,8 +1121,6 @@ impl io::Seek for SstFileHandle {
     }
 }
 
-pub const SZ_U32: usize = size_of::<u32>();
-
 /// Metadata for blocks inside an SSTable. It contains the blocks start in bytes as offset
 /// and the first/last keys in this block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1258,7 +1263,7 @@ impl BlockMetadata {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{num::NonZeroUsize, sync::Arc};
 
     use pretty_assertions::assert_eq;
 
@@ -1318,14 +1323,18 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_writer_inmem() {
         tracing();
         let codec = RecordCodec;
         let writer = std::io::Cursor::new(Vec::new());
         let num_records = 512usize;
-        let mut sw =
-            HashedWriterState::new(writer, codec, None, num_records).unwrap();
+        let mut sw = HashedWriterState::new(
+            writer,
+            codec,
+            None,
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
 
         for i in 0..num_records {
             sw.write(&record(i as u64, 512)).unwrap();
@@ -1337,7 +1346,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_file_writer() {
         let tempdir = tempfile::TempDir::new().unwrap();
 
@@ -1349,7 +1357,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
 
@@ -1362,7 +1370,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_read_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
@@ -1373,7 +1380,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
         for i in 0..num_records {
@@ -1400,7 +1407,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_cursor() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
@@ -1411,7 +1417,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
         let records: Vec<Record> =
@@ -1522,7 +1528,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_open() {
         tracing();
         let tempdir = tempfile::TempDir::new().unwrap();
@@ -1534,7 +1539,7 @@ mod test {
             codec,
             Some(block_limit),
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
 
