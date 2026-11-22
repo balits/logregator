@@ -259,14 +259,40 @@ where
         //
         // block_bytes_written can't be greater than MAX_SST_SIZE (which can't be greater than u32::MAX)
         // so this cast is safe
-        let block_meta_start = self.state.block_bytes_written as u32;
+        let block_meta_start = self.state.block_bytes_written;
         let block_meta_bytes = BlockMetadata::encode_metas(
             &self.state.block_meta,
             &self.state.codec,
         )
         .map_err(SstError::from)?;
-        let bloom_filter_start =
-            block_meta_start + block_meta_bytes.len() as u32;
+        let block_meta_end = block_meta_start
+            .checked_add(block_meta_bytes.len())
+            .ok_or_else(|| {
+                SstError::Other("Sst layout size overflow (block_meta_end = block_meta_start + block_meta_bytes_len)".to_string())
+            })?;
+        let bloom_len = self.state.bloom.wire_len();
+        let bloom_end =
+            block_meta_end.checked_add(bloom_len).ok_or_else(|| {
+                SstError::Other(
+                    "Sst layout size overflow (bloom_end = block_meta_end + bloom_len)"
+                        .to_string(),
+                )
+            })?;
+        let total_len =
+            bloom_end.checked_add(SST_FOOTER_SIZE).ok_or_else(|| {
+                SstError::Other(
+                    "Sst layout size overflow (total_layout = bloom_end SST_FOOTER_SIZE)"
+                        .to_string(),
+                )
+            })?;
+
+        if total_len > MAX_SST_SIZE {
+            return Err(SstError::InvalidSstSize {
+                min: MIN_SST_SIZE,
+                max: MAX_SST_SIZE,
+                got: total_len as u64,
+            });
+        }
 
         // 1.
         self.state
@@ -288,18 +314,24 @@ where
         self.hasher.update(&bloom_buf);
 
         // 3.
+        // SAFETY: total_len <= MAX_SST_SIZE = u32::MAX / 2
+        // and block_meta_start <= total_len
+        let block_meta_start_u32 = block_meta_start as u32;
         self.state
             .writer
-            .write_all(&block_meta_start.to_be_bytes())
+            .write_all(&block_meta_start_u32.to_be_bytes())
             .map_err(SstError::from)?;
-        self.hasher.update(&block_meta_start.to_be_bytes());
+        self.hasher.update(&block_meta_start_u32.to_be_bytes());
 
         // 4.
+        // SAFETY: total_len <= MAX_SST_SIZE = u32::MAX / 2
+        // and block_meta_end <= total_len
+        let bloom_filter_start_u32 = block_meta_end as u32;
         self.state
             .writer
-            .write_all(&bloom_filter_start.to_be_bytes())
+            .write_all(&bloom_filter_start_u32.to_be_bytes())
             .map_err(SstError::from)?;
-        self.hasher.update(&bloom_filter_start.to_be_bytes());
+        self.hasher.update(&bloom_filter_start_u32.to_be_bytes());
 
         // 5.
         self.state
@@ -309,8 +341,8 @@ where
 
         Ok(FinalizedWriterState {
             inner: self.state,
-            block_metadata_start_offset: block_meta_start as usize,
-            bloom_filter_start_offset: bloom_filter_start as usize,
+            block_metadata_start_offset: block_meta_start,
+            bloom_filter_start_offset: block_meta_end,
         })
     }
 
@@ -351,7 +383,7 @@ where
         // Firstly, we already made sure block_offset is less than u32::MAX (see MAX_SST_SIZE),
         // so casting offset from usize to u32 is safe.
         //
-        // Secondly, this function is only called when block writer is full, meaning it has
+        // Second, this function is only called when block writer is full, meaning it has
         // at least 1 record written into it, therefore first_key and last_key cannot be None
         // and unwrapping is safe.
         let first_key = first_key.unwrap();
@@ -1166,10 +1198,12 @@ impl BlockMetadata {
         metas: &[Self],
         codec: &C,
     ) -> Result<Vec<u8>, CodecError> {
-        // need enough bytes the lenght prefix, for the metas themselves,
+        // need enough bytes for the lenght prefix, for the metas themselves,
         // and for the 32bit checksum
         let capacity = SZ_U32 + metas.len() * Self::BLOCK_META_SIZE + SZ_U32;
         let mut data = Vec::with_capacity(capacity);
+        // cast is safe since an sst could only hold MAX_SST_SIZE / MIN_BLOCK_WIRE_LEN blocks at max, which is way below
+        // u32::MAX (plus currently MAX_SST_SIZE is u32::max / 2)
         data.extend((metas.len() as u32).to_be_bytes());
         let mut key_bytes = [0; KEY_SIZE];
         let mut encode_key = |key: &Key| -> Result<[u8; KEY_SIZE], CodecError> {

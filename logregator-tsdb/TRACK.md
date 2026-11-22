@@ -37,8 +37,8 @@ Issue: **#7**, also closes **#3** · branch: `fix/tsdb-sst-roundtrip`
 - [x] Fix the stale "FIXED" comment that no longer matches `finalize` (`sst.rs:478-485`).
 - [x] Validate offsets before slicing: `bloom_offset` against `fsize - footer` (`sst.rs:507-524`), `read_block` uses only `debug_assert` (`sst.rs:601-613`), `decode_metas` checks no ordering/monotonicity (`sst.rs:1195-1255`).
 - [x] Block size accounting omits the 4-byte checksum (`block.rs:77-88,369-380,124-126`), `todo!()` for oversized data (`block.rs:94-96`), a failed encode leaves zero-filled bytes behind a stale offset (`block.rs:382-397`).
-- [ ] Checked `u32` arithmetic for `bloom_filter_start` (`sst.rs:243-250`); keep the `io::Error` context on footer reads (`sst.rs:474-476`).
-- [x] Re-enable or replace the commented-out block tests (`block.rs`) — 4 active tests (`block_writer`, `block_encode`, `block_decode`, `block_cursor`) plus 3 ignored placeholders for the remaining block items; https://github.com/balits/logregator/issues/7 (AI-generated) 
+- [x] Checked `u32` arithmetic for `bloom_filter_start` (`sst.rs:243-250`); keep the `io::Error` context on footer reads (`sst.rs:474-476`).
+- [x] Re-enable or replace the commented-out block tests (`block.rs`) — 4 active tests (`block_writer`, `block_encode`, `block_decode`, `block_cursor`)(AI-generated) 
 - [ ] Add write → open → full-read tests with multiple blocks, plus corrupt-CRC and short-destination cases; no test currently passes `Some((Bound, Bound))` to a cursor.
 - [ ] Exit: the 6 SST tests go green.
 
