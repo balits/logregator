@@ -1,12 +1,12 @@
 //! Very much under WIP, some comments / functions are not coherent yet.
 
-use tracing::{instrument, trace};
+use tracing::{error, instrument, trace};
 
 use std::fmt::Debug;
 
 use crate::{
     ChecksumMismatch,
-    codec::{InvalidSize, SZ_U16, SZ_U32, SpecCodec, WireLen},
+    codec::{InvalidSize, SZ_U16, SZ_U32, SpecCodec, WireLen, other},
     record::{MAX_RECORD_WIRE_LENGTH, MIN_RECORD_WIRE_LENGTH},
 };
 
@@ -15,6 +15,13 @@ pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024;
 
 /// blocks cannot be larger than 64KB (u16::MAX) as we use u16s for record offsets inside the block
 pub const MAX_BLOCK_SIZE: usize = u16::MAX as usize;
+
+// At least one minimum-sized record plus its offset, the record-count suffix
+// and the checksum must fit into a block.
+const _: () = assert!(
+    MIN_RECORD_WIRE_LENGTH + SZ_U16 + SZ_U16 + SZ_U32 <= MAX_BLOCK_SIZE,
+    "one minimum-sized record must fit in MAX_BLOCK_SIZE"
+);
 
 /// (The block layout is still very much WIP)
 /// Block represents an in-memory encoded form of a list of records and their offsets.
@@ -47,7 +54,7 @@ impl Debug for Block {
 
 impl WireLen for Block {
     fn wire_len(&self) -> usize {
-        self.data.len() + SZ_U16 + self.offset_segment_len() + SZ_U16 + SZ_U32
+        self.data.len() + self.offset_segment_len() + SZ_U16 + SZ_U32
     }
 }
 
@@ -71,6 +78,12 @@ impl Block {
 
     #[instrument(skip(self), err)]
     pub fn encode_block(&self) -> Result<Vec<u8>, BlockCodecError> {
+        if self.data.is_empty() || self.offsets.is_empty() {
+            return Err(BlockCodecError::InvalidBlockSize(
+                InvalidBlockSize::EmptyBlock,
+            ));
+        }
+
         if self.offsets.len() > (u16::MAX as usize) {
             return Err(too_many_records(self.offsets.len()));
         }
@@ -80,32 +93,15 @@ impl Block {
             return Err(corrupted_meta("offset segment length is 0".into()));
         }
 
-        let data_len = self.data.len();
-        let num_of_records_size = SZ_U16;
-        let total_size =
-            data_len + self.offset_segment_len() + num_of_records_size;
-        trace!(
-            total_size,
-            data_len, offset_segment_len, num_of_records_size
-        );
-        // let total_size = self.wire_len();
+        let total_size = self.wire_len();
+        trace!(total_size, data_len = self.data.len(), offset_segment_len);
 
         if total_size > MAX_BLOCK_SIZE {
             return Err(max_size_exceeded(total_size));
         }
 
-        // is this still a valid check?
-        // ..64KB-MIN_RECORD_WIRE_LENGTH is still a safe size for creating offsets
-        if self.data.len() > (u16::MAX as usize) - MIN_RECORD_WIRE_LENGTH {
-            // otherwise the last offset could possibly overflow
-            todo!(
-                "should we check for block.data.len() > u16::MAX - MIN_RECORD_WIRE_LENGTH for offsetting?"
-            )
-        }
-
         let mut data = self.data.clone();
-
-        data.reserve_exact(offset_segment_len + SZ_U16);
+        data.reserve_exact(offset_segment_len + SZ_U16 + SZ_U32);
 
         let offset_len = self.offsets.len();
         for i in 0..offset_len {
@@ -117,10 +113,9 @@ impl Block {
             };
 
             if end <= start {
-                trace!(
+                error!(
                     "offsets where not strictly monotonic at index {i}/{offset_len}: end = {end} <= start {start}"
                 );
-
                 return Err(invalid_offsets(start, end));
             }
 
@@ -145,9 +140,9 @@ impl Block {
             return Err(unexpected_size(src.len(), SZ_U32));
         }
 
-        let (src, checksum_bs) = src.split_at(src.len() - SZ_U32);
+        let (src, checksum_bytes) = src.split_at(src.len() - SZ_U32);
         let stored = crc32fast::hash(src);
-        let computed = u32::from_be_bytes(checksum_bs.try_into().map_err(|e| {
+        let computed = u32::from_be_bytes(checksum_bytes.try_into().map_err(|e| {
             trace!("Block::decode: failed to convert last 4 bytes into [u8; 4] for checksum: {e}");
             unexpected_size(src.len(), SZ_U32)
         })?);
@@ -259,7 +254,6 @@ pub struct BlockWriter<C> {
     buffer: Vec<u8>,
     codec: C,
     offsets: Vec<u16>,
-    size: usize,
     limit: usize,
     record_count: usize,
     first_key: Option<Key>,
@@ -286,7 +280,7 @@ impl<C: Debug> Debug for BlockWriter<C> {
                     self.offsets.capacity()
                 ),
             )
-            .field("size", &self.size)
+            .field("blocksize", &self.buffer.len())
             .field("limit", &self.limit)
             .field("_record_count", &self.record_count)
             .field("first_key", &self.first_key)
@@ -319,14 +313,12 @@ impl<C> BlockWriter<C> {
             None => DEFAULT_BLOCK_SIZE,
         };
 
-        let size = 0;
         let buffer = Vec::with_capacity(limit);
         let avg_rec_length =
             (MAX_RECORD_WIRE_LENGTH + MIN_RECORD_WIRE_LENGTH) / 2;
         let offsets = Vec::with_capacity(limit / avg_rec_length);
         let this = Self {
             buffer,
-            size,
             codec,
             limit,
             record_count: 0,
@@ -347,8 +339,8 @@ impl<C> BlockWriter<C> {
         (block, first_key, last_key)
     }
 
-    pub fn size(&self) -> usize {
-        self.size
+    pub fn record_count(&self) -> usize {
+        self.record_count
     }
 
     pub fn limit(&self) -> usize {
@@ -364,6 +356,14 @@ impl<C> BlockWriter<C> {
     }
 }
 
+impl<C> WireLen for BlockWriter<C> {
+    /// Encoded wire length of the block built so far, including one `u16`
+    /// offset per record, the `u16` record count and the `u32` checksum.
+    fn wire_len(&self) -> usize {
+        self.buffer.len() + self.offsets.len() * SZ_U16 + SZ_U16 + SZ_U32
+    }
+}
+
 impl<C> BlockWriter<C>
 where
     C: SpecCodec<Record>,
@@ -371,35 +371,50 @@ where
     /// Encodes record into the block, returning [WriteOutput::Written] if successful.
     /// If the block is full, [WriteOutput::Full] is returned.
     /// If any other error is encounder Err(..) is returned.
-    #[instrument(skip(self), err, fields(block_size = self.size, record_count = self.record_count))]
+    #[instrument(skip(self), err, fields(block_size = self.buffer.len(), record_count = self.record_count))]
     pub fn write(&mut self, rec: &Record) -> Result<WriteOutput, CodecError> {
-        let est_total_size = self.size
+        let est_total_size = self.buffer.len()
             + rec.wire_len()
-            + (self.offsets.len() + 1) * size_of::<u16>()
-            + size_of::<u16>();
+            + (self.offsets.len() + 1) * SZ_U16
+            + SZ_U16
+            + SZ_U32;
 
         if !self.offsets.is_empty() && est_total_size > self.limit {
             return Ok(WriteOutput::Full);
         }
 
+        // `limit` is bounded by MAX_BLOCK_SIZE in `new()`, but keep this guard
+        // so a malformed limit cannot overflow the u16 offsets.
         if est_total_size > MAX_BLOCK_SIZE {
             return Ok(WriteOutput::Full);
         }
 
         let orig_len = self.buffer.len();
         self.buffer.resize(orig_len + rec.wire_len(), 0);
-        self.codec.encode(
-            rec,
-            &mut self.buffer[orig_len..orig_len + rec.wire_len()],
-        )?;
+        match self
+            .codec
+            .encode(rec, &mut self.buffer[orig_len..orig_len + rec.wire_len()])
+        {
+            Ok(n) if n == rec.wire_len() => {}
+            Ok(n) => {
+                self.buffer.truncate(orig_len);
+                return Err(other(format!(
+                    "codec wrote {n} bytes for a record with wire_len {}",
+                    rec.wire_len()
+                )));
+            }
+            Err(e) => {
+                self.buffer.truncate(orig_len);
+                return Err(e);
+            }
+        }
 
         if self.first_key.is_none() {
             self.first_key = Some(rec.key.clone());
         }
         self.last_key = Some(rec.key.clone());
 
-        self.offsets.push(self.size as u16);
-        self.size += rec.wire_len();
+        self.offsets.push(orig_len as u16);
         self.record_count += 1;
         Ok(WriteOutput::Written)
     }
@@ -596,6 +611,9 @@ pub enum InvalidBlockSize {
 
     #[error("invalid_block_size: max size exceeded (got = {0}, max = {max})", max = MAX_BLOCK_SIZE)]
     MaxSizeExceeded(usize),
+
+    #[error("invalid block size: block is empty")]
+    EmptyBlock,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -824,15 +842,16 @@ mod test {
 
         // --- Size accounting ------------------------------------------------------
 
-        // After one write, size == wire_len of that record.
+        // After one write, size is the full encoded block length: record bytes
+        // + one u16 offset + the u16 record count + the u32 checksum.
         let mut bw = BlockWriter::new(codec(), Some(4096)).unwrap();
         let r0 = record(1, 0, 0, 32);
         let wire = r0.wire_len();
         bw.write(&r0).unwrap();
         assert_eq!(
-            bw.size(),
-            wire,
-            "size must equal wire_len after first write"
+            bw.wire_len(),
+            wire + SZ_U16 + SZ_U16 + SZ_U32,
+            "size must include offsets, count and checksum after first write"
         );
         assert_eq!(
             bw.first_key(),
@@ -845,15 +864,20 @@ mod test {
             "last_key should match first_key"
         );
 
-        // After a second write with the same payload, size doubles.
+        // A second record adds its bytes and one more offset; the count and
+        // checksum suffixes are shared.
         bw.write(&record(1, 1, 1, 32)).unwrap();
-        assert_eq!(bw.size(), wire * 2, "size must accumulate across writes");
+        assert_eq!(
+            bw.wire_len(),
+            wire * 2 + 2 * SZ_U16 + SZ_U16 + SZ_U32,
+            "size must accumulate record bytes and one offset per record"
+        );
 
         // --- WriteOutput::Written -------------------------------------------------
 
         // The first record is always accepted regardless of how tight the limit is,
         // because there is nothing meaningful to flush to if we reject it.
-        let tight = r0.wire_len() + SZ_U16 + SZ_U16; // just enough for one record
+        let tight = r0.wire_len() + SZ_U16 + SZ_U16 + SZ_U32; // just enough for one record
         let mut bw = BlockWriter::new(codec(), Some(tight)).unwrap();
         assert!(
             matches!(bw.write(&r0).unwrap(), WriteOutput::Written),
@@ -884,8 +908,8 @@ mod test {
 
         // Build a limit that fits exactly two records and verify the third is Full.
         let r = record(1, 0, 0, 64);
-        // 2 records + 2 u16 offsets + 1 u16 num_of_records suffix
-        let two_limit = 2 * r.wire_len() + 3 * SZ_U16;
+        // 2 records + 2 u16 offsets + count suffix + checksum
+        let two_limit = 2 * r.wire_len() + 3 * SZ_U16 + SZ_U32;
         let mut bw = BlockWriter::new(codec(), Some(two_limit)).unwrap();
         assert!(matches!(
             bw.write(&record(1, 0, 0, 64)).unwrap(),
@@ -1261,26 +1285,22 @@ mod test {
         }
     }
 
-    // --- Tests for the remaining PR 1 block items --------------------------------
-    // These are ignored until the corresponding production fixes land. The
-    // placeholder helpers above describe the API/behavior those fixes need.
+    // --- Regression tests for the PR 1 block accounting item ---------------------
 
     #[test]
-    #[ignore = "BlockWriter::size() omits offsets, count and checksum; https://github.com/balits/logregator/issues/7"]
     fn block_writer_size_includes_block_footer() {
         let records = vec![record(1, 0, 0, 32), record(1, 1, 1, 32)];
         let mut bw = BlockWriter::new(codec(), None).unwrap();
         for r in &records {
             assert!(matches!(bw.write(r).unwrap(), WriteOutput::Written));
         }
-        assert_eq!(bw.size(), expected_writer_size(records.len(), 32));
+        assert_eq!(bw.wire_len(), expected_writer_size(records.len(), 32));
     }
 
     #[test]
-    #[ignore = "Block::encode_block() still has todo!() for oversized data; https://github.com/balits/logregator/issues/7"]
     fn block_encode_rejects_oversized_data() {
-        // total_size stays at MAX_BLOCK_SIZE, but data.len() is large enough to
-        // overflow an offset once the record prefix is accounted for.
+        // data.len() plus the offset, count and checksum suffixes pushes the
+        // full wire length past MAX_BLOCK_SIZE.
         let block = Block {
             data: vec![0u8; MAX_BLOCK_SIZE - 2 * SZ_U16],
             offsets: vec![0],
@@ -1295,7 +1315,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "flaky_codec placeholder: failed write leaves zeroed bytes behind a stale offset; https://github.com/balits/logregator/issues/7"]
     fn block_writer_failed_encode_does_not_corrupt_buffer() {
         let mut bw = BlockWriter::new(flaky_codec(), None).unwrap();
         assert!(matches!(

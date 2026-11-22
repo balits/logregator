@@ -247,7 +247,7 @@ where
     pub(crate) fn finalize(
         mut self,
     ) -> Result<FinalizedWriterState<W, C>, SstError> {
-        if self.state.block_writer.size() > 0 {
+        if self.state.block_writer.record_count() > 0 {
             self.flush_block()?;
         }
 
@@ -323,7 +323,7 @@ where
         }
 
         let estimated_bytes =
-            self.state.block_bytes_written + self.state.block_writer.size();
+            self.state.block_bytes_written + self.state.block_writer.wire_len();
         if estimated_bytes > MAX_SST_SIZE {
             return Err(SstError::InvalidSstSize {
                 got: estimated_bytes as u64,
