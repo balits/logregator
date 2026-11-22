@@ -245,7 +245,11 @@ where
                 todo!("handle wrongly formatted day_dir in sst_dir");
             };
 
-            if !sst::valid_daydir_path(day_fmt) {
+            let Some(day_fmt) = day_fmt.to_str() else {
+                todo!("handle formatted day_dir not being valid Unicode");
+            };
+
+            if !sst::is_valid_daydir_path(day_fmt) {
                 todo!(
                     "invalid daydir path found in sst directory. Log/delete + continue OR return with error?"
                 )

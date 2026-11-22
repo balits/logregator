@@ -42,24 +42,27 @@ pub const MIN_SST_SIZE: usize = SST_FOOTER_SIZE;
 pub const SST_DIR_NAME: &str = "sst";
 pub const SST_EXT: &str = "sst";
 
+/// Formats the ID into an SSTable file name, as `"{id:020}.{SST_EXT}"`
 pub fn format_sst_filename(id: u64) -> String {
     format!("{id:020}.{SST_EXT}")
 }
 
-/// Formats today to as its expected in the sst directory.
-///
-/// (Year-month-day format (ISO 8601). Same as %Y-%m-%d.
+/// Year-month-day format (ISO 8601). Same as %Y-%m-%d.
 /// src: https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
-pub fn format_today_dir_path() -> String {
-    chrono::Utc::now().format("%F").to_string()
+const DAYDIR_FORMAT: &str = "%F";
+
+/// Formats today as a directory path according to [DAYDIR_FORMAT], to be used in the sst directory.
+pub fn format_today_as_daydir_path() -> String {
+    let today = chrono::Utc::now();
+    today.format(DAYDIR_FORMAT).to_string()
 }
 
-pub fn valid_daydir_path(_: &std::ffi::OsStr) -> bool {
-    todo!(
-        "do some research on str -> formatted day | formatted day -> Option<str>"
-    )
+/// Checks if the the given str is well formatted, as per [format_today_as_daydir_path] and [DAYDIR_FORMAT].
+pub fn is_valid_daydir_path(path: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(path, DAYDIR_FORMAT).is_ok()
 }
 
+/// Huge enum for all the errors this module could produce.
 #[derive(thiserror::Error, Debug)]
 pub enum SstError {
     #[error("sst error: custom error occured: {0}")]
@@ -114,6 +117,7 @@ pub enum SstError {
     BlockCursorExhausted,
 }
 
+/// A bound for queries.
 #[derive(Debug)]
 pub enum BoundKind {
     Start,
@@ -436,7 +440,7 @@ pub struct SstHandle<C> {
 
 impl<C> SstHandle<C> {
     pub fn id(&self) -> u64 {
-        self.fh._id
+        self.fh.id
     }
 }
 
@@ -449,7 +453,7 @@ where
     where
         P: AsRef<Path> + std::fmt::Debug,
     {
-        let fh = SstFileHandle::open_from_path(path.as_ref())?;
+        let fh = SstFileHandle::open_readonly_from_path(path.as_ref())?;
         Self::open_file_handle(fh, codec)
     }
 
@@ -1034,7 +1038,7 @@ where
 /// Wrapper around a file, a unique ID, and the files path
 #[derive(Debug)]
 pub struct SstFileHandle {
-    _id: u64,
+    id: u64,
     file: File,
     path: PathBuf,
 }
@@ -1051,20 +1055,29 @@ impl SstFileHandle {
             None => fmt.into(),
         };
         let file = opts.open(&path)?;
-        Ok(Self {
-            _id: id,
-            path,
-            file,
-        })
+        Ok(Self { id, path, file })
     }
 
     /// checks if the path is a valid sst file path, then opens it
     /// as read-only
-    pub fn open_from_path(path: &Path) -> io::Result<Self> {
-        let fname =
-            path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing filename")
-            })?;
+    pub fn open_readonly_from_path(path: &Path) -> io::Result<Self> {
+        let fname = match path.file_name() {
+            Some(fname) => match fname.to_str() {
+                Some(fname) => fname,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "sst filename: invalid Unicode",
+                    ));
+                }
+            },
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sst filename: missing",
+                ));
+            }
+        };
 
         if !fname.ends_with(".sst") {
             return Err(io::Error::new(
@@ -1082,7 +1095,7 @@ impl SstFileHandle {
         })?;
 
         Ok(SstFileHandle {
-            _id: id,
+            id,
             file: File::open(path)?,
             path: path.to_path_buf(),
         })
