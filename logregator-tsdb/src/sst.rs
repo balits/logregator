@@ -10,7 +10,7 @@
 use std::{
     fmt::Debug,
     fs::{File, OpenOptions},
-    io,
+    io::{self, BufReader, Read},
     num::NonZeroUsize,
     ops::Bound,
     os::unix::fs::FileExt,
@@ -121,40 +121,57 @@ pub enum BoundKind {
     None,
 }
 
+/// Tracking state needed to construct an SSTable.
 #[derive(Debug)]
 pub(crate) struct WriterState<W, C> {
+    /// underlying writer
     pub(crate) writer: W,
+
+    /// how many block-bytes have currently been written
     pub(crate) block_bytes_written: usize,
+
+    /// underlying block writer
     pub(crate) block_writer: BlockWriter<C>,
+
+    /// limit on the size of a single block
     pub(crate) block_limit: usize,
+
+    /// list of [BlockMetadata] accumulated over time, containing its
+    /// offset in the writer, and its first/last key.
     pub(crate) block_meta: Vec<BlockMetadata>,
+
+    /// number of records accumulated
     pub(crate) record_count: usize,
+
     pub(crate) first_key: Option<Key>,
     pub(crate) last_key: Option<Key>,
     pub(crate) bloom: BloomFilter,
     pub(crate) codec: C,
 }
 
+/// The final, unmodifiable state of an SStable, with offsets where the block
+/// metadata and bloom filter starts at.
 #[derive(Debug)]
 pub(crate) struct FinalizedWriterState<W, C> {
-    pub(crate) inner: WriterState<W, C>,
-    pub(crate) block_metadata_start_offset: usize,
+    /// inner state
+    inner: WriterState<W, C>,
+
+    /// where the block metadata segment starts
+    block_metadata_start_offset: usize,
+
+    /// where the bloom filter segment starts
+    /// (and where the block metadata segment ends)
     #[allow(unused)]
-    pub(crate) bloom_filter_start_offset: usize,
+    bloom_filter_start_offset: usize,
 }
 
-/// SSTable binary layout:
-/// ```not_rust
-/// [...block]                    # each block contains records and their offsets
-/// [...block_metadata]           # each metadata contains the blocks offset plus first and last keys
-/// [bloom_filter]                # answers "does this SST contain any records for stream_id X"
-/// [block_metadata_start_offset] # where 'block_metadata' starts
-/// [bloom_filter_start_offset] # where 'bloom_filter' starts
-/// ```
+/// A [WriterState] and a checksum hasher.
+/// The hasher computes the checksum based on raw bytes of
+/// the blocks, metadata, bloom filter, and the latter twos offsets.
 #[derive(Debug)]
 pub struct HashedWriterState<W: io::Write, C> {
     state: WriterState<W, C>,
-    integrity_hasher: crc32fast::Hasher,
+    hasher: crc32fast::Hasher,
 }
 
 impl<W, C> HashedWriterState<W, C>
@@ -187,7 +204,7 @@ where
 
         Ok(Self {
             state,
-            integrity_hasher: crc32fast::Hasher::new(),
+            hasher: crc32fast::Hasher::new(),
         })
     }
 
@@ -202,7 +219,7 @@ where
                 self.state.bloom.insert(rec.key.stream_id);
             }
             Ok(WriteOutput::Full) => {
-                self.flush_blocks()?;
+                self.flush_block()?;
                 // first call to block_writer.write always succeeds
                 // so infinite recursion can't happen
                 self.write(rec)?;
@@ -215,27 +232,19 @@ where
         Ok(())
     }
 
-    /// the layout of the finalized state is roughly like so:
-    /// 0: raw_blocks (handled by `self.flush_blocks`)
-    ///
-    /// 1: block_metadata
-    /// 2: bloom_filter
-    /// 3: block_metadata_start_offset
-    /// 4: bloom_filter_start_offset
-    ///
-    /// 5: crc hash of the whole sst
-    ///
-    /// # NOTE
-    ///
-    /// Before the crc hash is appended to the end of the writer,
-    /// the hasher should be updated with the new bytes written to
-    /// the writer in this function.
-    #[instrument(skip(self), ret, err)]
+    /// the layout of the finalized state is:
+    /// 0: raw blocks (handled by [flush_block])
+    /// 1: block metadata
+    /// 2: bloom filter
+    /// 3: block metadata start offset
+    /// 4: bloom filter start offset
+    /// 5: crc hash of the whole sst (of 0,1,2,3,4)
+    #[instrument(skip(self), err)]
     pub(crate) fn finalize(
         mut self,
     ) -> Result<FinalizedWriterState<W, C>, SstError> {
         if self.state.block_writer.size() > 0 {
-            self.flush_blocks()?;
+            self.flush_block()?;
         }
 
         if self.state.first_key.is_none() || self.state.last_key.is_none() {
@@ -246,7 +255,6 @@ where
         //
         // block_bytes_written can't be greater than MAX_SST_SIZE (which can't be greater than u32::MAX)
         // so this cast is safe
-
         let block_meta_start = self.state.block_bytes_written as u32;
         let block_meta_bytes = BlockMetadata::encode_metas(
             &self.state.block_meta,
@@ -261,53 +269,38 @@ where
             .writer
             .write_all(&block_meta_bytes)
             .map_err(SstError::from)?;
-        self.integrity_hasher.update(&block_meta_bytes);
+        self.hasher.update(&block_meta_bytes);
 
         // 2.
-        {
-            /*
-            -------------------------------------------------
-            omg, i know i have SpecCodec<I> everywhere
-            but i rly dont feel like introducing
-            <B: SpecCodec<BloomFilter> to lsm, or sst
-            or wherever. Plus realistically a bloom
-            filters wire representation is not gonna change.
-            -------------------------------------------------
-            */
-
-            let codec = bloom::BloomFilterCodec;
-            let mut bloom_buf = vec![0; self.state.bloom.wire_len()];
-            codec
-                .encode(&self.state.bloom, &mut bloom_buf)
-                .map_err(SstError::from)?;
-            self.state
-                .writer
-                .write_all(&bloom_buf)
-                .map_err(SstError::from)?;
-
-            self.integrity_hasher.update(&bloom_buf);
-        }
+        let bloom_codec = bloom::BloomFilterCodec;
+        let mut bloom_buf = vec![0; self.state.bloom.wire_len()];
+        bloom_codec
+            .encode(&self.state.bloom, &mut bloom_buf)
+            .map_err(SstError::from)?;
+        self.state
+            .writer
+            .write_all(&bloom_buf)
+            .map_err(SstError::from)?;
+        self.hasher.update(&bloom_buf);
 
         // 3.
         self.state
             .writer
             .write_all(&block_meta_start.to_be_bytes())
             .map_err(SstError::from)?;
-        self.integrity_hasher
-            .update(&block_meta_start.to_be_bytes());
+        self.hasher.update(&block_meta_start.to_be_bytes());
 
         // 4.
         self.state
             .writer
             .write_all(&bloom_filter_start.to_be_bytes())
             .map_err(SstError::from)?;
-        self.integrity_hasher
-            .update(&bloom_filter_start.to_be_bytes());
+        self.hasher.update(&bloom_filter_start.to_be_bytes());
 
         // 5.
         self.state
             .writer
-            .write_all(&self.integrity_hasher.finalize().to_be_bytes())
+            .write_all(&self.hasher.finalize().to_be_bytes())
             .map_err(SstError::from)?;
 
         Ok(FinalizedWriterState {
@@ -317,8 +310,10 @@ where
         })
     }
 
+    /// Writes the [Block] produced by the [BlockWriter] into the underlying
+    /// Writer, and updates the hasher with the block bytes.
     #[instrument(skip(self), err)]
-    fn flush_blocks(&mut self) -> Result<(), SstError> {
+    fn flush_block(&mut self) -> Result<(), SstError> {
         if self.state.block_bytes_written >= MAX_SST_SIZE {
             return Err(SstError::SstFilledUp);
         }
@@ -345,7 +340,7 @@ where
         let block_offset = self.state.block_bytes_written;
         let block_bytes = block.encode_block()?;
         self.state.writer.write_all(&block_bytes)?;
-        self.integrity_hasher.update(&block_bytes);
+        self.hasher.update(&block_bytes);
 
         // SAFETY
         //
@@ -376,6 +371,7 @@ where
     }
 }
 
+/// An SSTable writer which uses an [SstFileHandle] as the underyling writer.
 #[derive(Debug)]
 pub struct SstFileWriter<C> {
     inner: HashedWriterState<SstFileHandle, C>,
@@ -490,7 +486,7 @@ where
         // the bloom and blockmeta bytes, and is generated
         // by `finalize()`, which we are reading anyways,
         // just pass it to a crc hasher.
-        let (blockmeta_offset, bloom_offset, orig_checksum) = (
+        let (blockmeta_offset, bloom_offset, original_checksum) = (
             u32::from_be_bytes([
                 footer_buf[0],
                 footer_buf[1],
@@ -530,55 +526,66 @@ where
         let bloom_segment_len: usize =
             (fsize - SST_FOOTER_SIZE as u64 - bloom_offset) as usize;
 
-        let blockmeta_segment_len: usize = (bloom_offset - blockmeta_offset).try_into().map_err(|e| {
-            SstError::Other(format!(
-                "faild to cast meta_segment_lenght (= file_size {fsize} - meta_offset {blockmeta_offset}) from u64 to usize: {e}"
-            ))
-        })?;
+        let blockmeta_segment_len = bloom_offset - blockmeta_offset;
+        let blockmeta_segment_len: usize =
+            blockmeta_segment_len.try_into().map_err(|_| {
+                SstError::Other(
+                    "blockmeta_segment_len: failed to cast from u64 to usize"
+                        .to_string(),
+                )
+            })?;
 
+        // the checksum is made out of 4 things
+        // 1) the raw block bytes
+        // 2) the block metadata bytes
+        // 3) the bloom filter bytes
+        // 4) the block meta offset + bloom filter offset
+        //
+        // but we dont rly care, just read the whole file - checksum
+        let mut bufreader =
+            BufReader::with_capacity(32 * 1024, f).take(fsize - SZ_U32 as u64);
         let mut hasher = crc32fast::Hasher::new();
-        let mut readbuf = vec![0; blockmeta_segment_len];
-
-        f.read_exact_at(&mut readbuf, blockmeta_offset)?;
-        let block_metadata = BlockMetadata::decode_metas(&readbuf[..], &codec)?;
-        hasher.update(&readbuf[..]);
-
-        readbuf.resize(bloom_segment_len, 0);
-        f.read_exact_at(&mut readbuf, bloom_offset)?;
-
-        let bloom = {
-            /*
-            -------------------------------------------------
-            omg, i know i have SpecCodec<I> everywhere
-            but i rly dont feel like introducing
-            <B: SpecCodec<BloomFilter> to lsm, or sst
-            or wherever. Plus realistically a bloom
-            filters wire representation is not gonna change.
-            -------------------------------------------------
-            */
-
-            let codec = BloomFilterCodec;
-            match codec.decode(&readbuf) {
-                Ok(Some((bloom, n))) => {
-                    hasher.update(&readbuf[..n]);
-                    bloom
-                }
-                Ok(None) => {
-                    return Err(SstError::Other(
-                        "failed to decode bloom filter: not enough bytes in buffer"
-                        .to_string()
+        let mut buf = vec![0; 8 * 1024];
+        loop {
+            let n = bufreader.read(&mut buf)?;
+            if n == 0 {
+                let computed = hasher.finalize();
+                if original_checksum != computed {
+                    return Err(SstError::ChecksumMismatch(
+                        crate::ChecksumMismatch {
+                            original: original_checksum,
+                            computed,
+                        },
                     ));
+                } else {
+                    break;
                 }
-                Err(e) => return Err(e.into()),
             }
-        };
+            hasher.update(&buf[..n]);
+        }
 
-        let computed_checksum = hasher.finalize();
-        if orig_checksum != computed_checksum {
-            return Err(SstError::ChecksumMismatch(crate::ChecksumMismatch {
-                original: orig_checksum,
-                computed: computed_checksum,
-            }));
+        // 2) block meta bytes
+        buf.resize(blockmeta_segment_len, 0);
+        f.read_exact_at(&mut buf, blockmeta_offset)?;
+        let block_metadata = BlockMetadata::decode_metas(&buf[..], &codec)?;
+
+        // 3) bloom filter bytes
+        buf.resize(bloom_segment_len, 0);
+        f.read_exact_at(&mut buf, bloom_offset)?;
+        let (bloom, n) = match BloomFilterCodec.decode(&buf[..]) {
+            Ok(Some((bloom, n))) => (bloom, n),
+            Ok(None) => {
+                return Err(SstError::Other(
+                    "failed to decode bloom filter: not enough bytes in buffer"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if n != bloom_segment_len {
+            return Err(SstError::Other(format!(
+                "failed to decode bloom filter: expected to read {bloom_segment_len} bytes, actually read {n}"
+            )));
         }
 
         Ok(SstHandle {

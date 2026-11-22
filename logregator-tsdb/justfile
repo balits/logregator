@@ -1,9 +1,13 @@
-default: fmt test check 
+default: fmt-check test check lint
 
-# format everything!!!
+# formats everything!!!
 [group("tsdb")]
 fmt:
 	cargo fmt -p logregator-tsdb
+
+[group("tsdb")]
+fmt-check:
+	cargo fmt -p logregator-tsdb --check
 
 # run all tests
 [group("tsdb")]
