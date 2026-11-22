@@ -33,9 +33,9 @@ Issue: **#7**, also closes **#3** · branch: `fix/tsdb-sst-roundtrip`
 - [x] Bloom encode: slice each field into its own destination range, use `dst[20..20 + item.bitmap.len()]` (safe for oversized `dst`), add a byte-exact test. The fix is already in the working tree — commit it.
 - [x] Bloom wire doc says `bitmap_len: u64` but encodes `u32` (`bloom.rs:113-116`) — already fixed in working tree.
 - [x] Guard `BloomFilter::new(0, _)` division by zero (`bloom.rs:39-48,78`, assert already in working tree) and validate decoded `n_bits`/`n_hashes` against bitmap length (`bloom.rs:141-165`).
-- [ ] Fix the stale "FIXED" comment that no longer matches `finalize` (`sst.rs:478-485`).
-- [ ] Validate offsets before slicing: `bloom_offset` against `fsize - footer` (`sst.rs:507-524`), `read_block` uses only `debug_assert` (`sst.rs:601-613`), `decode_metas` checks no ordering/monotonicity (`sst.rs:1195-1255`).
 - [x] Align integrity checksum scope: writer hashes blocks + metadata + bloom + footer offsets (`sst.rs:341,257,281,289-298`), reader hashes only metadata + bloom (`sst.rs:532-570`) — every written SST fails to open.
+- [x] Fix the stale "FIXED" comment that no longer matches `finalize` (`sst.rs:478-485`).
+- [?] Validate offsets before slicing: `bloom_offset` against `fsize - footer` (`sst.rs:507-524`), `read_block` uses only `debug_assert` (`sst.rs:601-613`), `decode_metas` checks no ordering/monotonicity (`sst.rs:1195-1255`).
 - [ ] Block size accounting omits the 4-byte checksum (`block.rs:77-88,369-380,124-126`), `todo!()` for oversized data (`block.rs:94-96`), a failed encode leaves zero-filled bytes behind a stale offset (`block.rs:382-397`).
 - [ ] Checked `u32` arithmetic for `bloom_filter_start` (`sst.rs:243-250`); keep the `io::Error` context on footer reads (`sst.rs:474-476`).
 - [ ] Re-enable or replace the commented-out block tests (`block.rs:1-5,669-1181`) — note the stale expectation that an empty block encodes successfully (`block.rs:746-752`).

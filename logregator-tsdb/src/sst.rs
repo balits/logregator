@@ -474,18 +474,10 @@ where
             )));
         }
 
+        let fsize_minus_footer = fsize - SST_FOOTER_SIZE as u64;
         let mut footer_buf = [0; SST_FOOTER_SIZE];
-        f.read_exact_at(&mut footer_buf, fsize - SST_FOOTER_SIZE as u64)
-            .map_err(|e| SstError::Other(format!("{e}")))?;
+        f.read_exact_at(&mut footer_buf, fsize - SST_FOOTER_SIZE as u64)?;
 
-        // FIXED: what do i do with this checksum?
-        // to reconstruct we would have to iterate over
-        // the whooole sst file
-        //
-        // SOLUTION: sst level checksum is made out of
-        // the bloom and blockmeta bytes, and is generated
-        // by `finalize()`, which we are reading anyways,
-        // just pass it to a crc hasher.
         let (blockmeta_offset, bloom_offset, original_checksum) = (
             u32::from_be_bytes([
                 footer_buf[0],
@@ -507,14 +499,14 @@ where
             ]),
         );
 
-        if blockmeta_offset > fsize {
+        if blockmeta_offset > fsize_minus_footer {
             return Err(SstError::Other(format!(
-                "block metadata start offset points past the size of the file (offset: {blockmeta_offset} file_size: {fsize})"
+                "block metadata start offset points past the size of the file minus footer size (offset: {blockmeta_offset} file_size: {fsize}, footer_size: {SST_FOOTER_SIZE})"
             )));
         }
-        if bloom_offset > fsize {
+        if bloom_offset > fsize_minus_footer {
             return Err(SstError::Other(format!(
-                "bloom filter start offset points past the size of the file (offset: {bloom_offset} file_size: {fsize})"
+                "bloom filter start offset points past the size of the file minus footer size (offset: {bloom_offset}, file_size: {fsize}, footer_size: {SST_FOOTER_SIZE})"
             )));
         }
         if blockmeta_offset >= bloom_offset {
@@ -524,7 +516,7 @@ where
         }
 
         let bloom_segment_len: usize =
-            (fsize - SST_FOOTER_SIZE as u64 - bloom_offset) as usize;
+            (fsize_minus_footer - bloom_offset) as usize;
 
         let blockmeta_segment_len = bloom_offset - blockmeta_offset;
         let blockmeta_segment_len: usize =
@@ -618,10 +610,11 @@ where
             self.block_meta()[block_idx + 1].offset as usize
         };
 
-        debug_assert!(
-            block_start < block_end,
-            "malformed sst blocks: block_start >= block_end"
-        );
+        if block_start >= block_end {
+            return Err(SstError::Other(format!(
+                "malformed sst block (idx = {block_idx}): block_start ({block_start}) >= block_end ({block_end})"
+            )));
+        }
 
         let mut buf = vec![0; block_end - block_start];
         self.fh.file().read_exact_at(&mut buf, block_start as u64)?;
@@ -1229,7 +1222,7 @@ impl BlockMetadata {
             }
         };
 
-        let mut data = Vec::with_capacity(metas_len);
+        let mut data: Vec<BlockMetadata> = Vec::with_capacity(metas_len);
         for _ in 0..metas_len {
             let offset = u32::from_be_bytes([
                 src[consumed],
@@ -1248,7 +1241,17 @@ impl BlockMetadata {
                 first_key,
                 last_key,
             };
-            data.push(meta);
+
+            if let Some(last_meta) = data.last()
+                && last_meta.offset >= offset
+            {
+                return Err(codec::other(format!(
+                    "BlockMetadata::decode_metas(): offset monotonicity violation (last offset: {}, current offset {})",
+                    last_meta.offset, offset
+                )));
+            } else {
+                data.push(meta);
+            }
         }
 
         let computed = crc32fast::hash(&src[..consumed]);
