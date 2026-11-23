@@ -170,6 +170,11 @@ impl Block {
 
             u16::from_be_bytes(buf) as usize
         };
+        if num_of_records == 0 {
+            return Err(BlockCodecError::InvalidBlockSize(
+                InvalidBlockSize::EmptyBlock,
+            ));
+        }
 
         let offset_segment_len = num_of_records * SZ_U16;
         // no overflow due to the num_of_record block's check
@@ -369,6 +374,16 @@ where
     /// If any other error is encounder Err(..) is returned.
     #[instrument(skip(self), err, fields(block_size = self.buffer.len(), record_count = self.record_count))]
     pub fn write(&mut self, rec: &Record) -> Result<WriteOutput, CodecError> {
+        if !(MIN_RECORD_WIRE_LENGTH..=MAX_RECORD_WIRE_LENGTH)
+            .contains(&rec.wire_len())
+        {
+            return Err(codec::invalid_payload_sz(
+                rec.wire_len(),
+                MAX_RECORD_WIRE_LENGTH,
+                MIN_RECORD_WIRE_LENGTH,
+            ));
+        }
+
         let est_total_size = self.buffer.len()
             + rec.wire_len()
             + (self.offsets.len() + 1) * SZ_U16
@@ -700,8 +715,12 @@ mod test {
         MAX_BLOCK_SIZE, SZ_U16, SZ_U32, WriteOutput,
     };
     use crate::{
+        ChecksumMismatch,
         codec::{CodecError, RecordCodecExt, SpecCodec, WireLen},
-        record::{KEY_SIZE, Key, MIN_RECORD_WIRE_LENGTH, Record, RecordCodec},
+        record::{
+            KEY_SIZE, Key, MAX_PAYLOAD_LENGTH, MIN_PAYLOAD_LENGTH,
+            MIN_RECORD_WIRE_LENGTH, Record, RecordCodec,
+        },
     };
 
     fn tracing() {
@@ -1327,5 +1346,67 @@ mod test {
         let encoded = block.encode_block().unwrap();
         let decoded = Block::decode_block(&encoded).unwrap();
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn block_decode_rejects_oversized_buffer() {
+        let len = MAX_BLOCK_SIZE + 1;
+        let mut buf = vec![0u8; len];
+        let checksum = crc32fast::hash(&buf[..len - SZ_U32]);
+        buf[len - SZ_U32..].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(matches!(
+            Block::decode_block(&buf),
+            Err(BlockCodecError::InvalidBlockSize(
+                InvalidBlockSize::MaxSizeExceeded(got)
+            )) if got == len
+        ));
+    }
+
+    #[test]
+    fn block_decode_checksum_error_field_order() {
+        let (block, _) = build_block(3, 16);
+        let mut encoded = block.encode_block().unwrap();
+        encoded[0] ^= 0x01;
+
+        let split = encoded.len() - SZ_U32;
+        let original = u32::from_be_bytes(encoded[split..].try_into().unwrap());
+        let computed = crc32fast::hash(&encoded[..split]);
+        assert_ne!(original, computed);
+
+        match Block::decode_block(&encoded) {
+            Err(BlockCodecError::Checksum(ChecksumMismatch {
+                original: got_original,
+                computed: got_computed,
+            })) => {
+                assert_eq!(
+                    got_original, original,
+                    "`original` must be the checksum read from the file"
+                );
+                assert_eq!(
+                    got_computed, computed,
+                    "`computed` must be the recalculated hash"
+                );
+            }
+            other => panic!("expected checksum mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_writer_rejects_out_of_bounds_record() {
+        let mut bw = BlockWriter::new(codec(), None).unwrap();
+        let before = bw.wire_len();
+
+        for payload_len in [MIN_PAYLOAD_LENGTH - 1, MAX_PAYLOAD_LENGTH + 1] {
+            assert!(matches!(
+                bw.write(&record(1, 0, 0, payload_len)),
+                Err(CodecError::InvalidPayloadSize(_))
+            ));
+        }
+
+        assert_eq!(bw.wire_len(), before);
+        assert_eq!(bw.record_count(), 0);
+        assert!(bw.first_key().is_none());
+        assert!(bw.last_key().is_none());
     }
 }

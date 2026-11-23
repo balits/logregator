@@ -41,7 +41,7 @@ Issue: **#7**, also closes **#3** · branch: `fix/tsdb-sst-roundtrip`
 - [x] Re-enable or replace the commented-out block tests (`block.rs`) — 4 active tests (`block_writer`, `block_encode`, `block_decode`, `block_cursor`)(AI-generated) 
 - [x] Harden `Block::decode_block` with an upper size bound: reject `src.len() > MAX_BLOCK_SIZE` to match `encode_block` (`block.rs:93,138-141,669`); https://github.com/balits/logregator/issues/7
 - [x] Fix `ChecksumMismatch` field order in `decode_block`: `original` must be the file value, `computed` the recalculated hash (`block.rs:143-151,687-691`); https://github.com/balits/logregator/issues/7
-- [ ] Align write/decode block validation: `decode_block` enforces `MIN_RECORD_WIRE_LENGTH..=MAX_RECORD_WIRE_LENGTH` but accepts 0 records, while `encode_block` rejects empty blocks and `BlockWriter::write` relies on the codec (`block.rs:220-229,240,375`); https://github.com/balits/logregator/issues/7
+- [x] Align write/decode block validation: `decode_block` enforces `MIN_RECORD_WIRE_LENGTH..=MAX_RECORD_WIRE_LENGTH` but accepts 0 records, while `encode_block` rejects empty blocks and `BlockWriter::write` relies on the codec (`block.rs:220-229,240,375`); https://github.com/balits/logregator/issues/7
 - [ ] Add write → open → full-read tests with multiple blocks, plus corrupt-CRC and short-destination cases; no test currently passes `Some((Bound, Bound))` to a cursor.
 - [ ] Exit: the 6 SST tests go green.
 
