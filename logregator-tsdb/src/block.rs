@@ -136,19 +136,26 @@ impl Block {
     /// so the caller should make sure [src] is long enough and well formed
     #[instrument(skip(src), err)]
     pub fn decode_block(src: &[u8]) -> Result<Self, BlockCodecError> {
+        if src.len() > MAX_BLOCK_SIZE {
+            return Err(max_size_exceeded(src.len()));
+        }
+
         if src.len() < SZ_U32 {
             return Err(unexpected_size(src.len(), SZ_U32));
         }
 
         let (src, checksum_bytes) = src.split_at(src.len() - SZ_U32);
-        let stored = crc32fast::hash(src);
-        let computed = u32::from_be_bytes(checksum_bytes.try_into().map_err(|e| {
+        let checksum_bytes: [u8; 4] = checksum_bytes.try_into().map_err(|e| {
             trace!("Block::decode: failed to convert last 4 bytes into [u8; 4] for checksum: {e}");
             unexpected_size(src.len(), SZ_U32)
-        })?);
-
-        if stored != computed {
-            return Err(checksum_mismatch(stored, computed));
+        })?;
+        let original_checksum = u32::from_be_bytes(checksum_bytes);
+        let computed_checksum = crc32fast::hash(src);
+        if computed_checksum != original_checksum {
+            return Err(checksum_mismatch(
+                original_checksum,
+                computed_checksum,
+            ));
         }
 
         let num_of_records = {
@@ -156,7 +163,7 @@ impl Block {
                 return Err(unexpected_size(src.len(), SZ_U16));
             }
 
-            let buf = src[src.len() - SZ_U16..].try_into().map_err(|e| {
+            let buf: [u8; 2] = src[src.len() - SZ_U16..].try_into().map_err(|e| {
                 trace!("Block::decode: failed to convert last 2 bytes into [u8; 2] for num_of_records: {e}");
                 unexpected_size(src.len(), SZ_U16)
             })?;
@@ -188,16 +195,10 @@ impl Block {
         let data = src[..offset_segment_start].to_vec();
 
         let offsets = {
-            // let offset_span = span!(Level::TRACE, "offset_checking");
-            // let _guard = offset_span.enter();
-
             let iter = src[offset_segment_start..offset_segment_end]
                 .as_chunks::<SZ_U16>()
                 .0
                 .iter()
-                // .inspect(|ch| {
-                //     trace!("decode: chunk: {:?}", ch);
-                // })
                 .map(|[a, b]| u16::from_be_bytes([*a, *b]));
 
             let mut offsets = Vec::with_capacity(num_of_records);
@@ -216,7 +217,6 @@ impl Block {
                 }
 
                 let record_wire_len = end - start;
-
                 if !(MIN_RECORD_WIRE_LENGTH..=MAX_RECORD_WIRE_LENGTH)
                     .contains(&record_wire_len)
                 {
@@ -228,10 +228,6 @@ impl Block {
                         },
                     ));
                 }
-
-                // trace!(
-                //     "offset chunk: start = {start}, end = {end}, wire_length = {record_wire_len}"
-                // );
             }
 
             offsets
@@ -684,11 +680,11 @@ pub(super) fn unexpected_size(got: usize, want: usize) -> BlockCodecError {
     ))
 }
 
-pub(super) fn checksum_mismatch(stored: u32, computed: u32) -> BlockCodecError {
-    BlockCodecError::Checksum(ChecksumMismatch {
-        original: stored,
-        computed,
-    })
+pub(super) fn checksum_mismatch(
+    original: u32,
+    computed: u32,
+) -> BlockCodecError {
+    BlockCodecError::Checksum(ChecksumMismatch { original, computed })
 }
 
 /// Well it turned out to be true, i couldnt bother to rewrite
