@@ -441,7 +441,7 @@ use crate::{
 /// A cursor-like iterator over a Block
 /// To use the iterator, first it needs to be set to the first element,
 /// with [seek_to_first()]. From this point on, one can use next() or seek()
-/// to update the cursors internal item, [in_valid()] will return false if this
+/// to update the cursors internal item, [is_valid()] (???) will return false if this
 // fails. It also fails after [next()] results in going past the offset array.
 #[derive(Debug)]
 pub struct BlockCursor<C> {

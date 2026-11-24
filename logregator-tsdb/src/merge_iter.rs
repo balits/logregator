@@ -52,11 +52,8 @@ where
             }
 
             // ugh "hidden" cloning of keys again...
-            match h.cursor(Some((start_bound.clone(), end_bound.clone()))) {
-                Ok(Some(c)) => cursors.push(c),
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            };
+            let c = h.cursor(Some((start_bound.clone(), end_bound.clone())))?;
+            cursors.push(c)
         }
 
         let mut memtables = Vec::with_capacity(1 + frozen_len);

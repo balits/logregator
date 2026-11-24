@@ -138,7 +138,7 @@ pub(crate) struct WriterState<W, C> {
     pub(crate) block_writer: BlockWriter<C>,
 
     /// limit on the size of a single block
-    pub(crate) block_limit: usize,
+    pub(crate) block_size_limit: usize,
 
     /// list of [BlockMetadata] accumulated over time, containing its
     /// offset in the writer, and its first/last key.
@@ -186,18 +186,18 @@ where
     pub fn new(
         writer: W,
         codec: C,
-        block_limit: Option<usize>,
+        block_size_limit: Option<usize>,
         record_count: NonZeroUsize,
     ) -> Result<Self, InvalidBlockLimit> {
-        let block_writer = BlockWriter::new(codec.clone(), block_limit)?;
-        let block_limit = block_writer.limit();
+        let block_writer = BlockWriter::new(codec.clone(), block_size_limit)?;
+        let block_size_limit = block_writer.limit();
         let bloom = BloomFilter::new(record_count.get(), 0.01)
             .expect("n and fpr are both positive non-zero");
         let state = WriterState {
             writer,
             block_bytes_written: 0,
             block_writer,
-            block_limit,
+            block_size_limit,
             block_meta: vec![],
             first_key: None,
             last_key: None,
@@ -368,7 +368,7 @@ where
             &mut self.state.block_writer,
             BlockWriter::new(
                 self.state.codec.clone(),
-                Some(self.state.block_limit),
+                Some(self.state.block_size_limit),
             )?,
         );
 
@@ -421,7 +421,7 @@ where
     pub fn new(
         id: u64,
         codec: C,
-        block_limit: Option<usize>,
+        block_size_limit: Option<usize>,
         path_prefix: Option<&Path>,
         record_count: NonZeroUsize,
     ) -> Result<Self, SstError> {
@@ -436,7 +436,7 @@ where
         )?;
 
         let inner =
-            HashedWriterState::new(fh, codec, block_limit, record_count)?;
+            HashedWriterState::new(fh, codec, block_size_limit, record_count)?;
 
         Ok(Self { inner })
     }
@@ -662,7 +662,7 @@ where
     pub fn cursor<'a>(
         &'a self,
         bounds: Option<(Bound<Key>, Bound<Key>)>,
-    ) -> Result<Option<SstCursor<'a, C>>, SstError> {
+    ) -> Result<SstCursor<'a, C>, SstError> {
         let bounds = bounds.unwrap_or((Bound::Unbounded, Bound::Unbounded));
         SstCursor::new(self, bounds)
     }
@@ -750,7 +750,7 @@ where
     /// errors encountered.
     ///
     /// If its `Bound::Excluded`, the process is similar,
-    /// except the after seeking to the start key, we
+    /// except after seeking to the start key, we
     /// advance the inner cursor by one.
     ///
     /// # Note
@@ -761,7 +761,7 @@ where
     fn new(
         sst: &'s SstHandle<C>,
         bounds: (Bound<Key>, Bound<Key>),
-    ) -> Result<Option<Self>, SstError> {
+    ) -> Result<Self, SstError> {
         let start_block_idx = match bounds.0.as_ref() {
             Bound::Included(k) | Bound::Excluded(k) => {
                 sst.block_idx_for_stream_id(k.stream_id)?
@@ -791,14 +791,14 @@ where
             }
         }
 
-        Ok(Some(Self {
+        Ok(Self {
             sst,
             block_cursor: Ok(cursor),
             block_idx: start_block_idx,
             codec: sst.codec.clone(),
             _start_bound: bounds.0,
             end_bound: bounds.1,
-        }))
+        })
     }
 
     #[inline]
@@ -933,12 +933,10 @@ where
 
         if !self.is_error() {
             self.block_idx += 1;
-
             if !self.next_block_may_be_in_bounds() {
                 self.block_cursor = Err(SstError::BlockCursorExhausted);
                 return;
             }
-
             self.update_current();
         }
     }
@@ -1079,7 +1077,7 @@ impl SstFileHandle {
     pub fn open(
         id: u64,
         prefix: Option<&Path>,
-        opts: &mut OpenOptions,
+        opts: &OpenOptions,
     ) -> io::Result<Self> {
         let fmt = format_sst_filename(id);
         let path = match prefix {
@@ -1320,15 +1318,21 @@ impl BlockMetadata {
 
 #[cfg(test)]
 mod test {
-    use std::{num::NonZeroUsize, sync::Arc};
+    use std::{
+        assert_matches, num::NonZeroUsize, os::unix::fs::FileExt, sync::Arc,
+    };
 
     use pretty_assertions::assert_eq;
+    use rand::RngExt;
 
     use super::BlockMetadata;
     use crate::{
         block::DEFAULT_BLOCK_SIZE,
         record::{Record, RecordCodec},
-        sst::{HashedWriterState, SstFileWriter, SstHandle},
+        sst::{
+            HashedWriterState, SstError, SstFileHandle, SstFileWriter,
+            SstHandle,
+        },
     };
 
     fn tracing() {
@@ -1340,6 +1344,12 @@ mod test {
             .try_init();
     }
 
+    fn payload(i: u64, len: usize) -> Vec<u8> {
+        use rand::SeedableRng;
+        let rng = rand::rngs::SmallRng::from_seed(std::array::repeat(i as u8));
+        rng.random_iter().take(len).collect()
+    }
+
     fn record(i: u64, len: usize) -> Record {
         Record {
             key: crate::record::Key {
@@ -1348,7 +1358,7 @@ mod test {
                 sequence_num: i,
                 stream_id: i,
             },
-            payload: vec![67u8; len].into(),
+            payload: payload(i, len).into(),
         }
     }
 
@@ -1403,9 +1413,8 @@ mod test {
     }
 
     #[test]
-    fn sst_file_writer() {
+    fn sst_writer_single_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
-
         tracing();
         let codec = RecordCodec;
         let num_records = 512;
@@ -1424,6 +1433,41 @@ mod test {
 
         let sst = sw.finalize_file().unwrap();
         dbg!(sst);
+    }
+
+    #[test]
+    fn sst_writer_multiple_blocks() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        tracing();
+        let codec = RecordCodec;
+        let sst_id = 1;
+        let num_records = 20;
+        let payload_size = 512;
+        let records_per_block = 3;
+        let record_wire_len = 32 + 4 + payload_size;
+        let per_block_suffix = records_per_block * 2 + 4 + 4;
+        // key + payload_len_prefix + payload + per block suffix (2 * offset + 4 num_of_records + 4 checksum)
+        let block_size_limit: usize =
+            records_per_block * record_wire_len + per_block_suffix;
+
+        let mut sw = SstFileWriter::new(
+            sst_id,
+            codec,
+            Some(block_size_limit),
+            Some(tempdir.path()),
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
+
+        for i in 0..num_records {
+            sw.write(&record(i as u64, payload_size)).unwrap();
+        }
+        let sst = sw.finalize_file().unwrap();
+
+        assert_eq!(
+            sst.block_metadata.len(),
+            num_records.div_ceil(records_per_block)
+        );
     }
 
     #[test]
@@ -1486,10 +1530,7 @@ mod test {
         let sst = Arc::new(sw.finalize_file().unwrap());
         // assert_eq!(sst.meta._record_count, num_records);
 
-        let mut c = sst
-            .cursor(None)
-            .expect("sst::cursor -> Err")
-            .expect("sst::Cursor -> Ok(None)");
+        let mut c = sst.cursor(None).expect("sst.cursor(None)");
         println!("\n\n=> CURSOR: iterating using .next() <=\n\n");
         println!(
             "Before iterating the cursor: sst has {} block(s)",
@@ -1585,6 +1626,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "deprecated, use sst_finalize_open()"]
     fn sst_open() {
         tracing();
         let tempdir = tempfile::TempDir::new().unwrap();
@@ -1609,5 +1651,92 @@ mod test {
         let fh = sst.file_handle();
 
         SstHandle::open_path(&fh.path, codec).unwrap();
+    }
+
+    /// Finalize an sst with (multiple blocks), then reopen it.
+    #[test]
+    fn sst_finalize_open() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        tracing();
+
+        let codec = RecordCodec;
+        let sst_id = 1;
+        let num_records = 20;
+        let payload_len = 512;
+        // this should fit 3 records
+        let block_size_limit = 1700;
+
+        let mut sw = SstFileWriter::new(
+            sst_id,
+            codec,
+            Some(block_size_limit),
+            Some(tempdir.path()),
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
+
+        for i in 0..num_records {
+            sw.write(&record(i as u64, payload_len)).unwrap();
+        }
+        let _sst_original = sw.finalize_file().unwrap();
+
+        let fh = SstFileHandle::open(
+            sst_id,
+            Some(tempdir.path()),
+            std::fs::OpenOptions::new().read(true),
+        )
+        .unwrap();
+        let sst_reopened = SstHandle::open_file_handle(fh, codec).unwrap();
+
+        let mut cursor = sst_reopened.cursor(None).unwrap();
+
+        for i in 0..(num_records as u64) {
+            let read = cursor.current_record().unwrap();
+            assert_eq!(i, read.key.stream_id);
+            assert_eq!(i, read.key.timestamp);
+            assert_eq!(i, read.key.sequence_num);
+            assert_eq!(i, read.key.source_id);
+            assert_eq!(
+                read.payload.as_ref(),
+                payload(i, payload_len).as_slice()
+            );
+            cursor.next();
+        }
+
+        assert!(cursor.is_error());
+        assert_matches!(
+            cursor.get_error(),
+            Some(Ok(super::super::sst::SstError::BlockCursorExhausted))
+        );
+
+        drop(cursor);
+        drop(sst_reopened);
+
+        {
+            let tinkering_file = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .open(_sst_original.fh.path())
+                .unwrap();
+            dbg!(_sst_original.file_handle(), &tinkering_file);
+            let mut buf = [0; 1];
+            let n = tinkering_file
+                .read_at(&mut buf, 0)
+                .expect("tinkering with sst file (read_at)");
+            assert_eq!(n, 1, "failed to tinker with original sst file");
+            buf[0] ^= 0x01;
+            let n = tinkering_file
+                .write_at(&buf, 0)
+                .expect("tinkering with sst file (write_at)");
+            assert_eq!(n, 1, "failed to tinker with original sst file");
+        }
+
+        let open_res = SstHandle::open_path(_sst_original.fh.path, codec);
+        assert!(open_res.is_err());
+        assert_matches!(
+            open_res,
+            Err(SstError::ChecksumMismatch(_)),
+            "tinkered sst did not fail to open with mismatched checksum"
+        );
     }
 }
