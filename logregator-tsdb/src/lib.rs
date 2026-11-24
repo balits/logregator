@@ -139,7 +139,7 @@ pub struct ChecksumMismatch {
 #[cfg(test)]
 #[allow(unused)]
 mod cli {
-    use std::{rc::Rc, sync::Arc};
+    use std::{num::NonZeroUsize, rc::Rc, sync::Arc};
 
     use crate::{
         codec::WireLen,
@@ -148,7 +148,6 @@ mod cli {
     };
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn layouts() {
         let k = Key::dummy(2u64);
         let rec = record(1, 3);
@@ -173,7 +172,7 @@ mod cli {
             codec,
             None,
             Some(tempdir.path()),
-            num_records as usize,
+            NonZeroUsize::new(num_records as usize).unwrap(),
         )
         .unwrap();
 

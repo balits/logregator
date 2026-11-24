@@ -1,7 +1,17 @@
+//! SSTable binary layout:
+//! ```not_rust
+//! [...blocks]                   # each block contains records and their offsets
+//! [...block_metadata]           # each metadata contains the blocks offset plus first and last keys
+//! [bloom_filter]                # answers "does this SST contain any records for stream_id X"
+//! [block_metadata_start_offset] # where 'block_metadata' starts
+//! [bloom_filter_start_offset]   # where 'bloom_filter' starts
+//! ```
+
 use std::{
     fmt::Debug,
     fs::{File, OpenOptions},
-    io,
+    io::{self, BufReader, Read},
+    num::NonZeroUsize,
     ops::Bound,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
@@ -15,7 +25,7 @@ use crate::{
         self, Block, BlockCursor, BlockWriter, InvalidBlockLimit, WriteOutput,
     },
     bloom::{self, BloomFilter, BloomFilterCodec},
-    codec::{self, CodecError, RecordCodecExt, SpecCodec, WireLen},
+    codec::{self, CodecError, RecordCodecExt, SZ_U32, SpecCodec, WireLen},
     record::{KEY_SIZE, Key, Record},
 };
 
@@ -32,24 +42,27 @@ pub const MIN_SST_SIZE: usize = SST_FOOTER_SIZE;
 pub const SST_DIR_NAME: &str = "sst";
 pub const SST_EXT: &str = "sst";
 
+/// Formats the ID into an SSTable file name, as `"{id:020}.{SST_EXT}"`
 pub fn format_sst_filename(id: u64) -> String {
     format!("{id:020}.{SST_EXT}")
 }
 
-/// Formats today to as its expected in the sst directory.
-///
-/// (Year-month-day format (ISO 8601). Same as %Y-%m-%d.
+/// Year-month-day format (ISO 8601). Same as %Y-%m-%d.
 /// src: https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
-pub fn format_today_dir_path() -> String {
-    chrono::Utc::now().format("%F").to_string()
+const DAYDIR_FORMAT: &str = "%F";
+
+/// Formats today as a directory path according to [DAYDIR_FORMAT], to be used in the sst directory.
+pub fn format_today_as_daydir_path() -> String {
+    let today = chrono::Utc::now();
+    today.format(DAYDIR_FORMAT).to_string()
 }
 
-pub fn valid_daydir_path(_: &std::ffi::OsStr) -> bool {
-    todo!(
-        "do some research on str -> formatted day | formatted day -> Option<str>"
-    )
+/// Checks if the the given str is well formatted, as per [format_today_as_daydir_path] and [DAYDIR_FORMAT].
+pub fn is_valid_daydir_path(path: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(path, DAYDIR_FORMAT).is_ok()
 }
 
+/// Huge enum for all the errors this module could produce.
 #[derive(thiserror::Error, Debug)]
 pub enum SstError {
     #[error("sst error: custom error occured: {0}")]
@@ -86,10 +99,6 @@ pub enum SstError {
     )]
     BlockIdxOutOfBounds { idx: usize, len: usize },
 
-    // #[error(
-    //     "sst error: bound {bound:?} does not exist in the current SSTable"
-    // )]
-    // BoundNotExist { bound: Bound<Key> },
     #[error(
         "sst read error: bound {bound_kind:?} with stream_id {stream_id} not found"
     )]
@@ -108,6 +117,7 @@ pub enum SstError {
     BlockCursorExhausted,
 }
 
+/// A bound for queries.
 #[derive(Debug)]
 pub enum BoundKind {
     Start,
@@ -115,40 +125,57 @@ pub enum BoundKind {
     None,
 }
 
+/// Tracking state needed to construct an SSTable.
 #[derive(Debug)]
 pub(crate) struct WriterState<W, C> {
+    /// underlying writer
     pub(crate) writer: W,
+
+    /// how many block-bytes have currently been written
     pub(crate) block_bytes_written: usize,
+
+    /// underlying block writer
     pub(crate) block_writer: BlockWriter<C>,
-    pub(crate) block_limit: usize,
+
+    /// limit on the size of a single block
+    pub(crate) block_size_limit: usize,
+
+    /// list of [BlockMetadata] accumulated over time, containing its
+    /// offset in the writer, and its first/last key.
     pub(crate) block_meta: Vec<BlockMetadata>,
+
+    /// number of records accumulated
     pub(crate) record_count: usize,
+
     pub(crate) first_key: Option<Key>,
     pub(crate) last_key: Option<Key>,
     pub(crate) bloom: BloomFilter,
     pub(crate) codec: C,
 }
 
+/// The final, unmodifiable state of an SStable, with offsets where the block
+/// metadata and bloom filter starts at.
 #[derive(Debug)]
 pub(crate) struct FinalizedWriterState<W, C> {
-    pub(crate) inner: WriterState<W, C>,
-    pub(crate) block_metadata_start_offset: usize,
+    /// inner state
+    inner: WriterState<W, C>,
+
+    /// where the block metadata segment starts
+    block_metadata_start_offset: usize,
+
+    /// where the bloom filter segment starts
+    /// (and where the block metadata segment ends)
     #[allow(unused)]
-    pub(crate) bloom_filter_start_offset: usize,
+    bloom_filter_start_offset: usize,
 }
 
-/// SSTable binary layout:
-/// ```not_rust
-/// [...block]                    # each block contains records and their offsets
-/// [...block_metadata]           # each metadata contains the blocks offset plus first and last keys
-/// [bloom_filter]                # answers "does this SST contain any records for stream_id X"
-/// [block_metadata_start_offset] # where 'block_metadata' starts
-/// [bloom_filter_start_offset] # where 'bloom_filter' starts
-/// ```
+/// A [WriterState] and a checksum hasher.
+/// The hasher computes the checksum based on raw bytes of
+/// the blocks, metadata, bloom filter, and the latter twos offsets.
 #[derive(Debug)]
 pub struct HashedWriterState<W: io::Write, C> {
     state: WriterState<W, C>,
-    integrity_hasher: crc32fast::Hasher,
+    hasher: crc32fast::Hasher,
 }
 
 impl<W, C> HashedWriterState<W, C>
@@ -159,17 +186,18 @@ where
     pub fn new(
         writer: W,
         codec: C,
-        block_limit: Option<usize>,
-        record_count: usize,
+        block_size_limit: Option<usize>,
+        record_count: NonZeroUsize,
     ) -> Result<Self, InvalidBlockLimit> {
-        let block_writer = BlockWriter::new(codec.clone(), block_limit)?;
-        let block_limit = block_writer.limit();
-        let bloom = BloomFilter::new(record_count, 0.01);
+        let block_writer = BlockWriter::new(codec.clone(), block_size_limit)?;
+        let block_size_limit = block_writer.limit();
+        let bloom = BloomFilter::new(record_count.get(), 0.01)
+            .expect("n and fpr are both positive non-zero");
         let state = WriterState {
             writer,
             block_bytes_written: 0,
             block_writer,
-            block_limit,
+            block_size_limit,
             block_meta: vec![],
             first_key: None,
             last_key: None,
@@ -180,7 +208,7 @@ where
 
         Ok(Self {
             state,
-            integrity_hasher: crc32fast::Hasher::new(),
+            hasher: crc32fast::Hasher::new(),
         })
     }
 
@@ -195,7 +223,7 @@ where
                 self.state.bloom.insert(rec.key.stream_id);
             }
             Ok(WriteOutput::Full) => {
-                self.flush_blocks()?;
+                self.flush_block()?;
                 // first call to block_writer.write always succeeds
                 // so infinite recursion can't happen
                 self.write(rec)?;
@@ -208,27 +236,19 @@ where
         Ok(())
     }
 
-    /// the layout of the finalized state is roughly like so:
-    /// 0: raw_blocks (handled by `self.flush_blocks`)
-    ///
-    /// 1: block_metadata
-    /// 2: bloom_filter
-    /// 3: block_metadata_start_offset
-    /// 4: bloom_filter_start_offset
-    ///
-    /// 5: crc hash of the whole sst
-    ///
-    /// # NOTE
-    ///
-    /// Before the crc hash is appended to the end of the writer,
-    /// the hasher should be updated with the new bytes written to
-    /// the writer in this function.
-    #[instrument(skip(self), ret, err)]
+    /// the layout of the finalized state is:
+    /// 0: raw blocks (handled by [flush_block])
+    /// 1: block metadata
+    /// 2: bloom filter
+    /// 3: block metadata start offset
+    /// 4: bloom filter start offset
+    /// 5: crc hash of the whole sst (of 0,1,2,3,4)
+    #[instrument(skip(self), err)]
     pub(crate) fn finalize(
         mut self,
     ) -> Result<FinalizedWriterState<W, C>, SstError> {
-        if self.state.block_writer.size() > 0 {
-            self.flush_blocks()?;
+        if self.state.block_writer.record_count() > 0 {
+            self.flush_block()?;
         }
 
         if self.state.first_key.is_none() || self.state.last_key.is_none() {
@@ -239,85 +259,103 @@ where
         //
         // block_bytes_written can't be greater than MAX_SST_SIZE (which can't be greater than u32::MAX)
         // so this cast is safe
-
-        let block_meta_start = self.state.block_bytes_written as u32;
+        let block_meta_start = self.state.block_bytes_written;
         let block_meta_bytes = BlockMetadata::encode_metas(
             &self.state.block_meta,
             &self.state.codec,
         )
         .map_err(SstError::from)?;
-        let bloom_filter_start =
-            block_meta_start + block_meta_bytes.len() as u32;
+        let block_meta_end = block_meta_start
+            .checked_add(block_meta_bytes.len())
+            .ok_or_else(|| {
+                SstError::Other("Sst layout size overflow (block_meta_end = block_meta_start + block_meta_bytes_len)".to_string())
+            })?;
+        let bloom_len = self.state.bloom.wire_len();
+        let bloom_end =
+            block_meta_end.checked_add(bloom_len).ok_or_else(|| {
+                SstError::Other(
+                    "Sst layout size overflow (bloom_end = block_meta_end + bloom_len)"
+                        .to_string(),
+                )
+            })?;
+        let total_len =
+            bloom_end.checked_add(SST_FOOTER_SIZE).ok_or_else(|| {
+                SstError::Other(
+                    "Sst layout size overflow (total_layout = bloom_end SST_FOOTER_SIZE)"
+                        .to_string(),
+                )
+            })?;
+
+        if total_len > MAX_SST_SIZE {
+            return Err(SstError::InvalidSstSize {
+                min: MIN_SST_SIZE,
+                max: MAX_SST_SIZE,
+                got: total_len as u64,
+            });
+        }
 
         // 1.
         self.state
             .writer
             .write_all(&block_meta_bytes)
             .map_err(SstError::from)?;
-        self.integrity_hasher.update(&block_meta_bytes);
+        self.hasher.update(&block_meta_bytes);
 
         // 2.
-        {
-            /*
-            -------------------------------------------------
-            omg, i know i have SpecCodec<I> everywhere
-            but i rly dont feel like introducing
-            <B: SpecCodec<BloomFilter> to lsm, or sst
-            or wherever. Plus realistically a bloom
-            filters wire representation is not gonna change.
-            -------------------------------------------------
-            */
-
-            let codec = bloom::BloomFilterCodec;
-            let mut bloom_buf = vec![0; self.state.bloom.wire_len()];
-            codec
-                .encode(&self.state.bloom, &mut bloom_buf)
-                .map_err(SstError::from)?;
-            self.state
-                .writer
-                .write_all(&bloom_buf)
-                .map_err(SstError::from)?;
-
-            self.integrity_hasher.update(&bloom_buf);
-        }
+        let bloom_codec = bloom::BloomFilterCodec;
+        let mut bloom_buf = vec![0; self.state.bloom.wire_len()];
+        bloom_codec
+            .encode(&self.state.bloom, &mut bloom_buf)
+            .map_err(SstError::from)?;
+        self.state
+            .writer
+            .write_all(&bloom_buf)
+            .map_err(SstError::from)?;
+        self.hasher.update(&bloom_buf);
 
         // 3.
+        // SAFETY: total_len <= MAX_SST_SIZE = u32::MAX / 2
+        // and block_meta_start <= total_len
+        let block_meta_start_u32 = block_meta_start as u32;
         self.state
             .writer
-            .write_all(&block_meta_start.to_be_bytes())
+            .write_all(&block_meta_start_u32.to_be_bytes())
             .map_err(SstError::from)?;
-        self.integrity_hasher
-            .update(&block_meta_start.to_be_bytes());
+        self.hasher.update(&block_meta_start_u32.to_be_bytes());
 
         // 4.
+        // SAFETY: total_len <= MAX_SST_SIZE = u32::MAX / 2
+        // and block_meta_end <= total_len
+        let bloom_filter_start_u32 = block_meta_end as u32;
         self.state
             .writer
-            .write_all(&bloom_filter_start.to_be_bytes())
+            .write_all(&bloom_filter_start_u32.to_be_bytes())
             .map_err(SstError::from)?;
-        self.integrity_hasher
-            .update(&bloom_filter_start.to_be_bytes());
+        self.hasher.update(&bloom_filter_start_u32.to_be_bytes());
 
         // 5.
         self.state
             .writer
-            .write_all(&self.integrity_hasher.finalize().to_be_bytes())
+            .write_all(&self.hasher.finalize().to_be_bytes())
             .map_err(SstError::from)?;
 
         Ok(FinalizedWriterState {
             inner: self.state,
-            block_metadata_start_offset: block_meta_start as usize,
-            bloom_filter_start_offset: bloom_filter_start as usize,
+            block_metadata_start_offset: block_meta_start,
+            bloom_filter_start_offset: block_meta_end,
         })
     }
 
+    /// Writes the [Block] produced by the [BlockWriter] into the underlying
+    /// Writer, and updates the hasher with the block bytes.
     #[instrument(skip(self), err)]
-    fn flush_blocks(&mut self) -> Result<(), SstError> {
+    fn flush_block(&mut self) -> Result<(), SstError> {
         if self.state.block_bytes_written >= MAX_SST_SIZE {
             return Err(SstError::SstFilledUp);
         }
 
         let estimated_bytes =
-            self.state.block_bytes_written + self.state.block_writer.size();
+            self.state.block_bytes_written + self.state.block_writer.wire_len();
         if estimated_bytes > MAX_SST_SIZE {
             return Err(SstError::InvalidSstSize {
                 got: estimated_bytes as u64,
@@ -330,7 +368,7 @@ where
             &mut self.state.block_writer,
             BlockWriter::new(
                 self.state.codec.clone(),
-                Some(self.state.block_limit),
+                Some(self.state.block_size_limit),
             )?,
         );
 
@@ -338,14 +376,14 @@ where
         let block_offset = self.state.block_bytes_written;
         let block_bytes = block.encode_block()?;
         self.state.writer.write_all(&block_bytes)?;
-        self.integrity_hasher.update(&block_bytes);
+        self.hasher.update(&block_bytes);
 
         // SAFETY
         //
         // Firstly, we already made sure block_offset is less than u32::MAX (see MAX_SST_SIZE),
         // so casting offset from usize to u32 is safe.
         //
-        // Secondly, this function is only called when block writer is full, meaning it has
+        // Second, this function is only called when block writer is full, meaning it has
         // at least 1 record written into it, therefore first_key and last_key cannot be None
         // and unwrapping is safe.
         let first_key = first_key.unwrap();
@@ -369,6 +407,7 @@ where
     }
 }
 
+/// An SSTable writer which uses an [SstFileHandle] as the underyling writer.
 #[derive(Debug)]
 pub struct SstFileWriter<C> {
     inner: HashedWriterState<SstFileHandle, C>,
@@ -382,9 +421,9 @@ where
     pub fn new(
         id: u64,
         codec: C,
-        block_limit: Option<usize>,
+        block_size_limit: Option<usize>,
         path_prefix: Option<&Path>,
-        record_count: usize,
+        record_count: NonZeroUsize,
     ) -> Result<Self, SstError> {
         let fh = SstFileHandle::open(
             id,
@@ -397,7 +436,7 @@ where
         )?;
 
         let inner =
-            HashedWriterState::new(fh, codec, block_limit, record_count)?;
+            HashedWriterState::new(fh, codec, block_size_limit, record_count)?;
 
         Ok(Self { inner })
     }
@@ -433,7 +472,7 @@ pub struct SstHandle<C> {
 
 impl<C> SstHandle<C> {
     pub fn id(&self) -> u64 {
-        self.fh._id
+        self.fh.id
     }
 }
 
@@ -446,7 +485,7 @@ where
     where
         P: AsRef<Path> + std::fmt::Debug,
     {
-        let fh = SstFileHandle::open_from_path(path.as_ref())?;
+        let fh = SstFileHandle::open_readonly_from_path(path.as_ref())?;
         Self::open_file_handle(fh, codec)
     }
 
@@ -471,19 +510,11 @@ where
             )));
         }
 
+        let fsize_minus_footer = fsize - SST_FOOTER_SIZE as u64;
         let mut footer_buf = [0; SST_FOOTER_SIZE];
-        f.read_exact_at(&mut footer_buf, fsize - SST_FOOTER_SIZE as u64)
-            .map_err(|e| SstError::Other(format!("{e}")))?;
+        f.read_exact_at(&mut footer_buf, fsize - SST_FOOTER_SIZE as u64)?;
 
-        // FIXED: what do i do with this checksum?
-        // to reconstruct we would have to iterate over
-        // the whooole sst file
-        //
-        // SOLUTION: sst level checksum is made out of
-        // the bloom and blockmeta bytes, and is generated
-        // by `finalize()`, which we are reading anyways,
-        // just pass it to a crc hasher.
-        let (blockmeta_offset, bloom_offset, orig_checksum) = (
+        let (blockmeta_offset, bloom_offset, original_checksum) = (
             u32::from_be_bytes([
                 footer_buf[0],
                 footer_buf[1],
@@ -504,14 +535,14 @@ where
             ]),
         );
 
-        if blockmeta_offset > fsize {
+        if blockmeta_offset > fsize_minus_footer {
             return Err(SstError::Other(format!(
-                "block metadata start offset points past the size of the file (offset: {blockmeta_offset} file_size: {fsize})"
+                "block metadata start offset points past the size of the file minus footer size (offset: {blockmeta_offset} file_size: {fsize}, footer_size: {SST_FOOTER_SIZE})"
             )));
         }
-        if bloom_offset > fsize {
+        if bloom_offset > fsize_minus_footer {
             return Err(SstError::Other(format!(
-                "bloom filter start offset points past the size of the file (offset: {bloom_offset} file_size: {fsize})"
+                "bloom filter start offset points past the size of the file minus footer size (offset: {bloom_offset}, file_size: {fsize}, footer_size: {SST_FOOTER_SIZE})"
             )));
         }
         if blockmeta_offset >= bloom_offset {
@@ -521,57 +552,68 @@ where
         }
 
         let bloom_segment_len: usize =
-            (fsize - SST_FOOTER_SIZE as u64 - bloom_offset) as usize;
+            (fsize_minus_footer - bloom_offset) as usize;
 
-        let blockmeta_segment_len: usize = (bloom_offset - blockmeta_offset).try_into().map_err(|e| {
-            SstError::Other(format!(
-                "faild to cast meta_segment_lenght (= file_size {fsize} - meta_offset {blockmeta_offset}) from u64 to usize: {e}"
-            ))
-        })?;
+        let blockmeta_segment_len = bloom_offset - blockmeta_offset;
+        let blockmeta_segment_len: usize =
+            blockmeta_segment_len.try_into().map_err(|_| {
+                SstError::Other(
+                    "blockmeta_segment_len: failed to cast from u64 to usize"
+                        .to_string(),
+                )
+            })?;
 
+        // the checksum is made out of 4 things
+        // 1) the raw block bytes
+        // 2) the block metadata bytes
+        // 3) the bloom filter bytes
+        // 4) the block meta offset + bloom filter offset
+        //
+        // but we dont rly care, just read the whole file - checksum
+        let mut bufreader =
+            BufReader::with_capacity(32 * 1024, f).take(fsize - SZ_U32 as u64);
         let mut hasher = crc32fast::Hasher::new();
-        let mut readbuf = vec![0; blockmeta_segment_len];
-
-        f.read_exact_at(&mut readbuf, blockmeta_offset)?;
-        let block_metadata = BlockMetadata::decode_metas(&readbuf[..], &codec)?;
-        hasher.update(&readbuf[..]);
-
-        readbuf.resize(bloom_segment_len, 0);
-        f.read_exact_at(&mut readbuf, bloom_offset)?;
-
-        let bloom = {
-            /*
-            -------------------------------------------------
-            omg, i know i have SpecCodec<I> everywhere
-            but i rly dont feel like introducing
-            <B: SpecCodec<BloomFilter> to lsm, or sst
-            or wherever. Plus realistically a bloom
-            filters wire representation is not gonna change.
-            -------------------------------------------------
-            */
-
-            let codec = BloomFilterCodec;
-            match codec.decode(&readbuf) {
-                Ok(Some((bloom, n))) => {
-                    hasher.update(&readbuf[..n]);
-                    bloom
-                }
-                Ok(None) => {
-                    return Err(SstError::Other(
-                        "failed to decode bloom filter: not enough bytes in buffer"
-                        .to_string()
+        let mut buf = vec![0; 8 * 1024];
+        loop {
+            let n = bufreader.read(&mut buf)?;
+            if n == 0 {
+                let computed = hasher.finalize();
+                if original_checksum != computed {
+                    return Err(SstError::ChecksumMismatch(
+                        crate::ChecksumMismatch {
+                            original: original_checksum,
+                            computed,
+                        },
                     ));
+                } else {
+                    break;
                 }
-                Err(e) => return Err(e.into()),
             }
-        };
+            hasher.update(&buf[..n]);
+        }
 
-        let computed_checksum = hasher.finalize();
-        if orig_checksum != computed_checksum {
-            return Err(SstError::ChecksumMismatch(crate::ChecksumMismatch {
-                original: orig_checksum,
-                computed: computed_checksum,
-            }));
+        // 2) block meta bytes
+        buf.resize(blockmeta_segment_len, 0);
+        f.read_exact_at(&mut buf, blockmeta_offset)?;
+        let block_metadata = BlockMetadata::decode_metas(&buf[..], &codec)?;
+
+        // 3) bloom filter bytes
+        buf.resize(bloom_segment_len, 0);
+        f.read_exact_at(&mut buf, bloom_offset)?;
+        let (bloom, n) = match BloomFilterCodec.decode(&buf[..]) {
+            Ok(Some((bloom, n))) => (bloom, n),
+            Ok(None) => {
+                return Err(SstError::Other(
+                    "failed to decode bloom filter: not enough bytes in buffer"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if n != bloom_segment_len {
+            return Err(SstError::Other(format!(
+                "failed to decode bloom filter: expected to read {bloom_segment_len} bytes, actually read {n}"
+            )));
         }
 
         Ok(SstHandle {
@@ -604,10 +646,11 @@ where
             self.block_meta()[block_idx + 1].offset as usize
         };
 
-        debug_assert!(
-            block_start < block_end,
-            "malformed sst blocks: block_start >= block_end"
-        );
+        if block_start >= block_end {
+            return Err(SstError::Other(format!(
+                "malformed sst block (idx = {block_idx}): block_start ({block_start}) >= block_end ({block_end})"
+            )));
+        }
 
         let mut buf = vec![0; block_end - block_start];
         self.fh.file().read_exact_at(&mut buf, block_start as u64)?;
@@ -619,7 +662,7 @@ where
     pub fn cursor<'a>(
         &'a self,
         bounds: Option<(Bound<Key>, Bound<Key>)>,
-    ) -> Result<Option<SstCursor<'a, C>>, SstError> {
+    ) -> Result<SstCursor<'a, C>, SstError> {
         let bounds = bounds.unwrap_or((Bound::Unbounded, Bound::Unbounded));
         SstCursor::new(self, bounds)
     }
@@ -707,7 +750,7 @@ where
     /// errors encountered.
     ///
     /// If its `Bound::Excluded`, the process is similar,
-    /// except the after seeking to the start key, we
+    /// except after seeking to the start key, we
     /// advance the inner cursor by one.
     ///
     /// # Note
@@ -718,7 +761,7 @@ where
     fn new(
         sst: &'s SstHandle<C>,
         bounds: (Bound<Key>, Bound<Key>),
-    ) -> Result<Option<Self>, SstError> {
+    ) -> Result<Self, SstError> {
         let start_block_idx = match bounds.0.as_ref() {
             Bound::Included(k) | Bound::Excluded(k) => {
                 sst.block_idx_for_stream_id(k.stream_id)?
@@ -748,14 +791,14 @@ where
             }
         }
 
-        Ok(Some(Self {
+        Ok(Self {
             sst,
             block_cursor: Ok(cursor),
             block_idx: start_block_idx,
             codec: sst.codec.clone(),
             _start_bound: bounds.0,
             end_bound: bounds.1,
-        }))
+        })
     }
 
     #[inline]
@@ -890,12 +933,10 @@ where
 
         if !self.is_error() {
             self.block_idx += 1;
-
             if !self.next_block_may_be_in_bounds() {
                 self.block_cursor = Err(SstError::BlockCursorExhausted);
                 return;
             }
-
             self.update_current();
         }
     }
@@ -1027,7 +1068,7 @@ where
 /// Wrapper around a file, a unique ID, and the files path
 #[derive(Debug)]
 pub struct SstFileHandle {
-    _id: u64,
+    id: u64,
     file: File,
     path: PathBuf,
 }
@@ -1036,7 +1077,7 @@ impl SstFileHandle {
     pub fn open(
         id: u64,
         prefix: Option<&Path>,
-        opts: &mut OpenOptions,
+        opts: &OpenOptions,
     ) -> io::Result<Self> {
         let fmt = format_sst_filename(id);
         let path = match prefix {
@@ -1044,20 +1085,29 @@ impl SstFileHandle {
             None => fmt.into(),
         };
         let file = opts.open(&path)?;
-        Ok(Self {
-            _id: id,
-            path,
-            file,
-        })
+        Ok(Self { id, path, file })
     }
 
     /// checks if the path is a valid sst file path, then opens it
     /// as read-only
-    pub fn open_from_path(path: &Path) -> io::Result<Self> {
-        let fname =
-            path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing filename")
-            })?;
+    pub fn open_readonly_from_path(path: &Path) -> io::Result<Self> {
+        let fname = match path.file_name() {
+            Some(fname) => match fname.to_str() {
+                Some(fname) => fname,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "sst filename: invalid Unicode",
+                    ));
+                }
+            },
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sst filename: missing",
+                ));
+            }
+        };
 
         if !fname.ends_with(".sst") {
             return Err(io::Error::new(
@@ -1075,7 +1125,7 @@ impl SstFileHandle {
         })?;
 
         Ok(SstFileHandle {
-            _id: id,
+            id,
             file: File::open(path)?,
             path: path.to_path_buf(),
         })
@@ -1114,8 +1164,6 @@ impl io::Seek for SstFileHandle {
     }
 }
 
-pub const SZ_U32: usize = size_of::<u32>();
-
 /// Metadata for blocks inside an SSTable. It contains the blocks start in bytes as offset
 /// and the first/last keys in this block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1148,10 +1196,12 @@ impl BlockMetadata {
         metas: &[Self],
         codec: &C,
     ) -> Result<Vec<u8>, CodecError> {
-        // need enough bytes the lenght prefix, for the metas themselves,
+        // need enough bytes for the lenght prefix, for the metas themselves,
         // and for the 32bit checksum
         let capacity = SZ_U32 + metas.len() * Self::BLOCK_META_SIZE + SZ_U32;
         let mut data = Vec::with_capacity(capacity);
+        // cast is safe since an sst could only hold MAX_SST_SIZE / MIN_BLOCK_WIRE_LEN blocks at max, which is way below
+        // u32::MAX (plus currently MAX_SST_SIZE is u32::max / 2)
         data.extend((metas.len() as u32).to_be_bytes());
         let mut key_bytes = [0; KEY_SIZE];
         let mut encode_key = |key: &Key| -> Result<[u8; KEY_SIZE], CodecError> {
@@ -1217,7 +1267,7 @@ impl BlockMetadata {
             }
         };
 
-        let mut data = Vec::with_capacity(metas_len);
+        let mut data: Vec<BlockMetadata> = Vec::with_capacity(metas_len);
         for _ in 0..metas_len {
             let offset = u32::from_be_bytes([
                 src[consumed],
@@ -1236,7 +1286,17 @@ impl BlockMetadata {
                 first_key,
                 last_key,
             };
-            data.push(meta);
+
+            if let Some(last_meta) = data.last()
+                && last_meta.offset >= offset
+            {
+                return Err(codec::other(format!(
+                    "BlockMetadata::decode_metas(): offset monotonicity violation (last offset: {}, current offset {})",
+                    last_meta.offset, offset
+                )));
+            } else {
+                data.push(meta);
+            }
         }
 
         let computed = crc32fast::hash(&src[..consumed]);
@@ -1258,15 +1318,21 @@ impl BlockMetadata {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{
+        assert_matches, num::NonZeroUsize, os::unix::fs::FileExt, sync::Arc,
+    };
 
     use pretty_assertions::assert_eq;
+    use rand::RngExt;
 
     use super::BlockMetadata;
     use crate::{
         block::DEFAULT_BLOCK_SIZE,
         record::{Record, RecordCodec},
-        sst::{HashedWriterState, SstFileWriter, SstHandle},
+        sst::{
+            HashedWriterState, SstError, SstFileHandle, SstFileWriter,
+            SstHandle,
+        },
     };
 
     fn tracing() {
@@ -1278,6 +1344,12 @@ mod test {
             .try_init();
     }
 
+    fn payload(i: u64, len: usize) -> Vec<u8> {
+        use rand::SeedableRng;
+        let rng = rand::rngs::SmallRng::from_seed(std::array::repeat(i as u8));
+        rng.random_iter().take(len).collect()
+    }
+
     fn record(i: u64, len: usize) -> Record {
         Record {
             key: crate::record::Key {
@@ -1286,7 +1358,7 @@ mod test {
                 sequence_num: i,
                 stream_id: i,
             },
-            payload: vec![67u8; len].into(),
+            payload: payload(i, len).into(),
         }
     }
 
@@ -1318,14 +1390,18 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_writer_inmem() {
         tracing();
         let codec = RecordCodec;
         let writer = std::io::Cursor::new(Vec::new());
         let num_records = 512usize;
-        let mut sw =
-            HashedWriterState::new(writer, codec, None, num_records).unwrap();
+        let mut sw = HashedWriterState::new(
+            writer,
+            codec,
+            None,
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
 
         for i in 0..num_records {
             sw.write(&record(i as u64, 512)).unwrap();
@@ -1337,10 +1413,8 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
-    fn sst_file_writer() {
+    fn sst_writer_single_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
-
         tracing();
         let codec = RecordCodec;
         let num_records = 512;
@@ -1349,7 +1423,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
 
@@ -1362,7 +1436,41 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
+    fn sst_writer_multiple_blocks() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        tracing();
+        let codec = RecordCodec;
+        let sst_id = 1;
+        let num_records = 20;
+        let payload_size = 512;
+        let records_per_block = 3;
+        let record_wire_len = 32 + 4 + payload_size;
+        let per_block_suffix = records_per_block * 2 + 4 + 4;
+        // key + payload_len_prefix + payload + per block suffix (2 * offset + 4 num_of_records + 4 checksum)
+        let block_size_limit: usize =
+            records_per_block * record_wire_len + per_block_suffix;
+
+        let mut sw = SstFileWriter::new(
+            sst_id,
+            codec,
+            Some(block_size_limit),
+            Some(tempdir.path()),
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
+
+        for i in 0..num_records {
+            sw.write(&record(i as u64, payload_size)).unwrap();
+        }
+        let sst = sw.finalize_file().unwrap();
+
+        assert_eq!(
+            sst.block_metadata.len(),
+            num_records.div_ceil(records_per_block)
+        );
+    }
+
+    #[test]
     fn sst_read_block() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
@@ -1373,7 +1481,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
         for i in 0..num_records {
@@ -1400,7 +1508,6 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
     fn sst_cursor() {
         let tempdir = tempfile::TempDir::new().unwrap();
         tracing();
@@ -1411,7 +1518,7 @@ mod test {
             codec,
             None,
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
         let records: Vec<Record> =
@@ -1423,10 +1530,7 @@ mod test {
         let sst = Arc::new(sw.finalize_file().unwrap());
         // assert_eq!(sst.meta._record_count, num_records);
 
-        let mut c = sst
-            .cursor(None)
-            .expect("sst::cursor -> Err")
-            .expect("sst::Cursor -> Ok(None)");
+        let mut c = sst.cursor(None).expect("sst.cursor(None)");
         println!("\n\n=> CURSOR: iterating using .next() <=\n\n");
         println!(
             "Before iterating the cursor: sst has {} block(s)",
@@ -1522,7 +1626,7 @@ mod test {
     }
 
     #[test]
-    #[ignore = "bloom codec encode panics; https://github.com/balits/logregator/issues/7"]
+    #[ignore = "deprecated, use sst_finalize_open()"]
     fn sst_open() {
         tracing();
         let tempdir = tempfile::TempDir::new().unwrap();
@@ -1534,7 +1638,7 @@ mod test {
             codec,
             Some(block_limit),
             Some(tempdir.path()),
-            num_records,
+            NonZeroUsize::new(num_records).unwrap(),
         )
         .unwrap();
 
@@ -1547,5 +1651,92 @@ mod test {
         let fh = sst.file_handle();
 
         SstHandle::open_path(&fh.path, codec).unwrap();
+    }
+
+    /// Finalize an sst with (multiple blocks), then reopen it.
+    #[test]
+    fn sst_finalize_open() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        tracing();
+
+        let codec = RecordCodec;
+        let sst_id = 1;
+        let num_records = 20;
+        let payload_len = 512;
+        // this should fit 3 records
+        let block_size_limit = 1700;
+
+        let mut sw = SstFileWriter::new(
+            sst_id,
+            codec,
+            Some(block_size_limit),
+            Some(tempdir.path()),
+            NonZeroUsize::new(num_records).unwrap(),
+        )
+        .unwrap();
+
+        for i in 0..num_records {
+            sw.write(&record(i as u64, payload_len)).unwrap();
+        }
+        let _sst_original = sw.finalize_file().unwrap();
+
+        let fh = SstFileHandle::open(
+            sst_id,
+            Some(tempdir.path()),
+            std::fs::OpenOptions::new().read(true),
+        )
+        .unwrap();
+        let sst_reopened = SstHandle::open_file_handle(fh, codec).unwrap();
+
+        let mut cursor = sst_reopened.cursor(None).unwrap();
+
+        for i in 0..(num_records as u64) {
+            let read = cursor.current_record().unwrap();
+            assert_eq!(i, read.key.stream_id);
+            assert_eq!(i, read.key.timestamp);
+            assert_eq!(i, read.key.sequence_num);
+            assert_eq!(i, read.key.source_id);
+            assert_eq!(
+                read.payload.as_ref(),
+                payload(i, payload_len).as_slice()
+            );
+            cursor.next();
+        }
+
+        assert!(cursor.is_error());
+        assert_matches!(
+            cursor.get_error(),
+            Some(Ok(super::super::sst::SstError::BlockCursorExhausted))
+        );
+
+        drop(cursor);
+        drop(sst_reopened);
+
+        {
+            let tinkering_file = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .open(_sst_original.fh.path())
+                .unwrap();
+            dbg!(_sst_original.file_handle(), &tinkering_file);
+            let mut buf = [0; 1];
+            let n = tinkering_file
+                .read_at(&mut buf, 0)
+                .expect("tinkering with sst file (read_at)");
+            assert_eq!(n, 1, "failed to tinker with original sst file");
+            buf[0] ^= 0x01;
+            let n = tinkering_file
+                .write_at(&buf, 0)
+                .expect("tinkering with sst file (write_at)");
+            assert_eq!(n, 1, "failed to tinker with original sst file");
+        }
+
+        let open_res = SstHandle::open_path(_sst_original.fh.path, codec);
+        assert!(open_res.is_err());
+        assert_matches!(
+            open_res,
+            Err(SstError::ChecksumMismatch(_)),
+            "tinkered sst did not fail to open with mismatched checksum"
+        );
     }
 }
